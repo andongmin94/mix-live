@@ -6,7 +6,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 마이크·반주·게임·통화 소리를 선택적으로 섞고, 입력과 최종 믹스에 내장 보정 및
 사용자가 소유한 VST3를 적용하는 것이 목표다. DAW의 타임라인은 만들지 않는다.
 
-> **현재: 라우팅 코어 + Windows 장치 CLI + 내장 모노 보컬 체인 + 별도 VST3 검사 도구.**
+> **현재: 라우팅 코어 + Windows 장치 CLI + 내장 모노 보컬 체인 + 별도 VST3 검사·편집·WAV 도구.**
 > VST3 검사는 비실시간이며 아직 마이크 체인에 연결하지 않았다.
 > 완성된 방송 앱·가상 마이크 드라이버가 아니다. 실제 검사와 실장비·청취 미검증 범위는
 > [STATUS.md](STATUS.md)를 따른다.
@@ -30,7 +30,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 - `mixlive-vst3`: 설치 경로 조회, 선택한 VST3의 별도 프로세스 로딩·합성 처리·파라미터
   및 상태 저장/복원. `mixlive-audio`의 callback과 별개다.
 
-**미구현:** ASIO, 앱별 캡처, 자체 가상 장치, VST3 라이브 연결·원본 편집창,
+**미구현:** ASIO, 앱별 캡처, 자체 가상 장치, VST3 라이브 연결,
 reverb/delay, pitch correction, GPUI 화면, Scene 저장, 실행 중 설정 변경.
 출력 clipping guard는 전문 리미터가 아니다.
 
@@ -92,7 +92,7 @@ mono 출력은 `--output-channels 1`. 장치 기본 샘플레이트와 포맷으
 `--queue-ms` 기본 30은 queue 목표이지 드라이버 버퍼나 왕복 지연이 아니다.
 `run`은 기본 30초 후 끝나며 최대 `--seconds 3600`. 음성 녹음 파일은 만들지 않는다.
 
-## 사용자 VST3 검사
+## 사용자 VST3 검사·편집
 
 ```powershell
 cargo build --release -p mixlive-vst3 --bin mixlive-plugins --locked
@@ -105,6 +105,17 @@ cargo build --release -p mixlive-vst3 --bin mixlive-plugins --locked
 검사 시 마이크/스피커를 열지 않으며, 성공해도 실시간 호환성이나 음질 수용을 뜻하지 않는다.
 검사는 자식 프로세스에서 한 번 수행한다. native crash 분리이지 권한 sandbox가 아니다.
 신뢰하고 적법하게 설치한 플러그인만 선택한다.
+
+원본 편집창을 열어 설정한 뒤 새 상태 파일로 저장할 수 있다.
+
+```powershell
+.\target\release\mixlive-plugins.exe edit "C:\Plugins\Example.vst3" --state-out voice.mixlive-vst3.json
+.\target\release\mixlive-plugins.exe render "C:\Plugins\Example.vst3" --input dry.wav --output wet.wav --state-in voice.mixlive-vst3.json
+```
+
+`edit`는 사용자 플러그인의 실제 창을 열지만 소리 미리듣기나 실시간 마이크 연결은 하지 않는다.
+`--state-out`을 지정하면 창을 정상적으로 닫은 뒤 저장하고, 생략하면 편집 결과를 버린다.
+기존 파일은 덮어쓰지 않는다. GPUI 메인 화면과는 별개의 네이티브 플러그인 창이다.
 
 ## 개발 검사
 

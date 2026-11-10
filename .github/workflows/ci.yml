@@ -48,7 +48,7 @@ jobs:
           Copy-Item (Join-Path $fixtureTarget 'debug/vst3_host_testplug.dll') $state
           "MIXLIVE_GAIN_VST3=$gain" >> $env:GITHUB_ENV
           "MIXLIVE_STATE_VST3=$state" >> $env:GITHUB_ENV
-      - name: Check native VST3 processing, state restore and WAV output
+      - name: Check native VST3 processing, state, editor contracts and WAV output
         run: cargo test -p mixlive-vst3 --tests --locked -- --ignored
       - name: Lint current targets
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -63,6 +63,8 @@ jobs:
           ./target/release/mixlive-plugins.exe inspect --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-plugins.exe render --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./target/release/mixlive-plugins.exe edit --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Keep development binaries, notices and resolved dependencies
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9

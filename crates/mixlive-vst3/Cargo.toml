@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 rust-version = "1.85"
-description = "MixLive's device-free VST3 inspection, state and WAV processing tools"
+description = "MixLive's device-free VST3 inspection, native editor, state and WAV tools"
 
 [dependencies]
 clap = { version = "=4.6.7", features = ["derive"] }
@@ -18,10 +18,17 @@ hound = "=3.5.1"
 # Control-plane use only. No CPAL, egui, MIDI input or runtime-isolation subsystem.
 # The upstream real-time runner still has internal locks; it is NOT used by our audio callback.
 vst3-host = { version = "=0.11.1", default-features = false }
+# Already in the locked dependency graph; used only for main-thread window messages.
+winapi = { version = "=0.3.9", features = ["winuser"] }
 
 [[bin]]
 name = "mixlive-plugins"
 path = "src/main.rs"
 
-[lints]
-workspace = true
+# The audio/effects crates retain workspace `forbid`. This control-plane crate permits
+# an explicit, documented exception only in editor::native::messages.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"

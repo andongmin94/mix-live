@@ -1,8 +1,8 @@
-# VST3 검사·WAV 처리
+# VST3 검사·원본 편집창·WAV 처리
 
-Windows용 **비실시간 검사·파일 처리 도구**다. 플러그인을 마이크에 연결하거나 소리를 재생하지 않는다.
+Windows용 **장치 독립 검사·설정·파일 처리 도구**다. 플러그인을 마이크에 연결하거나 소리를 재생하지 않는다.
 설치된 번들 경로를 찾고, 하나를 선택해 별도 프로세스에서 로딩·파라미터 변경·합성 버퍼
-처리·상태 저장을 수행한다. 원본 편집창, 라이브 체인, Scene UI는 아직 없다.
+처리·상태 저장과 원본 편집창을 제공한다. 라이브 체인과 Scene UI는 아직 없다.
 
 ```powershell
 mixlive-plugins.exe list
@@ -47,7 +47,7 @@ mutex가 남아 있다고 문서화되어 있으므로 이 경로를 MixLive cal
 ## 검사 실행
 
 일반 설정·파일 검사는 `cargo test -p mixlive-vst3 --locked`다. `tests/native.rs`와
-`tests/wav_render.rs`의 네 검사는 native fixture가 필요해 기본 실행에서는 ignored이고,
+`tests/wav_render.rs`, `tests/editor.rs`의 검사는 native fixture가 필요해 기본 실행에서는 ignored이고,
 기존 Windows CI job이 소스에서 fixture를 빌드한 뒤
 `cargo test -p mixlive-vst3 --tests --locked -- --ignored`로 실제 실행한다.
 
@@ -84,3 +84,30 @@ mixlive-plugins.exe render "C:\Plugins\Example.vst3" --input dry.wav --output we
 `tests/wav_render.rs`는 기존 Gain fixture로 613-frame 부분 블록, stereo 분리, float headroom,
 44.1 kHz mono/24-bit 변환, 명시적 tail, 기존 출력 보존과 실패 시 미게시를 확인한다.
 CI는 같은 두 fixture를 재사용하고 `--tests -- --ignored`로 native 검사를 실행한다.
+
+## 원본 편집창에서 설정하기
+
+```powershell
+mixlive-plugins.exe edit "C:\Plugins\Example.vst3" --state-out voice.mixlive-vst3.json
+mixlive-plugins.exe edit "C:\Plugins\Example.vst3" --state-in voice.mixlive-vst3.json --state-out voice-v2.mixlive-vst3.json
+mixlive-plugins.exe render "C:\Plugins\Example.vst3" --input dry.wav --output wet.wav --state-in voice-v2.mixlive-vst3.json
+```
+
+- 제조사가 제공하는 VST3 원본 창이다. 새 egui/WebView UI를 만들거나 GPUI 메인 화면을 대신하지 않는다.
+- 플러그인 로딩·창·메시지 처리·상태 접근·종료는 별도 editor 프로세스의 메인 스레드에 있다.
+- `--class-id`, `--state-in`, `--set`, `--sample-rate`는 기존 검사와 같은 의미다.
+- **창을 정상적으로 닫으면 완료**한다. `--state-out`을 명시한 경우에만 새 파일로 저장한다.
+  생략하면 저장하지 않는다. 기존 파일 덮어쓰기·자동 저장·마이크 녹음은 하지 않는다.
+- 대화형 편집에는 검사 도구의 30초 제한을 적용하지 않는다. 중단하려면 콘솔에서 Ctrl+C로
+  종료한다. 비정상 종료 시 최종 상태 파일을 게시하지 않는다. 플러그인은 사용자 권한이며 sandbox가 아니다.
+- Win32 메시지 처리 중에는 플러그인 mutex를 잡지 않는다. 창 크기/DPI/닫힘 처리는 기존
+  `PluginWindow`를 사용한다. 플러그인 뷰를 분리한 뒤 부모 창을 파괴한다.
+- 오디오 장치는 열지 않는다. GUI 변경은 **0-sample parameter flush**로 processor에도 전달하고
+  component/controller 상태를 함께 저장한다. 오디오 미리듣기·보컬 실시간 처리 기능은 아니다.
+- native editor가 없는 플러그인은 오류로 안내한다. 자동으로 다른 플러그인이나 원음으로 대체하지 않는다.
+- CI는 설정 인자, 파일 보존, native editor 미지원, zero-sample 처리와 새 프로세스 상태 복원을
+  기존 fixture로 검사한다. 실제 상용 플러그인 창의 그리기·조작·DPI는 별도 수동 검증 대상이다.
+
+새 의존성 버전은 추가하지 않았다. 이미 lock에 있던 winapi 0.3.9를 메시지 처리의 직접
+의존성으로 선언했다. unsafe 예외는 `editor::native::messages`에만 있으며 오디오 crate의
+`forbid(unsafe_code)`는 바꾸지 않았다.

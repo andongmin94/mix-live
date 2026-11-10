@@ -23,7 +23,7 @@ ASIO feature는 꺼져 있다. 공식 설치 파일·드라이버 릴리스는 �
   biquad가 사용하는 num-traits 0.2.19의 libm feature 때문에 libm 0.2.16이 추가된다.
 - vst3-host 0.11.1 (MIT), Helge Sverre:
   https://github.com/HelgeSverre/rust-vst3-host/tree/6c64cdffc6740cce0b4c5b6916724697b0ef9ff8
-  기본 features를 끄고 Windows의 비실시간 검사 경계에서만 사용한다.
+  기본 features를 끄고 Windows의 장치 독립 검사·편집·파일 처리 경계에서만 사용한다.
   VST3 bindings (`vst3`), libloading 등의 전이 의존성을 포함하며 원본 저작권을 유지한다.
 - serde / serde_json (MIT OR Apache-2.0), tempfile (MIT OR Apache-2.0),
   wait-timeout (MIT OR Apache-2.0): 설정 직렬화·새 파일 원자 저장·검사 자식 프로세스 제한.
@@ -97,3 +97,10 @@ DEALINGS IN THE SOFTWARE.
   WAV 파서·writer를 라이브러리로 재사용한다. 자체 WAV 파서를 만들지 않았다.
   crates.io registry checksum: `62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f`.
   runtime 전이 의존성이 없으며 기존 lockfile의 다른 패키지 버전은 변경하지 않았다.
+
+## 원본 편집창
+
+- 기존 vst3-host 0.11.1의 PluginWindow를 재사용한다. egui/WebView 의존성은 켜지 않는다.
+- winapi 0.3.9 (MIT OR Apache-2.0): https://docs.rs/crate/winapi/0.3.9
+  기존 전이 의존성을 직접 선언하며 버전·checksum은 바꾸지 않았다. Win32 MSG와
+  PeekMessageW/TranslateMessage/DispatchMessageW를 통한 메인 스레드 메시지 처리에만 쓴다.

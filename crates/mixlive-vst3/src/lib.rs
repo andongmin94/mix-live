@@ -4,11 +4,12 @@
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, fs::File, io::{Read, Write}, path::{Path, PathBuf}, process::{Command as Process, Stdio}, time::Duration};
+use std::{collections::HashSet, fs::File, io::{Read, Write}, path::{Path, PathBuf}, process::{Command as Process, ExitStatus, Stdio}, time::Duration};
 use wait_timeout::ChildExt;
 
 #[cfg(windows)]
 pub mod host;
+pub mod editor;
 pub mod render;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -19,7 +20,7 @@ pub const BLOCK_FRAMES: usize = 256;
 pub const TEST_BLOCKS: usize = 16;
 
 #[derive(Debug, Parser)]
-#[command(version, about = "MixLive VST3 tools: inspect plugins and process WAV files without opening audio devices")]
+#[command(version, about = "MixLive VST3 tools: inspect, edit and process WAV files without opening audio devices")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -35,12 +36,21 @@ pub enum Command {
     },
     /// Inspect one bundle, process synthetic buffers and optionally load/save its state.
     Inspect(InspectArgs),
+    /// Open the plugin's own editor. No audio preview. Close the window to finish.
+    Edit(editor::EditArgs),
     /// Process a mono/stereo WAV through one stereo effect. Never overwrites an existing file.
     Render(render::RenderArgs),
     #[command(name = "__probe", hide = true)]
     Probe {
         #[command(flatten)]
         options: InspectArgs,
+        #[arg(long)]
+        report: PathBuf,
+    },
+    #[command(name = "__edit", hide = true)]
+    EditChild {
+        #[command(flatten)]
+        options: editor::EditArgs,
         #[arg(long)]
         report: PathBuf,
     },
@@ -195,6 +205,11 @@ pub(crate) fn finish_child(mut command: Process, report: &Path, timeout_seconds:
             return Err(error.into());
         }
     };
+    read_child_report(status, report)
+}
+
+/// Shared by deadline-bound probes and interactive editor sessions.
+pub(crate) fn read_child_report(status: ExitStatus, report: &Path) -> Result<Value> {
     if !status.success() { return Err(format!("VST3 worker failed ({status}); no live path was changed").into()); }
     let report: Value = serde_json::from_slice(&read_bounded(report, MAX_REPORT_BYTES)?)?;
     if report["schema"] != 1 || report["live_audio_connected"] != false {
