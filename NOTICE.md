@@ -90,3 +90,10 @@ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+
+## WAV 처리 의존성
+
+- hound 3.5.1, Ruud van Asseldonk (Apache-2.0): https://github.com/ruuda/hound
+  WAV 파서·writer를 라이브러리로 재사용한다. 자체 WAV 파서를 만들지 않았다.
+  crates.io registry checksum: `62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f`.
+  runtime 전이 의존성이 없으며 기존 lockfile의 다른 패키지 버전은 변경하지 않았다.

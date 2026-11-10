@@ -14,7 +14,9 @@ pub fn list(directories: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-pub fn probe(options: &InspectArgs) -> Result<Value> {
+/// Shared by synthetic inspection and WAV rendering; never run on the live audio thread.
+pub(crate) fn load_configured(options: &InspectArgs) -> Result<Plugin> {
+    options.validate()?;
     let saved = options.state_in.as_deref().map(StateFile::read).transpose()?;
     let requested = options.class_id.as_deref().or_else(|| saved.as_ref().map(|state| state.class_id.as_str()));
     let mut host = Vst3Host::builder().build()?;
@@ -22,7 +24,6 @@ pub fn probe(options: &InspectArgs) -> Result<Value> {
         Some(id) => host.load_plugin_class(&options.plugin, id)?,
         None => host.load_plugin(&options.plugin)?,
     };
-    // Do not silently accept a retired-ID migration or a different audio class.
     if requested.is_some_and(|id| !id.eq_ignore_ascii_case(&plugin.info().uid)) {
         return Err("loaded audio class differs from the requested class ID".into());
     }
@@ -41,6 +42,11 @@ pub fn probe(options: &InspectArgs) -> Result<Value> {
         if parameter.is_read_only { return Err(format!("VST3 parameter {} is read-only", change.id).into()); }
         plugin.set_parameter(change.id, change.normalized)?;
     }
+    Ok(plugin)
+}
+
+pub fn probe(options: &InspectArgs) -> Result<Value> {
+    let mut plugin = load_configured(options)?;
     let layout = plugin.audio_bus_layout()?;
     validate_layout(&layout)?;
     let latency = plugin.latency_samples();
@@ -71,7 +77,7 @@ pub fn probe(options: &InspectArgs) -> Result<Value> {
         "latency_samples_before": latency,
         "latency_samples_after": plugin.latency_samples(),
         "synthetic_processing": rendered,
-        "state_loaded": saved.is_some(),
+        "state_loaded": options.state_in.is_some(),
         "state_saved_bytes": state_bytes,
         "live_audio_connected": false,
         "note": "Synthetic, offline preflight only. No audio devices or editor windows were opened by MixLive. This is not a live-compatibility or sound-quality approval."

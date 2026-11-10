@@ -20,9 +20,7 @@ jobs:
       - name: Install Rust tools
         run: rustup toolchain install stable --profile minimal --component clippy
       - name: Test routing, clock boundaries, vocal processing and plugin file contracts
-        # This first dependency-introduction run resolves only the new host/tool packages.
-        # Commit its Cargo.lock artifact and restore --locked after reading the results.
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Fetch the existing gain fixture (source only)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -50,8 +48,8 @@ jobs:
           Copy-Item (Join-Path $fixtureTarget 'debug/vst3_host_testplug.dll') $state
           "MIXLIVE_GAIN_VST3=$gain" >> $env:GITHUB_ENV
           "MIXLIVE_STATE_VST3=$state" >> $env:GITHUB_ENV
-      - name: Check native VST3 processing and fresh-process state restore
-        run: cargo test -p mixlive-vst3 --test native --locked -- --ignored
+      - name: Check native VST3 processing, state restore and WAV output
+        run: cargo test -p mixlive-vst3 --tests --locked -- --ignored
       - name: Lint current targets
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build Windows development tools
@@ -64,8 +62,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-plugins.exe inspect --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./target/release/mixlive-plugins.exe render --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Keep development binaries, notices and resolved dependencies
-        if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: windows-audio-dev-${{ github.sha }}
@@ -77,3 +76,4 @@ jobs:
             target/release/mixlive-audio.exe
             target/release/mixlive-plugins.exe
           retention-days: 7
+          if-no-files-found: error
