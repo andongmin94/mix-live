@@ -14,9 +14,11 @@
 
 ## 실제 검증
 
-코드 커밋: `e5afb0d9034b338567246c1f732ff4a49124f979`.
-[Audio #2](https://github.com/andongmin94/mix-live/actions/runs/42788397613)
-Windows job `129735319470` 전체 성공 (Windows Server 2025, Rust 1.99.1).
+코드·의존성 고정 커밋: `f11be5f044d43cda1dc948fe072a0735c81feafc`.
+[Audio #3](https://github.com/andongmin94/mix-live/actions/runs/42789882779)
+Windows job `129740300556` 전체 성공. 최초 구현 커밋 `e5afb0d9`의
+[Audio #2](https://github.com/andongmin94/mix-live/actions/runs/42788397613)도 성공했다.
+실행 환경: Windows Server 2025, Rust 1.99.1.
 
 | 검사 | 결과 |
 |---|---|
@@ -28,8 +30,9 @@ Windows job `129735319470` 전체 성공 (Windows Server 2025, Rust 1.99.1).
 
 새 검사는 채널 매핑·잘못된 CLI 설정·44.1→48 kHz stereo 보존·각 30초 합성 ±500ppm
 clock drift·underrun/overflow/clip guard·한 capture의 두 믹스 분리와 fault 무음을 확인했다.
-첫 CI의 실제 lockfile을 저장소에 반영하고 `--locked`를 복원했다. 의존성을 다시 선택하지
-않은 빌드 결과는 이 변경의 Actions에서 확인한다. 로컬 Rust 도구체인은 없어 미실행이다.
+첫 CI의 실제 lockfile을 저장소에 반영했다. #3에서는 모든 Cargo 명령을 `--locked`로
+실행해 고정된 의존성의 빌드를 검증했다. 로컬 Rust 도구체인은 없어 미실행이다.
+이 결과를 기록하는 마지막 커밋은 문서만 변경하며 통과한 코드 검사를 다시 실행하지 않는다.
 
 ## 미완료
 
