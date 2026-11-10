@@ -1,0 +1,13 @@
+[package]
+name = "mixlive-effects"
+description = "Device-independent streaming vocal processing for MixLive"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.85"
+publish.workspace = true
+
+[dependencies]
+biquad = "=0.6.0"
+
+[lints]
+workspace = true

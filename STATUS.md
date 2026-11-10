@@ -1,50 +1,40 @@
 # 현재 상태
 
 기준일: 2026-11-10
-단계: **S1 Windows 장치 경로 구현·Windows 빌드 성공, 실장비 수용 대기**
+단계: **S2 내장 보컬 체인 구현·통합 검사 대기. S1 실장비 수용은 미완료**
 
-## 구현
+## 이번 변경
 
-- S0 코어 유지. 새 `mixlive-audio-windows`와 `mixlive-audio` CLI 추가.
-- WASAPI endpoint ID·기본 포맷 조회, 입력 1채널 선택, 출력별 채널 매핑.
-- 마이크→독립 출력 1~2개, 입력/두 번째 믹스 음량. `check`는 스트림을 시작하지 않는다.
-- 출력별 bounded SPSC queue와 Rubato sinc resampler, queue 기반 clock drift 조절.
-- peak/queue/underrun/clipping 계수. 장치 오류에는 무음·종료, 다른 장치를 자동 선택하지 않는다.
-- 직접 의존성 CPAL 0.18.2, Rubato 5.0.1, rtrb 0.4.0, clap 4.6.7을 Cargo.lock에 고정했다.
+- `mixlive-effects`: HPF + 3 tone filters, RMS soft-knee compressor, split-band de-esser.
+- off/natural/warm/bright, dry/wet strength, 입력 trim, 압축/디에서 threshold.
+- 입력 trim → 보정 한 번 → 독립 sends → 최종 출력 감쇠. 원음 dry fallback 없음.
+- CLI 보정 옵션과 보정 후 peak·압축/디에서 억제량. 실행 중 설정 변경은 아직 없음.
+- `--gain-db` 제거, `--input-gain-db`와 `--output-gain-db`로 역할 분리. 출력 기본 -18 dB.
+- biquad 0.6.0과 필요한 libm 0.2.16만 lock에 추가. 기존 버전은 변경하지 않음.
+- 새 DSP 검사 7개, 실제 capture 경로의 DSP/두 출력 연결 검사 1개. 기존 CI job 사용.
 
-## 실제 검증
+## 검증 상태
 
-코드·의존성 고정 커밋: `f11be5f044d43cda1dc948fe072a0735c81feafc`.
-[Audio #3](https://github.com/andongmin94/mix-live/actions/runs/42789882779)
-Windows job `129740300556` 전체 성공. 최초 구현 커밋 `e5afb0d9`의
-[Audio #2](https://github.com/andongmin94/mix-live/actions/runs/42788397613)도 성공했다.
-실행 환경: Windows Server 2025, Rust 1.99.1.
+- 이번 변경의 컴파일·테스트·Windows exe 결과는 아직 확인 전이다.
+- 로컬 Rust 도구체인이 없고 GitHub 직접 연결 DNS도 실패했다. 원격 GitHub Actions에서 검사한다.
+- S1 기존 검증: `f11be5f044d43cda1dc948fe072a0735c81feafc`,
+  [Audio #3](https://github.com/andongmin94/mix-live/actions/runs/42789882779):
+  core 8 + audio 6 통과, Clippy·Windows release 빌드·도움말 실행 성공.
+- 이번 신규 검사는 bypass/float headroom, HPF response, compressor knee/ratio/release,
+  high-band de-essing, block-size independence, invalid-input silence, sends 이전 1회 DSP를 대상으로 한다.
 
-| 검사 | 결과 |
-|---|---|
-| workspace tests | 기존 core 8 + 새 audio 6 = 14 passed, 0 failed, 0 ignored |
-| Clippy all targets, warnings denied | 성공 |
-| release Windows exe build | 성공 |
-| exe `--help` | Windows에서 실제 실행 성공; 장치를 열지 않음 |
-| artifact 내려받기 | 2파일(exe, Cargo.lock), 게시된 SHA256과 일치 |
+## 아직 수용하지 않은 범위
 
-새 검사는 채널 매핑·잘못된 CLI 설정·44.1→48 kHz stereo 보존·각 30초 합성 ±500ppm
-clock drift·underrun/overflow/clip guard·한 capture의 두 믹스 분리와 fault 무음을 확인했다.
-첫 CI의 실제 lockfile을 저장소에 반영했다. #3에서는 모든 Cargo 명령을 `--locked`로
-실행해 고정된 의존성의 빌드를 검증했다. 로컬 Rust 도구체인은 없어 미실행이다.
-이 결과를 기록하는 마지막 커밋은 문서만 변경하며 통과한 코드 검사를 다시 실행하지 않는다.
-
-## 미완료
-
-- 실제 MiniFuse 모델·WASAPI 채널·드라이버·버퍼, 통화/헤드폰 출력, 장시간 dropout,
-  실제 clock drift, 청취, 왕복 지연은 미검증. 합성 테스트를 실장비 검증으로 취급하지 않는다.
-- ASIO, Chrome/app capture, 자체 가상 장치, GPUI, VST3, 보컬 DSP, Scene 저장은 미구현.
-- 현재 출력은 기존 물리/가상 케이블의 재생 endpoint를 사용한다. 새 가상 마이크를 설치하지 않는다.
-- gain과 sample clipping guard는 보컬 보정·transparent/true-peak limiter가 아니다.
-- 개발용 exe는 서명된 출시 제품이 아니다. 녹음·드라이버 설치·공식 릴리스는 하지 않았다.
+- MiniFuse 모델·채널·driver, 장시간 실제 clock drift/dropout, 실제 음성 청취, 왕복 지연.
+- 프리셋은 청취 미수용 시작값이다. 수치 검사 통과를 고품질·상용 플러그인 동급이라 부르지 않는다.
+- sample clipping guard는 transparent/true-peak limiter가 아니다. DSP에 lookahead가 없다고
+  장치·queue 지연이나 IIR group delay까지 0이라고 쓰지 않는다.
+- ASIO, Chrome/app capture, 자체 가상 장치, GPUI, VST3, 공간계, pitch correction,
+  Scene/플러그인 상태 저장, 실시간 parameter 변경은 미구현. S2 전체 완료가 아니다.
+- 음성 녹음·클라우드 전송·드라이버 설치·공식 릴리스를 하지 않는다.
 
 ## 다음
 
-S1 실장비 수용은 별도 유지한다. 구현 경로를 바탕으로 보컬 DSP와 VST3를 추가하되,
-고품질 보정 완료는 실제 목소리의 음량 일치 청취 평가와 지연 검증으로 판정한다.
-현재 상태는 이 파일, 이력은 Git, 실행 근거는 각 커밋의 Actions를 따른다.
+이번 통합 검사 결과를 반영한 뒤 VST3 effect 1개의 실제 로딩/처리/상태 저장 경로를 만든다.
+보컬 프리셋의 품질 수용은 사용자가 동의한 실제 목소리의 음량 일치 청취와 장비 지연 측정으로 별도 수행한다.
+현재 기록은 이 파일, 이력은 Git, 실행 증거는 각 커밋의 Actions를 따른다.

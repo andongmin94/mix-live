@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/mixlive-core", "crates/mixlive-audio-windows"]
+members = ["crates/mixlive-core", "crates/mixlive-effects", "crates/mixlive-audio-windows"]
 resolver = "2"
 
 [workspace.package]

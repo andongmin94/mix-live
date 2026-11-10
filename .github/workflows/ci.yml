@@ -19,20 +19,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install Rust tools
         run: rustup toolchain install stable --profile minimal --component clippy
-      - name: Test core and clock boundaries
+      - name: Test routing, clock boundaries and vocal processing
         run: cargo test --workspace --locked
       - name: Lint current targets
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build Windows device prototype
         run: cargo build --release -p mixlive-audio-windows --bin mixlive-audio --locked
       - name: Check CLI without opening devices
-        run: ./target/release/mixlive-audio.exe --help
-      - name: Keep development binary and resolved dependencies
+        run: |
+          ./target/release/mixlive-audio.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./target/release/mixlive-audio.exe run --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Keep development binary, notices and resolved dependencies
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: windows-audio-dev-${{ github.sha }}
           path: |
             Cargo.lock
+            README.md
+            NOTICE.md
             target/release/mixlive-audio.exe
           retention-days: 7
