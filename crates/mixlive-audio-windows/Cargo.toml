@@ -1,0 +1,23 @@
+[package]
+name = "mixlive-audio-windows"
+description = "Explicit Windows device routes for MixLive; portable clock-boundary tests"
+version.workspace = true
+edition.workspace = true
+rust-version = "1.87"
+publish.workspace = true
+
+[dependencies]
+mixlive-core = { path = "../mixlive-core" }
+rtrb = "=0.4.0"
+rubato = { version = "=5.0.1", default-features = false }
+clap = { version = "4.6", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+cpal = "=0.18.2"
+
+[[bin]]
+name = "mixlive-audio"
+path = "src/main.rs"
+
+[lints]
+workspace = true
