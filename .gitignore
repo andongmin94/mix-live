@@ -1,0 +1,11 @@
+/target/
+*.scraft
+*.wav
+*.flac
+*.mp3
+*.vstpreset
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

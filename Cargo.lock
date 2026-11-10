@@ -1,0 +1,7 @@
+# Dependency-free bootstrap lockfile.
+# Cargo execution is pending; see STATUS.md.
+version = 3
+
+[[package]]
+name = "mixlive-core"
+version = "0.1.0-dev"

@@ -1,0 +1,30 @@
+name: Core
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**/*.md"]
+  pull_request:
+    paths-ignore: ["**/*.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: core-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust tools
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Test portable routing core
+        run: cargo test --workspace --locked
+      - name: Lint current targets
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run in-memory routing example
+        run: cargo run -p mixlive-core --example discord_singing --locked
