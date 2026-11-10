@@ -1,9 +1,11 @@
 /target/
+/.fixtures/
 *.scraft
 *.wav
 *.flac
 *.mp3
 *.vstpreset
+*.mixlive-vst3.json
 .env
 .env.*
 !.env.example

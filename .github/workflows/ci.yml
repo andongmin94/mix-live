@@ -19,19 +19,52 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install Rust tools
         run: rustup toolchain install stable --profile minimal --component clippy
-      - name: Test routing, clock boundaries and vocal processing
-        run: cargo test --workspace --locked
+      - name: Test routing, clock boundaries, vocal processing and plugin file contracts
+        # This first dependency-introduction run resolves only the new host/tool packages.
+        # Commit its Cargo.lock artifact and restore --locked after reading the results.
+        run: cargo test --workspace
+      - name: Fetch the existing gain fixture (source only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: coupler-rs/vst3-rs
+          ref: b2a45f2d40e602eff5a224b41613735388868590
+          path: .fixtures/vst3-rs
+          persist-credentials: false
+      - name: Fetch the existing state fixture (source only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: HelgeSverre/rust-vst3-host
+          ref: 6c64cdffc6740cce0b4c5b6916724697b0ef9ff8
+          path: .fixtures/rust-vst3-host
+          persist-credentials: false
+      - name: Build two native fixtures without installing plugins
+        run: |
+          $fixtureTarget = Join-Path $env:RUNNER_TEMP 'mixlive-vst3-fixtures'
+          cargo build --manifest-path .fixtures/vst3-rs/Cargo.toml -p vst3 --example gain --target-dir $fixtureTarget
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --manifest-path .fixtures/rust-vst3-host/Cargo.toml -p vst3-host-testplug --lib --target-dir $fixtureTarget
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $gain = Join-Path $fixtureTarget 'gain.vst3'
+          $state = Join-Path $fixtureTarget 'state.vst3'
+          Copy-Item (Join-Path $fixtureTarget 'debug/examples/gain.dll') $gain
+          Copy-Item (Join-Path $fixtureTarget 'debug/vst3_host_testplug.dll') $state
+          "MIXLIVE_GAIN_VST3=$gain" >> $env:GITHUB_ENV
+          "MIXLIVE_STATE_VST3=$state" >> $env:GITHUB_ENV
+      - name: Check native VST3 processing and fresh-process state restore
+        run: cargo test -p mixlive-vst3 --test native --locked -- --ignored
       - name: Lint current targets
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Build Windows device prototype
-        run: cargo build --release -p mixlive-audio-windows --bin mixlive-audio --locked
-      - name: Check CLI without opening devices
+      - name: Build Windows development tools
+        run: cargo build --release -p mixlive-audio-windows -p mixlive-vst3 --bins --locked
+      - name: Check CLIs without opening devices
         run: |
           ./target/release/mixlive-audio.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-audio.exe run --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Keep development binary, notices and resolved dependencies
+          ./target/release/mixlive-plugins.exe inspect --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Keep development binaries, notices and resolved dependencies
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -40,5 +73,7 @@ jobs:
             Cargo.lock
             README.md
             NOTICE.md
+            crates/mixlive-vst3/README.md
             target/release/mixlive-audio.exe
+            target/release/mixlive-plugins.exe
           retention-days: 7

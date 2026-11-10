@@ -1,8 +1,8 @@
 # 출처 및 라이선스 상태
 
-MixLive는 신규 설계·라우팅·보컬 체인 코드다. SoundCraft, FilmCraft, Splitwave,
-Steinberg SDK, Microsoft driver sample의 소스를 복사하거나 포함하지 않았다.
-S0 코어는 외부 의존성이 없고 장치/DSP 경로는 아래 Cargo 의존성을 사용한다.
+MixLive의 라우팅·보컬 체인·검사 앱 코드는 신규 구현이다. SoundCraft/FilmCraft/Splitwave,
+Steinberg SDK, Microsoft driver sample 소스를 직접 복사하거나 vendoring하지 않았다.
+VST3 API는 아래 Rust 호스팅 라이브러리와 그 의존성을 통해 사용한다.
 
 제품 전체 라이선스는 미정이다. 임의로 MIT/Apache 라이선스를 부여하지 않았으며
 Cargo 패키지는 `publish = false`다. 외부 의존성의 라이선스는 별도로 유지한다.
@@ -19,13 +19,47 @@ ASIO feature는 꺼져 있다. 공식 설치 파일·드라이버 릴리스는 �
 - clap 4.6 (MIT OR Apache-2.0): https://github.com/clap-rs/clap
 - biquad 0.6.0 (MIT OR Apache-2.0), Emil Fresk: https://github.com/korken89/biquad-rs
   Registry checksum: `8dee8f423f64504139bdc53d7fbe6a1cd8eff4f354be3652e7cf26385c9f1cb4`.
-  新규 필터 구현을 복사하지 않고 라이브러리로 링크한다. coefficient와 DF2T API를 확인했다.
+  신규 필터 구현을 복사하지 않고 라이브러리로 링크한다. coefficient와 DF2T API를 확인했다.
   biquad가 사용하는 num-traits 0.2.19의 libm feature 때문에 libm 0.2.16이 추가된다.
+- vst3-host 0.11.1 (MIT), Helge Sverre:
+  https://github.com/HelgeSverre/rust-vst3-host/tree/6c64cdffc6740cce0b4c5b6916724697b0ef9ff8
+  기본 features를 끄고 Windows의 비실시간 검사 경계에서만 사용한다.
+  VST3 bindings (`vst3`), libloading 등의 전이 의존성을 포함하며 원본 저작권을 유지한다.
+- serde / serde_json (MIT OR Apache-2.0), tempfile (MIT OR Apache-2.0),
+  wait-timeout (MIT OR Apache-2.0): 설정 직렬화·새 파일 원자 저장·검사 자식 프로세스 제한.
 
 필터 근거: Robert Bristow-Johnson의 Audio EQ Cookbook을 구현한 biquad를 사용한다.
 https://www.w3.org/TR/audio-eq-cookbook/
 컴프레서와 디에서는 MixLive의 소규모 streaming 구현이며 기존 제품의 모델링이나
 청취 품질 동등성을 주장하지 않는다. 기술 조사 자료는 DESIGN.md를 함께 참조한다.
+
+## 검사용 외부 소스
+
+CI가 고정 commit에서 가져오는 다음 fixture는 저장소에 복사하거나 제품에 배포하지 않는다.
+- `coupler-rs/vst3-rs` (`MIT OR Apache-2.0`), commit `b2a45f2d40e602eff5a224b41613735388868590`의 gain example.
+- `HelgeSverre/rust-vst3-host` (`MIT`), commit `6c64cdffc6740cce0b4c5b6916724697b0ef9ff8`의 test-plugin.
+
+## vst3-host MIT 고지
+
+Copyright (c) 2026 Helge Sverre
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ## biquad MIT 선택 고지
 
