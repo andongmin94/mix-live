@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-11
-단계: **VST3 원본 편집창·닫은 뒤 상태 저장 구현. Windows 통합 검사 대기**
+단계: **VST3 원본 편집창 경로 구현·Windows 빌드/상태 검사 통과. 실제 GUI·라이브 VST3 수용은 남음**
 
 ## 이번 묶음
 
@@ -14,12 +14,30 @@
 - unsafe는 Win32 메시지 경계만 허용. 오디오/effects/core의 forbid는 유지한다.
 - 기존 실시간 mic/DSP/출력 코드는 변경하지 않았다. editor는 오디오 장치를 열지 않는다.
 
-## 검증
+## 실제 검증
 
-- 기준 코드 `10ef699464fd25005382bbdfc2a666d338f637ea`의 Audio #6 성공은 유지된다.
-- 새 일반 검사 2개와 기존 fixture를 재사용하는 native 검사 2개를 작성했다.
-- 새 변경의 Windows compile/test/Clippy/실행 파일 검사는 아직 결과 확인 전이다.
-- 로컬에는 cargo/rustc가 없고 GitHub 직접 DNS 조회가 실패해 원격 Actions에서 검사한다.
+코드 커밋: `1f378c36aee23da21cae450ac10dbb003a039914`.
+[Audio #7](https://github.com/andongmin94/mix-live/actions/runs/42844917616)의
+Windows job `129929729403` 및 모든 단계가 success다. Windows Server 2025 / Rust 1.99.1.
+
+| 검사 | 실제 결과 |
+|---|---|
+| `cargo test --workspace --locked` | audio 7 + core 8 + effects 7 + plugins 7 = 29 passed, 0 failed |
+| 기존 fixture의 native 통합 검사 | editor 2 + 기존 로딩/상태 2 + WAV 2 = 6 passed, 0 failed |
+| Clippy, all targets, warnings denied | 통과 |
+| 두 Windows release 실행 파일 | 빌드 성공 |
+| audio / run / inspect / render / edit 도움말 | 실제 실행 성공, 장치는 열지 않음 |
+
+새 검사는 명시적 저장 인자, 기존 파일 보존, editor 미지원/잘못된 DLL의 저장 미발생,
+0-sample parameter 처리 후 0.29 설정값의 저장과 새 프로세스 복원을 확인했다.
+실제 창을 열어 노브를 조작하는 positive GUI 테스트는 수행하지 않았다.
+기존 fixture를 재사용했고 유료 플러그인 설치·새 검증 프레임워크는 추가하지 않았다.
+
+내려받은 artifact `13777412007`의 SHA256은 GitHub 값과 일치한다:
+`782a0c120c3a6950f261e0962a08e5a0c2ce4b21f346485e1b5fbc5bcdf7f66d`.
+두 exe와 안내 파일을 확인했고 Cargo.lock은 CRLF 차이를 제외하면 저장소와 동일하다.
+로컬 cargo/rustc는 없어 로컬 Rust 검사는 미실행이다. 위 결과는 실제 Windows Actions다.
+이 검증 기록만 갱신하는 커밋은 코드/의존성을 바꾸지 않아 CI를 다시 실행하지 않는다.
 
 ## 남은 수용 범위
 
@@ -31,6 +49,6 @@
 
 ## 다음
 
-이번 변경의 검사 결과를 반영한다. 이후 VST3 오디오 처리의 thread/lifecycle/lock 경계를
-해결해 실시간 체인에 연결하고, 기존 장치·보정·플러그인 제어를 GPUI 메인 화면으로 묶는다.
+VST3 오디오 처리의 thread/lifecycle/lock 경계를 해결해 실시간 체인에 연결하고,
+기존 장치·보정·플러그인 제어를 GPUI 메인 화면으로 묶는다.
 현재 상태는 이 파일, 이력은 Git, 실행 증거는 해당 commit의 Actions를 따른다.
