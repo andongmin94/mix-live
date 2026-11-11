@@ -14,12 +14,14 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install Rust tools
         run: rustup toolchain install stable --profile minimal --component clippy
-      - name: Test routing, clock boundaries, vocal processing and plugin file contracts
+      - name: Test routing, clock boundaries, vocal processing, Scene UI state and plugin files
         run: cargo test --workspace --locked
       - name: Fetch the existing gain fixture (source only)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -52,8 +54,8 @@ jobs:
         run: cargo test -p mixlive-vst3 -p mixlive-audio-windows --tests --locked -- --ignored
       - name: Lint current targets
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Build Windows development tools
-        run: cargo build --release -p mixlive-audio-windows -p mixlive-vst3 --bins --locked
+      - name: Build Windows app and development tools
+        run: cargo build --release -p mixlive-app -p mixlive-audio-windows -p mixlive-vst3 --bins --locked
       - name: Check CLIs without opening devices
         run: |
           ./target/release/mixlive-audio.exe --help
@@ -66,6 +68,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-plugins.exe edit --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Open and close the native screen without devices or plugins
+        run: |
+          $app = Start-Process ./target/release/mixlive.exe -PassThru
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            do {
+              Start-Sleep -Milliseconds 250
+              $app.Refresh()
+            } while (!$app.HasExited -and $app.MainWindowHandle -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+            if ($app.HasExited) { throw "MixLive exited before opening its window: $($app.ExitCode)" }
+            if ($app.MainWindowHandle -eq 0) { throw 'MixLive did not open its native window' }
+            if (!$app.CloseMainWindow()) { throw 'MixLive did not accept window close' }
+            if (!$app.WaitForExit(10000)) { throw 'MixLive did not exit after closing the empty screen' }
+            if ($app.ExitCode -ne 0) { throw "MixLive exited with code $($app.ExitCode)" }
+          } finally {
+            if (!$app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
       - name: Keep development binaries, notices and resolved dependencies
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
@@ -74,7 +93,9 @@ jobs:
             Cargo.lock
             README.md
             NOTICE.md
+            licenses/
             crates/mixlive-vst3/README.md
+            target/release/mixlive.exe
             target/release/mixlive-audio.exe
             target/release/mixlive-plugins.exe
           retention-days: 7

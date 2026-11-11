@@ -3,8 +3,9 @@
 **내 소리를 만들고, 누구에게 들려줄지 정한다.**
 
 Windows용 실시간 마이크·MR 라우팅/믹싱/보정 앱을 만드는 프로젝트다. DAW 타임라인이나
-OBS 전용 플러그인이 아니다. 현재는 **명령줄 개발 빌드**이며 GPUI 메인 화면·자체 가상 마이크·
-ASIO·앱별 직접 캡처는 아직 없다. 실제 검증 결과와 미검증 범위는 [STATUS.md](STATUS.md)를 따른다.
+OBS 전용 플러그인이 아니다. 현재는 **GPUI Scene 실행 화면과 명령줄 도구를 제공하는 개발 빌드**다.
+자체 가상 마이크·ASIO·앱별 직접 캡처는 아직 없다. 실제 검증 결과와 미검증 범위는
+[STATUS.md](STATUS.md)를 따른다.
 
 ## 현재 처리 경로
 
@@ -29,7 +30,40 @@ Rust stable로 빌드하거나 해당 코드 커밋의 Actions artifact를 사�
 드라이버 설치나 시스템 기본 장치 변경을 하지 않는다.
 
 ```powershell
-cargo build --release -p mixlive-audio-windows -p mixlive-vst3 --bins --locked
+cargo build --release -p mixlive-app -p mixlive-audio-windows -p mixlive-vst3 --bins --locked
+.\target\release\mixlive.exe
+```
+
+### 네이티브 Scene 화면
+
+`mixlive.exe`에서 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작** 순서로 실행한다.
+파일 경로를 `mixlive.exe singing.mixlive-scene.json`으로 전달해도 읽기만 하며 자동으로 시작하지 않는다.
+시작할 때 기존 장치/채널 검증과 VST3 로딩을 수행한다. Scene의 실제 DLL과 장치가 필요하며,
+누락되면 오류를 표시하고 시작하지 않는다. 다른 장치나 원음 경로로 바꾸지 않는다.
+
+실행 중에는 다음을 화면에서 조절한다.
+
+- 고정 상단의 전체 출력 음소거, 소스별 mic/AUX 음소거, 출력별 음소거.
+- 두 출력에 공통으로 적용되는 전체 음량과 추가 송출의 추가 감쇠.
+- 각 소스를 어느 출력에 보낼지 선택하는 스위치와 경로별 음량.
+- 실제 엔진의 상태/오류와 초당 갱신되는 진단 수치. 가상 level 애니메이션은 없다.
+
+**정지** 또는 창 닫기는 기존 장치 중지 → worker 종료 → native plugin 해제 경로를 사용한다.
+장치 시작·종료와 native plugin 수명은 GPUI 메인 스레드에 유지하고, 네이티브 호출 중에는
+GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 crash/hang은 여전히 격리되지 않는다.
+명시적으로 정지하거나 오류가 나기 전까지 실행하며 CLI의 실행 시간 제한은 적용하지 않는다.
+
+이 첫 화면은 기존 Scene을 실행한다. Scene 생성과 장치 ID 확인은 아래 CLI를 사용한다.
+장치 선택 마법사, 화면에서 보컬 설정/체인 편집, 원본 plugin editor, 실행 상태 저장은 아직 없다.
+음소거·음량·경로 변경은 이번 실행에만 적용되며 다시 시작하면 파일의 설정을 사용한다.
+표시된 endpoint 채널은 WASAPI 채널이고, 신고된 queue/plugin 지연은 실측 왕복 지연이 아니다.
+
+GPUI Design은 [고정 revision](https://github.com/andongmin94/gpui-design/tree/385b0178fbbaa3d30de79fe04329aab62a257dc0)의
+Button/Switch/Slider/Root를 재사용하고 GPUI engine family 0.3.11을 사용한다.
+
+### 장치 확인과 Scene 생성용 CLI
+
+```powershell
 .\target\release\mixlive-audio.exe devices
 .\target\release\mixlive-audio.exe check --input "<INPUT ID>" --output "<OUTPUT ID>" --vocal natural
 .\target\release\mixlive-audio.exe run --input "<INPUT ID>" --output "<OUTPUT ID>" --vocal natural --output-gain-db -18 --seconds 30
@@ -193,7 +227,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run -p mixlive-core --example discord_singing --locked
 ```
 
-Windows CI의 기존 native fixture 검사도 따른다. 자동 검사는 실제 오디오 장치를 열지 않는다.
+Windows CI의 기존 native fixture 검사도 따른다. 추가된 화면 검사는 빈 네이티브 창의
+열기/닫기만 확인하며 실제 오디오 장치를 열거나 상용 VST3 GUI를 조작하지 않는다.
 통과한 검사와 실제 장비·GUI·청취 수용을 구분한다. sample peak/GR은 LUFS/true peak가 아니다.
 
 [DESIGN.md](DESIGN.md) · [STATUS.md](STATUS.md) · [AGENTS.md](AGENTS.md) · [NOTICE.md](NOTICE.md)

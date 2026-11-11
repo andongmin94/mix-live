@@ -1,0 +1,26 @@
+[package]
+name = "mixlive-app"
+description = "MixLive's native Windows Scene and live-routing screen"
+version.workspace = true
+edition = "2024"
+rust-version = "1.88"
+publish.workspace = true
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+mixlive-audio-windows = { path = "../mixlive-audio-windows" }
+gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", default-features = false }
+gpui-design = { git = "https://github.com/andongmin94/gpui-design", rev = "385b0178fbbaa3d30de79fe04329aab62a257dc0" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "mixlive"
+path = "src/main.rs"
+
+[lints]
+workspace = true

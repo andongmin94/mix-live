@@ -13,6 +13,19 @@ ASIO feature는 꺼져 있다. 공식 설치 파일·드라이버 릴리스는 �
 
 정확한 전이 의존성은 Cargo.lock을 따른다. 전체 제품 라이선스 선택을 대신하지 않는다.
 
+- GPUI Design (Apache-2.0), `andongmin94/gpui-design`:
+  https://github.com/andongmin94/gpui-design/tree/385b0178fbbaa3d30de79fe04329aab62a257dc0
+  이 revision의 Button/Switch/Slider/Root를 의존성으로 재사용한다. 앱의 색상과 레이아웃은
+  MixLive가 정의하며 slider 표시의 배치는 upstream `two_styles` 예제의 계약을 따른다.
+  원본은 GPUI Kit v0.9.0에서 분리되었고 Copyright 2024–2026 Longbridge를 포함한다.
+  원본 라이선스 전문은 `licenses/gpui-design-APACHE-2.0.txt`에 보존한다. 별도 NOTICE는 없다.
+- GPUI pre / platform 0.3.11 (Apache-2.0), Zed Industries:
+  https://crates.io/crates/gpui-pre/0.3.11
+  https://github.com/zed-industries/zed/tree/f816e1f9263e3a8ef63c4baaa02e1441ce1c6038
+  GPUI Design과 같은 engine family를 정확히 고정하며 Windows 네이티브 backend를 사용한다.
+  원본 Copyright 2022–2025 Zed Industries와 라이선스 전문은
+  `licenses/gpui-APACHE-2.0.txt`에 보존한다. 바이너리 artifact에도 두 고지를 포함한다.
+
 - CPAL 0.18.2 (Apache-2.0): https://github.com/RustAudio/cpal/tree/v0.18.2
 - Rubato 5.0.1 (MIT OR Apache-2.0): https://github.com/HEnquist/rubato
 - rtrb 0.4.0 (MIT OR Apache-2.0): https://github.com/mgeier/rtrb

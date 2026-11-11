@@ -128,6 +128,29 @@ impl LiveControls {
     pub fn has_aux(&self) -> bool { self.has_aux }
     pub fn stop_requested(&self) -> bool { self.stop_requested.load(Ordering::Relaxed) }
 
+    /// Requested mute for this stage; global and local mutes remain independent.
+    pub fn is_muted(&self, target: MuteTarget) -> bool {
+        self.muted.load(Ordering::Relaxed) & target.bit() != 0
+    }
+
+    /// Requested attenuation, before combining the master and send stages.
+    pub fn gain_db(&self, target: GainTarget) -> Result<f32, String> {
+        let level = match target {
+            GainTarget::Master => &self.master,
+            GainTarget::Send if self.has_send => &self.send,
+            GainTarget::Send => return Err("this route has no send mix".into()),
+        };
+        Ok(20.0 * f32::from_bits(level.load(Ordering::Relaxed)).log10())
+    }
+
+    /// Requested connection and attenuation. A disabled route retains its level.
+    pub fn route_state(&self, source: RouteSource, mix: RouteMix) -> Result<(bool, f32), String> {
+        let index = self.route_index(source, mix)?;
+        let enabled = self.routes_enabled.load(Ordering::Relaxed) & (1 << index) != 0;
+        let db = 20.0 * f32::from_bits(self.route_levels[index].load(Ordering::Relaxed)).log10();
+        Ok((enabled, db))
+    }
+
     /// Control/UI thread only. Invalid commands leave every target unchanged.
     /// Stop requests teardown on the owning control thread, never inside a device callback.
     pub fn apply(&self, command: LiveCommand) -> Result<(), String> {
@@ -265,6 +288,38 @@ impl PlaybackGains {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typed_reads_preserve_independent_requested_controls_and_reject_absent_routes() {
+        let controls = LiveControls::new(-18.0, Some(-6.0), true).unwrap();
+        assert!((controls.gain_db(GainTarget::Master).unwrap() + 18.0).abs() < 1e-5);
+        assert!((controls.gain_db(GainTarget::Send).unwrap() + 6.0).abs() < 1e-5);
+        assert_eq!(controls.route_state(RouteSource::Mic, RouteMix::Output).unwrap(), (true, 0.0));
+        assert_eq!(controls.route_state(RouteSource::Aux, RouteMix::Send).unwrap(), (false, 0.0));
+
+        for command in ["mute all", "mute mic", "gain master -12.5", "gain send -9",
+            "level aux send -15", "route aux send on", "route aux send off"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        assert!(controls.is_muted(MuteTarget::All));
+        assert!(controls.is_muted(MuteTarget::Mic));
+        assert!(!controls.is_muted(MuteTarget::Output));
+        assert!(!controls.is_muted(MuteTarget::Send));
+        assert!((controls.gain_db(GainTarget::Master).unwrap() + 12.5).abs() < 1e-5);
+        assert!((controls.gain_db(GainTarget::Send).unwrap() + 9.0).abs() < 1e-5);
+        let (enabled, db) = controls.route_state(RouteSource::Aux, RouteMix::Send).unwrap();
+        assert!(!enabled);
+        assert!((db + 15.0).abs() < 1e-5);
+        controls.apply("unmute all".parse().unwrap()).unwrap();
+        assert!(!controls.is_muted(MuteTarget::All));
+        assert!(controls.is_muted(MuteTarget::Mic));
+
+        let single = LiveControls::new(0.0, None, false).unwrap();
+        assert_eq!(single.gain_db(GainTarget::Master).unwrap(), 0.0);
+        assert!(single.gain_db(GainTarget::Send).is_err());
+        assert!(single.route_state(RouteSource::Aux, RouteMix::Output).is_err());
+        assert!(single.route_state(RouteSource::Mic, RouteMix::Send).is_err());
+    }
+
     #[test]
     fn commands_validate_before_mutating_and_master_unmute_preserves_local_mutes() {
         let controls = LiveControls::new(-18.0, Some(-6.0), true).unwrap();
