@@ -182,7 +182,7 @@ AUX 장치 오류·잘못된 sample·queue overflow는 전체 경로를 중단�
 음성은 저장하지 않는다. Scene에는 개인 endpoint ID가 있으므로 공유하지 않는 것이 좋고,
 문서의 `*.mixlive-scene.json` 확장자는 `.gitignore`로 제외한다.
 
-## 실행 중 음량·음소거·중지
+## 실행 중 라우팅·음량·음소거·중지
 
 직접 `run` 또는 `scene run`에 `--interactive`를 붙이면 터미널에서 아래 명령을 입력한다.
 명령은 Enter로 실행한다. 별도 서버·포트·전역 단축키를 만들지 않으며, 이 옵션이 없으면
@@ -201,13 +201,14 @@ AUX 장치 오류·잘못된 sample·queue overflow는 전체 경로를 중단�
 | `mute all` / `unmute all` | 두 출력의 전체 음소거/해제. 개별 mute 상태는 그대로 유지 |
 | `gain master -18` | 두 출력의 공통 최종 감쇠. 초기값은 `--output-gain-db` |
 | `gain send -6` | 두 번째 출력에만 추가 감쇠. 초기값은 `--send-gain-db` |
-| `status` | 현재 요청된 음량과 mute 상태 표시 |
+| `status` | 현재 요청된 음량·mute·소스별 목적지와 경로 음량 표시 |
 | `stop` | 실행 중인 capture/playback stream을 닫고 종료 |
 
 두 gain 명령은 -96..0 dB의 유한한 값만 받는다. AUX/두 번째 출력이 없는 경로에서
 해당 명령은 거절하며 이전 설정을 유지한다. gain을 바꾸어도 음소거는 풀리지 않는다.
 상태는 **현재 실행에만** 적용되고 Scene 파일에는 자동 저장되지 않는다. Scene schema 2는
-변하지 않았다. 장치·AUX 목적지·보컬 프리셋/threshold·source trim은 실행 중 바꾸지 않는다.
+변하지 않았다. 장치·보컬 프리셋/threshold·source trim은 실행 중 바꾸지 않는다.
+마이크와 AUX의 목적지별 연결 및 추가 감쇠는 아래 명령으로 변경할 수 있다.
 
 source mute는 보컬 DSP 뒤 또는 AUX 합산 전에 적용한다. 마이크와 AUX 캡처는 계속되고
 보컬 검출기 상태도 유지한다. 따라서 mute는 마이크 장치 접근을 중단하는 기능이 아니다.
@@ -222,6 +223,36 @@ OS/드라이버 버퍼까지 포함한 음소거 응답시간의 보장이 아�
 
 대화형 입력의 EOF/입력 오류도 종료 요청으로 처리한다. `stop`/시간 제한/오류로 종료할 때
 소스와 출력 스트림을 소유 스레드에서 닫는다. `Stopped`는 해당 스트림 해제 뒤 출력한다.
+
+### 목소리·MR을 목적지별로 따로 조절
+
+`output`은 첫 번째 믹스, `send`는 `--send`로 정한 두 번째 믹스다. 앱 이름을 뜻하지 않는다.
+헤드폰을 output, 통화 송신을 send로 구성한 경우 아래 명령을 대화형 터미널에 입력한다.
+
+| 명령 | 효과 |
+|---|---|
+| `route mic output off` | 내 헤드폰에서 목소리만 제외. 상대에게 보내는 목소리와 MR은 유지 |
+| `route mic output on` | 헤드폰 보컬을 해당 경로의 기존 음량으로 다시 포함 |
+| `route aux send off` | 상대에게 MR을 보내지 않음. 헤드폰 MR 설정은 유지 |
+| `route aux output on` | MR을 첫 믹스에도 포함. 이미 다른 경로로 듣는다면 중복 모니터링에 주의 |
+| `level aux send -6` | 상대에게 보내는 MR만 추가 6 dB 감쇠. 목소리·헤드폰 MR은 그대로 |
+| `level mic output -9` | 헤드폰 목소리만 추가 9 dB 감쇠. 보컬 DSP 입력/검출기는 그대로 |
+
+일반형은 `route mic|aux output|send on|off`, `level mic|aux output|send <dB>`다.
+level 범위는 -96..0 dB이고 0은 추가 감쇠 없음이다. AUX의 기존 `--aux-gain-db`도 별도로 적용된다.
+`gain send`는 두 번째 믹스 전체, `level aux send`는 그 안의 MR만 바꾸므로 서로 다르다.
+**꺼둔 경로의 level을 바꿔도 켜지지 않는다.** route on 역시 mic/aux/output/send/all mute를
+풀지 않는다. status에는 각 경로의 on/off와 저장된 추가 감쇠를 따로 표시한다.
+
+처음 시작할 때는 마이크를 기존처럼 모든 출력에 보내고 AUX는 `--aux-to` 또는 Scene의
+초기 목적지를 따른다. 없는 AUX/두 번째 믹스에는 경로를 만들지 않으며 장치 재시작도 하지 않는다.
+현재 실행의 라우팅 변경은 Scene에 자동 저장하지 않는다. 장치 바인딩·Scene 형식은 그대로다.
+
+보컬은 한 번 처리한 뒤 같은 신호를 두 목적지에 보낸다. 경로별 gain은 기존 5 ms ramp를
+재사용하며 믹스 합산 **앞**에 적용한다. 따라서 route off/level 변경에는 출력 queue 지연이
+남는다. 이미 큐에 합쳐진 소리에서 한 소스만 소급 제거하지 않는다. 전체 송출을 끄려면
+출력 queue 뒤에서 적용되는 `mute send` 또는 `mute all`을 사용한다.
+이 기능은 프로세스 캡처나 통화 반환음 자동 제거를 추가하지 않는다.
 
 ## 사용자 VST3 검사·편집
 

@@ -7,7 +7,7 @@ const OUTPUT: u8 = 4;
 const SEND: u8 = 8;
 const ALL: u8 = 16;
 
-pub const HELP: &str = "Live commands: mute/unmute mic|aux|output|send|all; gain master|send <dB -96..0>; status; stop. Changes last for this run only.";
+pub const HELP: &str = "Live commands: mute/unmute mic|aux|output|send|all; gain master|send <dB -96..0>; route mic|aux output|send on|off; level mic|aux output|send <dB -96..0>; status; stop. Changes last for this run only.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuteTarget { Mic, Aux, Output, Send, All }
@@ -20,10 +20,24 @@ impl MuteTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GainTarget { Master, Send }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteSource { Mic, Aux }
+impl RouteSource {
+    fn index(self) -> usize { match self { Self::Mic => 0, Self::Aux => 1 } }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteMix { Output, Send }
+impl RouteMix {
+    fn index(self) -> usize { match self { Self::Output => 0, Self::Send => 1 } }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LiveCommand {
     Mute { target: MuteTarget, muted: bool },
     Gain { target: GainTarget, db: f32 },
+    Route { source: RouteSource, mix: RouteMix, enabled: bool },
+    RouteGain { source: RouteSource, mix: RouteMix, db: f32 },
     Status,
     Stop,
 }
@@ -48,6 +62,26 @@ impl FromStr for LiveCommand {
                 let db: f32 = words.next().ok_or(HELP)?.parse().map_err(|_| HELP)?;
                 validate_db(db)?;
                 Self::Gain { target, db }
+            }
+            Some(verb @ ("route" | "level")) => {
+                let source = match words.next() {
+                    Some("mic") => RouteSource::Mic, Some("aux") => RouteSource::Aux,
+                    _ => return Err(HELP.into()),
+                };
+                let mix = match words.next() {
+                    Some("output") => RouteMix::Output, Some("send") => RouteMix::Send,
+                    _ => return Err(HELP.into()),
+                };
+                if verb == "route" {
+                    let enabled = match words.next() {
+                        Some("on") => true, Some("off") => false, _ => return Err(HELP.into()),
+                    };
+                    Self::Route { source, mix, enabled }
+                } else {
+                    let db: f32 = words.next().ok_or(HELP)?.parse().map_err(|_| HELP)?;
+                    validate_db(db)?;
+                    Self::RouteGain { source, mix, db }
+                }
             }
             Some("status") => Self::Status,
             Some("stop") => Self::Stop,
@@ -75,13 +109,20 @@ pub struct LiveControls {
     send: AtomicU32,
     has_send: bool,
     has_aux: bool,
+    // Fixed order: mic->output, mic->send, AUX->output, AUX->send.
+    // Enabled state is independent of fader level and global source/output mutes.
+    routes_enabled: AtomicU8,
+    route_levels: [AtomicU32; 4],
 }
 impl LiveControls {
     pub fn new(master_db: f32, send_db: Option<f32>, has_aux: bool) -> Result<Self, String> {
         validate_db(master_db)?;
         validate_db(send_db.unwrap_or(0.0))?;
         Ok(Self { muted: AtomicU8::new(0), stop_requested: AtomicBool::new(false), master: AtomicU32::new(gain(master_db).to_bits()),
-            send: AtomicU32::new(gain(send_db.unwrap_or(0.0)).to_bits()), has_send: send_db.is_some(), has_aux })
+            send: AtomicU32::new(gain(send_db.unwrap_or(0.0)).to_bits()), has_send: send_db.is_some(), has_aux,
+            // Capture preparation sets the saved AUX destination before any stream starts.
+            routes_enabled: AtomicU8::new(if send_db.is_some() { 3 } else { 1 }),
+            route_levels: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())) })
     }
     pub fn mix_count(&self) -> usize { if self.has_send { 2 } else { 1 } }
     pub fn has_aux(&self) -> bool { self.has_aux }
@@ -106,10 +147,34 @@ impl LiveControls {
                 };
                 level.store(gain(db).to_bits(), Ordering::Relaxed);
             }
+            LiveCommand::Route { source, mix, enabled } => {
+                let index = self.route_index(source, mix)?;
+                if enabled { self.routes_enabled.fetch_or(1 << index, Ordering::Relaxed); }
+                else { self.routes_enabled.fetch_and(!(1 << index), Ordering::Relaxed); }
+            }
+            LiveCommand::RouteGain { source, mix, db } => {
+                let index = self.route_index(source, mix)?;
+                validate_db(db)?;
+                self.route_levels[index].store(gain(db).to_bits(), Ordering::Relaxed);
+            }
             LiveCommand::Stop => self.stop_requested.store(true, Ordering::Relaxed),
             LiveCommand::Status => {}
         }
         Ok(())
+    }
+
+    fn route_index(&self, source: RouteSource, mix: RouteMix) -> Result<usize, String> {
+        if source == RouteSource::Aux && !self.has_aux { return Err("this route has no AUX source".into()); }
+        if mix == RouteMix::Send && !self.has_send { return Err("this route has no send mix".into()); }
+        Ok(source.index() * 2 + mix.index())
+    }
+
+    /// Per-send targets only. Source mute and final output mute remain separate stages.
+    pub(crate) fn route_targets(&self) -> [f32; 4] {
+        let enabled = self.routes_enabled.load(Ordering::Relaxed);
+        std::array::from_fn(|index| if enabled & (1 << index) != 0 {
+            f32::from_bits(self.route_levels[index].load(Ordering::Relaxed))
+        } else { 0.0 })
     }
 
     pub(crate) fn source_targets(&self) -> [f32; 2] {
@@ -127,10 +192,21 @@ impl LiveControls {
     /// Requested state, not proof that another app or listener has received silence.
     pub fn describe(&self) -> String {
         let muted = self.muted.load(Ordering::Relaxed);
-        format!("master_gain={:.1}dB send_extra_gain={:.1}dB mute[mic={},aux={},output={},send={},all={}]",
+        let mut text = format!("master_gain={:.1}dB send_extra_gain={:.1}dB mute[mic={},aux={},output={},send={},all={}]",
             20.0 * f32::from_bits(self.master.load(Ordering::Relaxed)).log10(),
             20.0 * f32::from_bits(self.send.load(Ordering::Relaxed)).log10(),
-            muted & MIC != 0, muted & AUX != 0, muted & OUTPUT != 0, muted & SEND != 0, muted & ALL != 0)
+            muted & MIC != 0, muted & AUX != 0, muted & OUTPUT != 0, muted & SEND != 0, muted & ALL != 0);
+        let enabled = self.routes_enabled.load(Ordering::Relaxed);
+        for (source, name) in [(0, "mic"), (1, "aux")] {
+            if source == 1 && !self.has_aux { continue; }
+            for (mix, destination) in [(0, "output"), (1, "send")].into_iter().take(self.mix_count()) {
+                let index = source * 2 + mix;
+                let state = if enabled & (1 << index) != 0 { "on" } else { "off" };
+                let db = 20.0 * f32::from_bits(self.route_levels[index].load(Ordering::Relaxed)).log10();
+                text.push_str(&format!(" {name}->{destination}={state}@{db:.1}dB"));
+            }
+        }
+        text
     }
 }
 
@@ -281,4 +357,41 @@ mod tests {
         assert!((send_only.next_gains()[0] - gain(-12.0)).abs() < 1e-7);
         assert_eq!(send_only.next_gains()[1], 0.0);
     }
+
+    #[test]
+    fn route_switches_and_levels_are_independent_of_mutes_and_each_other() {
+        let controls = LiveControls::new(-18.0, Some(-6.0), true).unwrap();
+        assert_eq!(controls.route_targets(), [1.0, 1.0, 0.0, 0.0]);
+        for invalid in ["route mic", "route mic output", "route mic output yes", "route mic output off extra",
+            "route none send on", "route aux all on", "level aux send", "level mic output 1",
+            "level mic output -97", "level aux send NaN", "level aux send inf"] {
+            assert!(invalid.parse::<LiveCommand>().is_err(), "{invalid}");
+        }
+        controls.apply("route mic output off".parse().unwrap()).unwrap();
+        controls.apply("level mic output -6".parse().unwrap()).unwrap();
+        assert_eq!(controls.route_targets(), [0.0, 1.0, 0.0, 0.0]);
+        controls.apply("route aux send on".parse().unwrap()).unwrap();
+        controls.apply("level aux send -12".parse().unwrap()).unwrap();
+        let expected = [0.0, 1.0, 0.0, gain(-12.0)];
+        assert_eq!(controls.route_targets(), expected);
+        for command in ["mute all", "mute mic", "mute send", "unmute all", "gain master -3"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+            assert_eq!(controls.route_targets(), expected);
+        }
+        controls.apply("route mic output on".parse().unwrap()).unwrap();
+        assert_eq!(controls.source_targets()[0], 0.0); // routing cannot unmute the source
+        assert_eq!(controls.output_targets()[1], 0.0); // nor the whole send mix
+        assert_eq!(controls.route_targets()[0], gain(-6.0));
+        assert!(controls.describe().contains("aux->send=on@-12.0dB"));
+        let before = controls.describe();
+        assert!(controls.apply(LiveCommand::RouteGain { source: RouteSource::Mic, mix: RouteMix::Output, db: f32::NAN }).is_err());
+        assert_eq!(controls.describe(), before);
+        let single = LiveControls::new(0.0, None, false).unwrap();
+        let before = single.describe();
+        for command in ["route aux output on", "level aux output -6", "route mic send on", "level mic send -3"] {
+            assert!(single.apply(command.parse().unwrap()).is_err());
+            assert_eq!(single.describe(), before);
+        }
+    }
+
 }

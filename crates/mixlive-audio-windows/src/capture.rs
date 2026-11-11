@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, Source};
 use mixlive_effects::{Meters, VocalChain};
-use crate::{bridge::{Fault, Health, OutputWriter}, config::AuxDestination, control::{GainRamp, LiveControls}};
+use crate::{bridge::{Fault, Health, OutputWriter}, config::AuxDestination, control::{GainRamp, LiveCommand, LiveControls, RouteMix, RouteSource}};
 
 pub const CAPTURE_BLOCK: usize = 256;
 
@@ -35,6 +35,9 @@ pub struct Capture {
     aux_right: [f32; CAPTURE_BLOCK],
     controls: Arc<LiveControls>,
     source_mutes: [GainRamp; 2],
+    route_count: usize,
+    route_ramps: [GainRamp; 4],
+    route_envelopes: [[f32; CAPTURE_BLOCK]; 4],
     // A writer belongs to a physical endpoint, not necessarily to a single mix.
     outputs: Vec<(OutputWriter, Vec<usize>)>,
     health: Arc<Health>,
@@ -63,14 +66,26 @@ impl Capture {
                 return Err("AUX send destination needs a second mix".into());
             }
             scene.sources.push(Source { name: "AUX".into(), channels: ChannelLayout::Stereo, gain_db, muted: false });
-            scene.sends.extend((0..mix_count).filter(|mix| destination.includes(*mix))
+            // Compile every existing source/mix pair once. Initial off routes have zero
+            // envelopes, not disabled core routes that runtime controls could accidentally bypass.
+            scene.sends.extend((0..mix_count)
                 .map(|mix| Send { source: 1, mix, gain_db: 0.0, enabled: true }));
         }
         let engine = Engine::new(&scene, CAPTURE_BLOCK).map_err(|e| e.to_string())?;
+        // Initialize AUX routing on the setup thread, before any capture/playback starts.
+        if let Some((_, destination)) = aux {
+            for (mix, target) in [RouteMix::Output, RouteMix::Send].into_iter().take(mix_count).enumerate() {
+                controls.apply(LiveCommand::Route { source: RouteSource::Aux, mix: target, enabled: destination.includes(mix) })?;
+            }
+        }
+        let route_count = scene.sends.len();
+        let targets = controls.route_targets();
+        let route_ramps = std::array::from_fn(|index| GainRamp::new(sample_rate,
+            if index < route_count { targets[index / mix_count * 2 + index % mix_count] } else { 0.0 }));
         let source_mutes = controls.source_targets().map(|gain| GainRamp::new(sample_rate, gain));
         Ok(Self { engine, vocal, scratch: [0.0; CAPTURE_BLOCK], aux_enabled: aux.is_some(),
             aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK], outputs,
-            controls, source_mutes, health, vocal_stats: Arc::new(VocalStats::default()) })
+            controls, source_mutes, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; 4], health, vocal_stats: Arc::new(VocalStats::default()) })
     }
     /// AUX frames must already be on the mic's processing clock. Only the mic enters VocalChain.
     pub fn push(&mut self, samples: &[f32], aux: Option<&[[f32; 2]]>) {
@@ -80,6 +95,14 @@ impl Capture {
         }
         for (block_index, block) in samples.chunks(CAPTURE_BLOCK).enumerate() {
             for (ramp, target) in self.source_mutes.iter_mut().zip(self.controls.source_targets()) { ramp.set(target); }
+            let targets = self.controls.route_targets();
+            let mix_count = self.controls.mix_count();
+            for (index, ramp) in self.route_ramps[..self.route_count].iter_mut().enumerate() {
+                ramp.set(targets[index / mix_count * 2 + index % mix_count]);
+                for gain in &mut self.route_envelopes[index][..block.len()] { *gain = ramp.next_gain(); }
+            }
+            let envelopes: [&[f32]; 4] = std::array::from_fn(|index| &self.route_envelopes[index][..block.len()]);
+            let envelopes = &envelopes[..self.route_count];
             let processed = &mut self.scratch[..block.len()];
             processed.copy_from_slice(block);
             let Ok(meters) = self.vocal.process(processed) else { self.health.fail(Fault::Input); return; };
@@ -95,10 +118,10 @@ impl Capture {
                     peak = peak.max(frame[0].abs()).max(frame[1].abs());
                 }
                 self.health.aux_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
-                self.engine.render(block.len(), &[Input::Mono(processed), Input::Stereo {
+                self.engine.render_with_send_gains(block.len(), &[Input::Mono(processed), Input::Stereo {
                     left: &self.aux_left[..block.len()], right: &self.aux_right[..block.len()],
-                }])
-            } else { self.engine.render(block.len(), &[Input::Mono(processed)]) };
+                }], envelopes)
+            } else { self.engine.render_with_send_gains(block.len(), &[Input::Mono(processed)], envelopes) };
             if rendered.is_err() {
                 self.health.fail(Fault::Input); return;
             }
@@ -250,4 +273,85 @@ mod tests {
             assert!(health.failed());
         }
     }
+
+    #[test]
+    fn live_routes_keep_call_vocals_while_removing_only_monitor_vocals() {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, Some(0.0), true).unwrap());
+        let (writer, _reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
+        let config = VocalConfig { preset: Preset::Natural, ..VocalConfig::default() };
+        let mut reference = VocalChain::new(48000, config).unwrap();
+        let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+            Some((0.0, AuxDestination::Send)), vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+        assert_eq!(controls.route_targets(), [1.0, 1.0, 0.0, 1.0]);
+        controls.apply("route mic output off".parse().unwrap()).unwrap();
+        controls.apply("route aux output on".parse().unwrap()).unwrap();
+        controls.apply("level aux output -6".parse().unwrap()).unwrap();
+        let mic: Vec<f32> = (0..613).map(|i| (i as f32 * 0.13).sin() * 0.3).collect();
+        let mut wet = mic.clone();
+        reference.process(&mut wet).unwrap();
+        let aux = vec![[0.2, -0.1]; 613];
+        let mut cursor = 0;
+        for count in [1, 137, 256, 219] {
+            capture.push(&mic[cursor..cursor + count], Some(&aux[cursor..cursor + count]));
+            cursor += count;
+        }
+        let monitor = capture.engine.output(0).unwrap();
+        let call = capture.engine.output(1).unwrap();
+        let gain = 10.0_f32.powf(-6.0 / 20.0);
+        for (i, wet) in wet[394..].iter().enumerate() {
+            assert!((monitor.left[i] - 0.2 * gain).abs() < 1e-6);
+            assert!((monitor.right[i] + 0.1 * gain).abs() < 1e-6);
+            assert!((call.left[i] - (wet + 0.2)).abs() < 1e-6);
+            assert!((call.right[i] - (wet - 0.1)).abs() < 1e-6);
+        }
+        // Remove MR only from the call; monitor MR remains. DSP keeps its continuous history.
+        controls.apply("route aux send off".parse().unwrap()).unwrap();
+        controls.apply("level mic send -9".parse().unwrap()).unwrap();
+        let mut next = [0.1; 256];
+        reference.process(&mut next).unwrap();
+        capture.push(&[0.1; 256], Some(&[[0.2, -0.1]; 256]));
+        let call = capture.engine.output(1).unwrap();
+        let expected = next[255] * 10.0_f32.powf(-9.0 / 20.0);
+        assert!((call.left[255] - expected).abs() < 1e-6);
+        assert_eq!(call.left[255], call.right[255]);
+        assert!((capture.engine.output(0).unwrap().left[255] - 0.2 * gain).abs() < 1e-6);
+        assert!(!health.failed());
+    }
+
+    #[test]
+    fn single_output_route_fades_are_block_invariant_and_keep_inactive_routes_off() {
+        // Exercise the compact two-source/one-mix layout as well as ordinary mono-only routing.
+        for has_aux in [false, true] {
+            let run = |chunks: &[usize]| {
+                let health = Arc::new(Health::default());
+                let controls = Arc::new(LiveControls::new(0.0, None, has_aux).unwrap());
+                let (writer, _reader) = channel(48_000, 48_000, 30, 1, health.clone()).unwrap();
+                let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+                    has_aux.then_some((0.0, AuxDestination::Output)), vec![(writer, vec![0])], health.clone(), controls.clone()).unwrap();
+                controls.apply("route mic output off".parse().unwrap()).unwrap();
+                controls.apply("level mic output -6".parse().unwrap()).unwrap(); // must stay off
+                let mut result = Vec::new();
+                for &count in chunks {
+                    let mic = vec![0.4; count];
+                    let aux = vec![[0.2, -0.1]; count];
+                    capture.push(&mic, has_aux.then_some(aux.as_slice()));
+                    let output = capture.engine.output(0).unwrap();
+                    result.extend(output.left.iter().zip(output.right).map(|(&left, &right)| [left, right]));
+                }
+                assert!(!health.failed());
+                result
+            };
+            let whole = run(&[240]);
+            let split = run(&[1, 37, 99, 103]);
+            assert_eq!(whole, split);
+            let final_frame = if has_aux { [0.2, -0.1] } else { [0.0; 2] };
+            assert_eq!(whole[239], final_frame);
+            for pair in whole.windows(2) {
+                assert!(pair[0][0] >= pair[1][0]);
+                assert!((pair[0][0] - pair[1][0]).abs() <= 0.4 / 240.0 + 1e-6);
+            }
+        }
+    }
+
 }
