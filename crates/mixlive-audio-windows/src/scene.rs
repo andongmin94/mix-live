@@ -76,6 +76,7 @@ mod tests {
             let mut options = route();
             options.vocal = preset;
             if index == 0 { options.send = None; }
+            if index == 1 { options.send = Some(options.output.clone()); }
             let scene = DeviceScene::new(options.clone()).unwrap();
             let path = directory.path().join(format!("{index}.mixlive-scene.json"));
             scene.save_new(&path).unwrap();
@@ -115,7 +116,7 @@ mod tests {
         }
         for (key, value) in [
             ("input", json!(" ")), ("output", json!("")), ("send", json!(" ")),
-            ("send", json!("test-phones")), ("input_channel", json!(0)),
+            ("input_channel", json!(0)),
             ("output_channels", json!([])), ("output_channels", json!([1, 1])),
             ("send_channels", json!([0])), ("queue_ms", json!(0)),
             ("input_gain_db", json!(100)), ("output_gain_db", json!(1)),
@@ -127,6 +128,10 @@ mod tests {
             document["route"][key] = value;
             cases.push(document);
         }
+        let mut overlap = original.clone();
+        overlap["route"]["send"] = json!("test-phones");
+        overlap["route"]["send_channels"] = json!([4]);
+        cases.push(overlap);
         let mut missing = original;
         missing["route"].as_object_mut().unwrap().remove("output_gain_db");
         cases.push(missing);

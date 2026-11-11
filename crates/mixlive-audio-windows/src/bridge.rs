@@ -1,4 +1,4 @@
-//! Bounded SPSC transport and independently clocked outputs. No device API here.
+//! Bounded SPSC transport per playback endpoint. All mixes on one endpoint share a clock.
 //! Rubato owns the anti-alias filter; we only steer its ratio from queue occupancy.
 use std::sync::{Arc, atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering}};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -6,6 +6,8 @@ use rubato::{Adjustable, Async, FixedAsync, Resampler, SincInterpolationParamete
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 
 pub const QUANTUM: usize = 128;
+/// At most two stereo mixes, packed in the endpoint's route order. Unused lanes stay zero.
+pub type OutputFrame = [f32; 4];
 const MAX_CORRECTION: f64 = 0.001; // +/- 1000 ppm. This is not an audio device latency claim.
 const CEILING: f32 = 0.98; // Sample clipping guard, NOT a transparent or true-peak limiter.
 
@@ -46,11 +48,13 @@ pub struct OutputStats {
 }
 
 pub struct OutputWriter {
-    producer: Producer<[f32; 2]>,
+    producer: Producer<OutputFrame>,
+    mixes: usize,
     health: Arc<Health>,
 }
 impl OutputWriter {
-    pub fn push(&mut self, frame: [f32; 2]) {
+    pub fn mix_count(&self) -> usize { self.mixes }
+    pub fn push(&mut self, frame: OutputFrame) {
         if self.health.failed() { return; }
         if !frame.iter().all(|x| x.is_finite()) {
             self.health.fail(Fault::Input);
@@ -61,8 +65,9 @@ impl OutputWriter {
 }
 
 pub struct OutputReader {
-    consumer: Consumer<[f32; 2]>,
+    consumer: Consumer<OutputFrame>,
     resampler: Async<f32>,
+    channels: usize,
     input: Vec<f32>,
     output: Vec<f32>,
     cursor: usize,
@@ -78,20 +83,22 @@ pub struct OutputReader {
     health: Arc<Health>,
 }
 
-pub fn channel(input_rate: u32, output_rate: u32, queue_ms: u32, health: Arc<Health>) -> Result<(OutputWriter, OutputReader), String> {
+pub fn channel(input_rate: u32, output_rate: u32, queue_ms: u32, mixes: usize, health: Arc<Health>) -> Result<(OutputWriter, OutputReader), String> {
     if !(8_000..=192_000).contains(&input_rate) || !(8_000..=192_000).contains(&output_rate) || !(10..=100).contains(&queue_ms) {
         return Err("rates must be 8000..=192000 Hz and queue depth 10..=100 ms".into());
     }
+    if !(1..=2).contains(&mixes) { return Err("an endpoint carries one or two stereo mixes".into()); }
+    let channels = mixes * 2;
     let resampler = Async::<f32>::new_sinc(
         f64::from(output_rate) / f64::from(input_rate), 1.002,
-        &SincInterpolationParameters::default(), QUANTUM, 2, FixedAsync::Output,
+        &SincInterpolationParameters::default(), QUANTUM, channels, FixedAsync::Output,
     ).map_err(|e| e.to_string())?;
     let target = ((input_rate as usize * queue_ms as usize) / 1000).max(resampler.input_frames_max() * 3);
     let (producer, consumer) = RingBuffer::new(target * 4);
     let reader = OutputReader {
-        consumer,
-        input: vec![0.0; resampler.input_frames_max() * 2],
-        output: vec![0.0; resampler.output_frames_max() * 2],
+        consumer, channels,
+        input: vec![0.0; resampler.input_frames_max() * channels],
+        output: vec![0.0; resampler.output_frames_max() * channels],
         resampler_delay_ms: resampler.output_delay() as f64 * 1000.0 / f64::from(output_rate),
         resampler,
         cursor: 0, valid: 0, primed: false, target,
@@ -102,24 +109,27 @@ pub fn channel(input_rate: u32, output_rate: u32, queue_ms: u32, health: Arc<Hea
         stats: Arc::new(OutputStats::default()),
         health: health.clone(),
     };
-    Ok((OutputWriter { producer, health }, reader))
+    Ok((OutputWriter { producer, mixes, health }, reader))
 }
 
 impl OutputReader {
-    /// One stereo frame. Underrun and any latched fault yield silence, never stale or dry audio.
-    pub fn next_frame(&mut self) -> [f32; 2] {
-        if self.health.failed() || (self.cursor == self.valid && !self.refill()) { return [0.0; 2]; }
-        let mut frame = [self.output[self.cursor * 2], self.output[self.cursor * 2 + 1]];
+    /// All mixes for ONE endpoint frame. Underrun/fault silences them together.
+    pub fn next_frame(&mut self) -> OutputFrame {
+        if self.health.failed() || (self.cursor == self.valid && !self.refill()) { return [0.0; 4]; }
+        let mut frame = [0.0; 4];
+        let start = self.cursor * self.channels;
+        frame[..self.channels].copy_from_slice(&self.output[start..start + self.channels]);
         self.cursor += 1;
         if !frame.iter().all(|x| x.is_finite()) {
             self.health.fail(Fault::Resampler);
-            return [0.0; 2];
+            return [0.0; 4];
         }
         if frame.iter().any(|x| x.abs() > CEILING) {
             self.stats.clipped_frames.fetch_add(1, Ordering::Relaxed);
             frame.iter_mut().for_each(|x| *x = x.clamp(-CEILING, CEILING));
         }
-        self.stats.peak.fetch_max(frame[0].abs().max(frame[1].abs()).to_bits(), Ordering::Relaxed);
+        let peak = frame.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        self.stats.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
         frame
     }
 
@@ -146,17 +156,17 @@ impl OutputReader {
             self.resampler.reset();
             return false;
         }
-        for frame in self.input[..needed * 2].chunks_exact_mut(2) {
+        for frame in self.input[..needed * self.channels].chunks_exact_mut(self.channels) {
             let Ok(value) = self.consumer.pop() else {
                 self.health.fail(Fault::Resampler);
                 return false;
             };
-            frame.copy_from_slice(&value);
+            frame.copy_from_slice(&value[..self.channels]);
         }
-        let Ok(input) = InterleavedSlice::new(&self.input, 2, needed) else {
+        let Ok(input) = InterleavedSlice::new(&self.input, self.channels, needed) else {
             self.health.fail(Fault::Resampler); return false;
         };
-        let Ok(mut output) = InterleavedSlice::new_mut(&mut self.output, 2, QUANTUM) else {
+        let Ok(mut output) = InterleavedSlice::new_mut(&mut self.output, self.channels, QUANTUM) else {
             self.health.fail(Fault::Resampler); return false;
         };
         match self.resampler.process_into_buffer(&input, &mut output, None) {
@@ -175,28 +185,29 @@ mod tests {
     #[test]
     fn rate_conversion_keeps_stereo_and_faults_silence_pending_audio() {
         let health = Arc::new(Health::default());
-        let (mut writer, mut reader) = channel(44_100, 48_000, 30, health.clone()).unwrap();
-        for _ in 0..reader.target { writer.push([0.2, -0.1]); }
+        let (mut writer, mut reader) = channel(44_100, 48_000, 30, 1, health.clone()).unwrap();
+        for _ in 0..reader.target { writer.push([0.2, -0.1, 0.0, 0.0]); }
         for _ in 0..100 {
-            for _ in 0..reader.resampler.input_frames_next() { writer.push([0.2, -0.1]); }
+            for _ in 0..reader.resampler.input_frames_next() { writer.push([0.2, -0.1, 0.0, 0.0]); }
             for _ in 0..QUANTUM { let _ = reader.next_frame(); }
         }
         let frame = reader.next_frame();
         assert!((frame[0] - 0.2).abs() < 0.001 && (frame[1] + 0.1).abs() < 0.001);
+        assert_eq!(&frame[2..], &[0.0; 2]);
         health.fail(Fault::Device);
-        assert_eq!(reader.next_frame(), [0.0; 2]);
+        assert_eq!(reader.next_frame(), [0.0; 4]);
     }
 
     #[test]
     fn independent_clock_drift_remains_bounded() {
         for ppm in [-500.0, 500.0] {
             let health = Arc::new(Health::default());
-            let (mut writer, mut reader) = channel(16_000, 16_000, 30, health.clone()).unwrap();
-            for _ in 0..reader.target { writer.push([0.1, 0.1]); }
+            let (mut writer, mut reader) = channel(16_000, 16_000, 30, 1, health.clone()).unwrap();
+            for _ in 0..reader.target { writer.push([0.1, 0.1, 0.0, 0.0]); }
             let mut fraction = 0.0;
             for _ in 0..3750 { // 30 simulated seconds, no wall-clock sleeps.
                 fraction += QUANTUM as f64 * (1.0 + ppm / 1_000_000.0);
-                while fraction >= 1.0 { writer.push([0.1, 0.1]); fraction -= 1.0; }
+                while fraction >= 1.0 { writer.push([0.1, 0.1, 0.0, 0.0]); fraction -= 1.0; }
                 for _ in 0..QUANTUM { let _ = reader.next_frame(); }
             }
             assert!(!health.failed(), "{ppm}: {:?}", health.error());
@@ -209,17 +220,51 @@ mod tests {
     #[test]
     fn starvation_overflow_and_clip_guard_are_explicit() {
         let health = Arc::new(Health::default());
-        let (mut writer, mut reader) = channel(48_000, 48_000, 30, health.clone()).unwrap();
-        assert_eq!(reader.next_frame(), [0.0; 2]);
-        for _ in 0..reader.target { writer.push([2.0, -2.0]); }
+        let (mut writer, mut reader) = channel(48_000, 48_000, 30, 1, health.clone()).unwrap();
+        assert_eq!(reader.next_frame(), [0.0; 4]);
+        for _ in 0..reader.target { writer.push([2.0, -2.0, 0.0, 0.0]); }
         for _ in 0..reader.target * 2 { assert!(reader.next_frame().iter().all(|x| x.abs() <= CEILING)); }
         assert!(reader.stats.clipped_frames.load(Ordering::Relaxed) > 0);
         assert!(reader.stats.underruns.load(Ordering::Relaxed) > 0);
-        assert_eq!(reader.next_frame(), [0.0; 2]);
-        for _ in 0..reader.target * 4 + 1 { writer.push([0.2, 0.2]); }
+        assert_eq!(reader.next_frame(), [0.0; 4]);
+        for _ in 0..reader.target * 4 + 1 { writer.push([0.2, 0.2, 0.0, 0.0]); }
         assert!(health.failed());
-        assert_eq!(reader.next_frame(), [0.0; 2]);
-        assert!(channel(0, 48_000, 30, health.clone()).is_err());
-        assert!(channel(48_000, 48_000, 0, health).is_err());
+        assert_eq!(reader.next_frame(), [0.0; 4]);
+        assert!(channel(0, 48_000, 30, 1, health.clone()).is_err());
+        assert!(channel(48_000, 48_000, 0, 1, health.clone()).is_err());
+        for mixes in [0, 3] { assert!(channel(48_000, 48_000, 30, mixes, health.clone()).is_err()); }
+    }
+
+    #[test]
+    fn shared_mixes_keep_sample_alignment_and_silence_together() {
+        let health = Arc::new(Health::default());
+        let (mut writer, mut reader) = channel(44_100, 48_000, 10, 2, health.clone()).unwrap();
+        let mut position = 0;
+        let mut push = |count: usize| {
+            for _ in 0..count {
+                let a = (position as f32 * 0.07).sin() * 0.3;
+                let b = (position as f32 * 0.13).cos() * 0.2;
+                writer.push([a, b, a * 0.25, b * -0.5]);
+                position += 1;
+            }
+        };
+        push(reader.target);
+        let mut peak = 0.0_f32;
+        for _ in 0..50 {
+            push(reader.resampler.input_frames_next());
+            for _ in 0..QUANTUM {
+                let frame = reader.next_frame();
+                assert!((frame[2] - frame[0] * 0.25).abs() < 1e-6);
+                assert!((frame[3] + frame[1] * 0.5).abs() < 1e-6);
+                peak = peak.max(frame[0].abs());
+            }
+        }
+        assert!(peak > 0.2);
+        assert!(!health.failed());
+        for _ in 0..reader.target * 3 { reader.next_frame(); }
+        assert!(reader.stats.underruns.load(Ordering::Relaxed) > 0);
+        assert_eq!(reader.next_frame(), [0.0; 4]);
+        health.fail(Fault::Device);
+        assert_eq!(reader.next_frame(), [0.0; 4]);
     }
 }

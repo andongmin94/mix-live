@@ -22,8 +22,9 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 - `mixlive-effects`: 장치·UI 독립 모노 보컬 처리. biquad 0.6.0 필터, RMS soft-knee
   compression, 고역 비중과 레벨을 함께 보는 split-band de-essing. 자동 makeup gain 없음.
 - `mixlive-audio-windows`: WASAPI endpoint ID·기본 포맷, 명시적 입력 채널,
-  하나 또는 두 개의 독립 출력과 채널 매핑. 같은 보컬 체인을 두 출력에서 중복 처리하지 않는다.
-- 출력마다 bounded SPSC queue와 Rubato sinc resampler. 샘플레이트·클럭 경계를 처리하며
+  하나 또는 두 개의 독립 믹스와 채널 매핑. 같은 endpoint의 서로 다른 채널 쌍도 지원한다.
+  같은 보컬 체인을 두 믹스에서 중복 처리하지 않는다.
+- 물리 출력 endpoint마다 bounded SPSC queue와 Rubato sinc resampler. 샘플레이트·클럭 경계를 처리하며
   장치 오류·overflow에는 무음으로 멈춘다. 다른 장치를 임의로 선택하지 않는다.
 - 오디오 callback에서는 사전 준비된 필터와 버퍼만 사용한다. peak, gain reduction,
   queue, correction ppm, underrun, clipping 횟수는 제어 스레드에서 표시한다.
@@ -87,10 +88,31 @@ gain reduction이다. blend 강도를 낮추면 이 값은 wet 경로의 억제�
 **녹음 endpoint**를 선택한다. MixLive가 케이블을 설치하거나 자동 연결했다고 표시하지 않는다.
 
 채널은 선택한 WASAPI endpoint 안의 1-based 번호다. MiniFuse ASIO 3/4, 제조사 루프백,
-물리 단자와 같다고 가정하지 않는다. 없는 채널·같은 출력 endpoint 두 번 선택은 거절한다.
+물리 단자와 같다고 가정하지 않는다. 없는 채널과 같은 endpoint 안에서 겹치는 채널 선택은 거절한다.
 mono 출력은 `--output-channels 1`. 장치 기본 샘플레이트와 포맷으로 연다.
 `--queue-ms` 기본 30은 queue 목표이지 드라이버 버퍼나 왕복 지연이 아니다.
 `run`은 기본 30초 후 끝나며 최대 `--seconds 3600`. 음성 녹음 파일은 만들지 않는다.
+
+### 같은 장치의 1/2와 3/4로 보내기
+
+선택한 WASAPI **endpoint의 기본 구성이 4채널 이상일 때만** 다음 구성이 가능하다.
+같은 OUTPUT ID를 두 번 지정하되 채널을 분리한다. `check`로 실제 채널 수를 먼저 확인한다.
+
+```powershell
+.\target\release\mixlive-audio.exe check --input "<INPUT ID>" --output "<같은 OUTPUT ID>" --output-channels 1,2 --send "<같은 OUTPUT ID>" --send-channels 3,4 --send-gain-db -6
+.\target\release\mixlive-audio.exe run --input "<INPUT ID>" --output "<같은 OUTPUT ID>" --output-channels 1,2 --send "<같은 OUTPUT ID>" --send-channels 3,4 --send-gain-db -6 --vocal natural --seconds 30
+```
+
+이때 `check`는 `playback streams: 1`과 두 mix의 채널 매핑을 표시한다. 두 mix의 음량은
+각각 적용하지만, 한 프레임에 묶어 **같은 queue·4채널 리샘플러·출력 스트림**을 사용한다.
+두 채널 쌍이 따로 버퍼를 소비하거나 서로 다른 drift 보정을 받지 않는다. 다른 endpoint를
+선택하면 기존처럼 각 endpoint의 clock bridge를 사용한다. 통계의 `stream0`/`stream1`은
+물리 스트림 단위이며, 공유 출력의 peak·clipping 횟수는 두 mix를 합친 통계다.
+
+출력 채널이 겹치면 실행 전에 거절한다. 예를 들어 같은 endpoint의 `1,2`와 `2,3`은
+허용하지 않는다. mono 채널 또는 역순 stereo 매핑도 가능하며 미지정 채널은 무음이다.
+Windows에 stereo endpoint만 보이면 `3,4`를 만들 수 없다. 제조사 ASIO 채널·하드웨어
+loopback을 자동 노출하거나 설정하지 않으며, MiniFuse 모델별 동작은 실장비 검증이 남아 있다.
 
 ## 마이크 경로를 Scene으로 저장·재실행
 
@@ -107,6 +129,7 @@ queue 목표를 하나의 로컬 JSON으로 저장한다. `scene save`는 파일
 
 `save`에는 기존 `check/run`과 동일한 route 옵션을 사용한다. 두 출력도 저장하려면
 `--send "<별도 OUTPUT ID>" --send-channels 1,2 --send-gain-db -6`을 함께 지정한다.
+같은 endpoint의 `1/2`·`3/4` 구성도 동일한 Scene 형식으로 저장·검사·재실행한다.
 기존 파일은 덮어쓰지 않으며 다른 이름으로 저장한다. `schema: 1`만 읽고 구식 포맷 변환이나
 누락된 필수 값의 기본값 복원은 하지 않는다. 오타·중복 채널·허용 범위 밖 음량은 거절한다.
 

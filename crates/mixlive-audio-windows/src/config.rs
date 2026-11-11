@@ -63,10 +63,10 @@ pub struct RouteOptions {
     /// Exact playback endpoint ID. Can be headphones or an installed virtual cable's playback end.
     #[arg(long)]
     pub output: String,
-    /// One channel, or a stereo pair; all other device channels stay silent.
+    /// One channel, or a stereo pair; all other unassigned device channels stay silent.
     #[arg(long, value_delimiter = ',', default_value = "1,2")]
     pub output_channels: Vec<u16>,
-    /// Optional second, distinct playback endpoint (for example an installed virtual cable).
+    /// Second mix's playback endpoint. May share output if its channels do not overlap.
     #[arg(long)]
     pub send: Option<String>,
     #[arg(long, value_delimiter = ',', default_value = "1,2")]
@@ -93,7 +93,7 @@ pub struct RouteOptions {
     /// High-band de-esser threshold (-60..0 dBFS).
     #[arg(long, default_value = "-30", allow_hyphen_values = true)]
     pub deess_threshold_db: f32,
-    /// Target per-output queue depth, not round-trip latency or a hardware buffer size.
+    /// Target per-endpoint queue depth, not round-trip latency or a hardware buffer size.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(10..=100))]
     pub queue_ms: u32,
 }
@@ -112,10 +112,10 @@ impl RouteOptions {
         }
         // File-based settings do not pass through clap. Check channel shape here;
         // Prepared::new checks the actual device's channel count before opening streams.
-        OutputMap::new(&self.output_channels, u16::MAX)?;
-        OutputMap::new(&self.send_channels, u16::MAX)?;
-        if self.send.as_deref() == Some(self.output.as_str()) {
-            return Err("output and send must be distinct endpoints; two streams on one endpoint are not supported yet".into());
+        let output = OutputMap::new(&self.output_channels, u16::MAX)?;
+        let send = OutputMap::new(&self.send_channels, u16::MAX)?;
+        if self.send.as_deref() == Some(self.output.as_str()) && output.overlaps(send) {
+            return Err("output and send channels must not overlap on the same endpoint".into());
         }
         self.vocal_config().validate().map_err(|e| e.to_string())?;
         for db in [self.output_gain_db, self.send_gain_db] {
@@ -156,6 +156,10 @@ impl OutputMap {
             _ => Err("choose one channel or two distinct channels, e.g. 1 or 1,2".into()),
         }
     }
+    pub fn overlaps(self, other: Self) -> bool {
+        let channels = |map| match map { Self::Mono(one) => [one, one], Self::Stereo(left, right) => [left, right] };
+        channels(self).iter().any(|channel| channels(other).contains(channel))
+    }
     pub fn sample(self, channel: usize, frame: [f32; 2]) -> f32 {
         match self {
             Self::Mono(index) if index == channel => (frame[0] + frame[1]) * 0.5,
@@ -164,6 +168,12 @@ impl OutputMap {
             _ => 0.0,
         }
     }
+}
+
+/// Map one packed endpoint frame. Preparation guarantees one/two disjoint maps in lane order.
+pub fn output_sample(maps: &[OutputMap], channel: usize, frame: &[f32; 4]) -> f32 {
+    maps.iter().zip(frame.chunks_exact(2))
+        .map(|(map, stereo)| map.sample(channel, [stereo[0], stereo[1]])).sum()
 }
 
 #[cfg(test)]
@@ -193,6 +203,29 @@ mod tests {
         assert!(options.validate().is_err());
         options.output_gain_db = -18.0;
         options.send = Some(options.output.clone());
-        assert!(options.validate().is_err());
+        assert!(options.validate().unwrap_err().contains("overlap"));
+        options.send_channels = vec![3, 4];
+        assert!(options.validate().is_ok());
+        options.send_channels = vec![2, 3];
+        assert!(options.validate().unwrap_err().contains("overlap"));
+        options.send = Some("other-endpoint".into());
+        assert!(options.validate().is_ok());
+    }
+    #[test]
+    fn shared_endpoint_maps_preserve_stereo_mono_and_unassigned_channels() {
+        let maps = [OutputMap::new(&[2, 1], 6).unwrap(), OutputMap::new(&[4, 3], 6).unwrap()];
+        assert!(!maps[0].overlaps(maps[1]));
+        let packed = [0.1, 0.2, -0.3, 0.4];
+        assert_eq!((0..6).map(|channel| output_sample(&maps, channel, &packed)).collect::<Vec<_>>(),
+            [0.2, 0.1, 0.4, -0.3, 0.0, 0.0]);
+        let mono = [OutputMap::Mono(0), OutputMap::Mono(2)];
+        assert!(!mono[0].overlaps(mono[1]));
+        let result: Vec<f32> = (0..4).map(|c| output_sample(&mono, c, &[0.2, 0.4, -0.1, 0.3])).collect();
+        assert!((result[0] - 0.3).abs() < 1e-6 && (result[2] - 0.1).abs() < 1e-6);
+        assert_eq!((result[1], result[3]), (0.0, 0.0));
+        for (a, b) in [(OutputMap::Mono(1), maps[0]), (maps[0], OutputMap::Stereo(3, 1)), (mono[0], mono[0])] {
+            assert!(a.overlaps(b) && b.overlaps(a));
+        }
+        assert!(OutputMap::new(&[3, 4], 2).is_err());
     }
 }

@@ -2,7 +2,7 @@
 use std::{error::Error, sync::{Arc, atomic::Ordering}};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use mixlive_effects::VocalChain;
-use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{OutputMap, RouteOptions}};
+use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{OutputMap, RouteOptions, output_sample}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -18,7 +18,8 @@ pub fn list_devices() -> Result<Vec<String>> {
     Ok(rows)
 }
 
-struct OutputEndpoint { device: Device, config: SupportedStreamConfig, map: OutputMap, gain_db: f32 }
+// Each entry owns exactly one device stream/clock bridge; routes index the independent mixes.
+struct OutputEndpoint { device: Device, config: SupportedStreamConfig, routes: Vec<(usize, OutputMap)> }
 
 pub struct Prepared {
     input: Device,
@@ -26,6 +27,7 @@ pub struct Prepared {
     input_channel: usize,
     vocal: VocalChain,
     output_gain_db: f32,
+    send_gain_db: Option<f32>,
     queue_ms: u32,
     outputs: Vec<OutputEndpoint>,
 }
@@ -61,29 +63,44 @@ impl Prepared {
             return Err(format!("input channel {} exceeds this endpoint's {} channels", options.input_channel, input_config.channels()).into());
         }
         let vocal = VocalChain::new(input_config.sample_rate(), options.vocal_config())?;
-        let mut outputs = Vec::new();
-        let mut add = |id: &str, channels: &[u16], gain_db: f32| -> Result<()> {
+        let mut outputs: Vec<OutputEndpoint> = Vec::new();
+        let mut add = |id: &str, channels: &[u16], mix: usize| -> Result<()> {
             let device = find(&host, id)?;
+            // Group the resolved device identity, not just the user-supplied ID spelling.
+            if let Some(endpoint) = outputs.iter_mut().find(|endpoint| endpoint.device == device) {
+                let map = OutputMap::new(channels, endpoint.config.channels())?;
+                if endpoint.routes.iter().any(|(_, existing)| existing.overlaps(map)) {
+                    return Err("output and send channels must not overlap on the same endpoint".into());
+                }
+                endpoint.routes.push((mix, map));
+                return Ok(());
+            }
             if !host.output_devices()?.any(|candidate| candidate == device) {
                 return Err("output must be a playback endpoint listed under OUTPUT".into());
             }
             let config = device.default_output_config()?;
             validate_config(&config)?;
             let map = OutputMap::new(channels, config.channels())?;
-            outputs.push(OutputEndpoint { device, config, map, gain_db });
+            outputs.push(OutputEndpoint { device, config, routes: vec![(mix, map)] });
             Ok(())
         };
-        add(&options.output, &options.output_channels, 0.0)?;
-        if let Some(id) = &options.send { add(id, &options.send_channels, options.send_gain_db)?; }
-        Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal, output_gain_db: options.output_gain_db, queue_ms: options.queue_ms, outputs })
+        add(&options.output, &options.output_channels, 0)?;
+        if let Some(id) = &options.send { add(id, &options.send_channels, 1)?; }
+        Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal,
+            output_gain_db: options.output_gain_db, send_gain_db: options.send.as_ref().map(|_| options.send_gain_db),
+            queue_ms: options.queue_ms, outputs })
     }
 
     pub fn describe(&self) -> String {
-        let mut text = format!("WASAPI input: {}\n  {:?}; channel {}\nvocal: {:?}\nfinal mix attenuation: {} dB\n", self.input, self.input_config, self.input_channel + 1, self.vocal.config(), self.output_gain_db);
+        let mut text = format!("WASAPI input: {}\n  {:?}; channel {}\nvocal: {:?}\nfinal mix attenuation: {} dB\nplayback streams: {}\n", self.input, self.input_config, self.input_channel + 1, self.vocal.config(), self.output_gain_db, self.outputs.len());
         for (index, endpoint) in self.outputs.iter().enumerate() {
-            text.push_str(&format!("output {index}: {}\n  {:?}; map {:?} (zero-based); additional send gain {} dB\n", endpoint.device, endpoint.config, endpoint.map, endpoint.gain_db));
+            text.push_str(&format!("stream {index}: {}\n  {:?}; one queue/resampler for {} mix(es)\n", endpoint.device, endpoint.config, endpoint.routes.len()));
+            for (mix, map) in &endpoint.routes {
+                let gain = if *mix == 0 { 0.0 } else { self.send_gain_db.unwrap_or(0.0) };
+                text.push_str(&format!("  mix {mix}: map {map:?} (zero-based); additional send gain {gain} dB\n"));
+            }
         }
-        text.push_str("Vocal settings are fixed for this run. No automatic makeup gain or lookahead buffer; IIR phase/group delay still exists.\nCheck validates configuration, not device operation or sound quality. ASIO, VST3 and driver installation are not implemented.\n");
+        text.push_str("Vocal settings are fixed for this run. No automatic makeup gain or lookahead buffer; IIR phase/group delay still exists.\nCheck validates configuration, not device operation or sound quality. ASIO, live VST3 and driver installation are not implemented.\n");
         text
     }
 
@@ -93,25 +110,26 @@ impl Prepared {
         let mut writers = Vec::new();
         let mut stats = Vec::new();
         let mut timing = Vec::new();
-        for endpoint in self.outputs {
-            let (writer, reader) = bridge::channel(self.input_config.sample_rate(), endpoint.config.sample_rate(), self.queue_ms, health.clone())?;
-            timing.push(format!("queue target {:.2} ms + resampler delay {:.2} ms (excludes hardware and OS; NOT round-trip latency)", reader.queue_ms, reader.resampler_delay_ms));
+        for (index, endpoint) in self.outputs.into_iter().enumerate() {
+            let (writer, reader) = bridge::channel(self.input_config.sample_rate(), endpoint.config.sample_rate(), self.queue_ms, endpoint.routes.len(), health.clone())?;
+            timing.push(format!("stream {index}: {} mix(es), shared queue target {:.2} ms + resampler delay {:.2} ms (excludes hardware and OS; NOT round-trip latency)", endpoint.routes.len(), reader.queue_ms, reader.resampler_delay_ms));
             stats.push(reader.stats.clone());
-            writers.push((writer, endpoint.gain_db));
+            writers.push((writer, endpoint.routes.iter().map(|(mix, _)| *mix).collect()));
+            let maps: Vec<OutputMap> = endpoint.routes.iter().map(|(_, map)| *map).collect();
             let format = endpoint.config.sample_format();
             let config = endpoint.config.config();
             let stream = match format {
-                SampleFormat::F32 => output::<f32>(&endpoint.device, config, endpoint.map, reader, health.clone())?,
-                SampleFormat::F64 => output::<f64>(&endpoint.device, config, endpoint.map, reader, health.clone())?,
-                SampleFormat::I16 => output::<i16>(&endpoint.device, config, endpoint.map, reader, health.clone())?,
-                SampleFormat::I32 => output::<i32>(&endpoint.device, config, endpoint.map, reader, health.clone())?,
-                SampleFormat::U16 => output::<u16>(&endpoint.device, config, endpoint.map, reader, health.clone())?,
+                SampleFormat::F32 => output::<f32>(&endpoint.device, config, maps, reader, health.clone())?,
+                SampleFormat::F64 => output::<f64>(&endpoint.device, config, maps, reader, health.clone())?,
+                SampleFormat::I16 => output::<i16>(&endpoint.device, config, maps, reader, health.clone())?,
+                SampleFormat::I32 => output::<i32>(&endpoint.device, config, maps, reader, health.clone())?,
+                SampleFormat::U16 => output::<u16>(&endpoint.device, config, maps, reader, health.clone())?,
                 _ => return Err("sample format changed after validation".into()),
             };
             timing.push(format!("output driver buffer query: {:?} frames", stream.buffer_size()));
             streams.push(stream);
         }
-        let capture = Capture::new(self.vocal, self.output_gain_db, writers, health.clone())?;
+        let capture = Capture::new(self.vocal, self.output_gain_db, self.send_gain_db, writers, health.clone())?;
         let vocal_stats = capture.vocal_stats.clone();
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
@@ -136,6 +154,7 @@ pub struct Active {
     _input: Stream,
     _outputs: Vec<Stream>,
     pub health: Arc<Health>,
+    /// One set per physical playback endpoint, shared by its channel routes.
     pub outputs: Vec<Arc<OutputStats>>,
     pub vocal_stats: Arc<VocalStats>,
     pub timing: Vec<String>,
@@ -157,7 +176,7 @@ where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
     }, move |_| error_health.fail(Fault::Device), None)?)
 }
 
-fn output<T>(device: &Device, config: StreamConfig, map: OutputMap, mut reader: OutputReader, health: Arc<Health>) -> Result<Stream>
+fn output<T>(device: &Device, config: StreamConfig, maps: Vec<OutputMap>, mut reader: OutputReader, health: Arc<Health>) -> Result<Stream>
 where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
     let channels = usize::from(config.channels);
     let error_health = health.clone();
@@ -166,8 +185,9 @@ where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
         if health.failed() { return; }
         if data.len() % channels != 0 { health.fail(Fault::Routing); return; }
         for frame in data.chunks_exact_mut(channels) {
-            let stereo = reader.next_frame();
-            for (channel, sample) in frame.iter_mut().enumerate() { *sample = T::from_sample(map.sample(channel, stereo)); }
+            // Consume ONCE per endpoint frame, not once per destination or physical channel.
+            let packed = reader.next_frame();
+            for (channel, sample) in frame.iter_mut().enumerate() { *sample = T::from_sample(output_sample(&maps, channel, &packed)); }
         }
         if health.failed() { data.fill(T::EQUILIBRIUM); }
     }, move |_| error_health.fail(Fault::Device), None)?)
@@ -179,7 +199,7 @@ impl Active {
         let vocal = self.vocal_stats.take();
         let mut text = format!("captured={} input_peak={:.3} vocal_peak={:.3} comp_gr={:.1}dB deess_gr={:.1}dB", self.health.captured_frames.load(Ordering::Relaxed), f32::from_bits(self.health.input_peak.swap(0, Ordering::Relaxed)), vocal.output_peak, vocal.compression_db, vocal.deessing_db);
         for (index, stats) in self.outputs.iter().enumerate() {
-            text.push_str(&format!(" | out{index}: peak={:.3} queue={} frames correction={}ppm underruns={} clipped={}", f32::from_bits(stats.peak.swap(0, Ordering::Relaxed)), stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed), stats.underruns.load(Ordering::Relaxed), stats.clipped_frames.load(Ordering::Relaxed)));
+            text.push_str(&format!(" | stream{index}: peak={:.3} queue={} frames correction={}ppm underruns={} clipped={}", f32::from_bits(stats.peak.swap(0, Ordering::Relaxed)), stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed), stats.underruns.load(Ordering::Relaxed), stats.clipped_frames.load(Ordering::Relaxed)));
         }
         text
     }
