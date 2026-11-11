@@ -125,19 +125,28 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
             "fault" | "partial-failure" => { assert!(worker.finish(Some(&path)).is_err()); assert!(!path.exists()); },
             "exists" => { assert!(worker.finish(Some(&path)).is_err()); assert_eq!(std::fs::read(&path).unwrap(), b"keep"); },
             _ => {
+                use clap::Parser;
+                use crate::{config::{Cli, Command}, plugin::PluginArgs, scene::AudioScene};
                 worker.finish(Some(&path)).unwrap();
                 let restored = ChainFile::read(&path).unwrap();
                 assert_eq!(restored.effects.len(), 2);
-                for (spec, expected) in restored.effects.iter().zip([0.23, 0.61]) {
+                // Reuse the real native snapshots through the same scene/launch path as the CLI.
+                let Command::Check(route) = Cli::parse_from(["audio", "check", "--input", "fake-mic", "--output", "fake-phones"]).command
+                    else { panic!("expected check") };
+                let scene_path = directory.path().join("voice.mixlive-scene.json");
+                AudioScene::new(route, restored.effects).unwrap().save_new(&scene_path).unwrap();
+                let scene = AudioScene::read(&scene_path).unwrap();
+                let setup = PluginArgs::default().resolve_scene(scene.effects).unwrap();
+                for (spec, expected) in setup.effects.iter().zip([0.23, 0.61]) {
                     assert!(spec.plugin.is_absolute());
                     let plugin = load_effect(spec, 48000).unwrap();
                     assert!((plugin.get_parameter(0).unwrap() - expected).abs() < 1e-6);
                 }
-                let wrong_class = EffectSpec { plugin: fixture("MIXLIVE_GAIN_VST3").plugin, ..restored.effects[0].clone() };
+                let wrong_class = EffectSpec { plugin: fixture("MIXLIVE_GAIN_VST3").plugin, ..setup.effects[0].clone() };
                 assert!(load_effect(&wrong_class, 48000).is_err());
             }
         }
     }
-    // Only the complete snapshot and the pre-existing user file remain.
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    // Complete chain and embedded scene snapshots plus the pre-existing user file remain.
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
 }

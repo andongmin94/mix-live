@@ -1,5 +1,5 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
-use super::{ChainFile, EffectSpec, PluginArgs};
+use super::{ChainFile, EffectSpec, ResolvedPlugins};
 use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}};
 use mixlive_vst3::editor::{flush_editor_changes, pump_editor_messages};
 use rtrb::{Producer, RingBuffer};
@@ -69,16 +69,16 @@ fn load_effect(spec: &EffectSpec, rate: u32) -> Result<Plugin, String> {
     Ok(plugin)
 }
 
-pub fn connect(capture: Capture, args: &PluginArgs, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>)
+pub fn connect(capture: Capture, setup: &ResolvedPlugins, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>)
     -> Result<(CaptureSink, Option<PluginWorker>), String> {
-    let specs = args.resolve()?;
-    if specs.is_empty() { return Ok((CaptureSink::Direct(Box::new(capture)), None)); }
-    // All files/classes/states are checked before any capture/playback stream starts.
-    let plugins = specs.iter().enumerate().map(|(index, spec)| {
+    setup.validate()?;
+    if setup.effects.is_empty() { return Ok((CaptureSink::Direct(Box::new(capture)), None)); }
+    // Selection was resolved once, from CLI/chain or an embedded scene. Native loading happens here.
+    let plugins = setup.effects.iter().enumerate().map(|(index, spec)| {
         load_effect(spec, rate).map_err(|e| format!("VST3 slot {}: {e}", index + 1))
     }).collect::<Result<Vec<_>, _>>()?;
     let (input, mut worker) = spawn(capture, plugins, rate, queue_ms, has_aux, health)?;
-    for &index in &args.vst3_editor {
+    for &index in &setup.editors {
         let slot = &mut worker.slots[index as usize - 1];
         slot.editor = Some(open_editor(slot.plugin.clone()).map_err(|e| format!("VST3 slot {index}: {e}"))?);
     }

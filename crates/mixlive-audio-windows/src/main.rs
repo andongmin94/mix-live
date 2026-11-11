@@ -1,8 +1,8 @@
 use clap::{Args, CommandFactory, FromArgMatches};
 use mixlive_audio_windows::{
     config::{Cli, Command, RouteOptions, SceneCommand},
-    plugin::PluginArgs,
-    scene::{DeviceScene, Result},
+    plugin::{PluginArgs, ResolvedPlugins},
+    scene::{AudioScene, Result},
 };
 
 fn parser() -> clap::Command { PluginArgs::augment_args(Cli::command()) }
@@ -19,26 +19,42 @@ fn main() {
 
 fn run(cli: Cli, plugin: PluginArgs) -> Result<()> {
     plugin.validate()?;
-    if plugin.enabled() && !matches!(&cli.command,
-        Command::Run { .. } | Command::Scene { command: SceneCommand::Run { .. } }) {
-        return Err("VST3 launch options are supported by run and scene run only; use mixlive-plugins to inspect/edit".into());
+    if plugin.requested() && !matches!(&cli.command,
+        Command::Run { .. } | Command::Scene { command: SceneCommand::Run { .. } | SceneCommand::Save { .. } }) {
+        return Err("VST3 options belong to run, scene save or scene run; use mixlive-plugins to inspect/edit".into());
     }
     match cli.command {
         Command::Devices => device::list(),
         Command::Check(route) => device::check(&route),
-        Command::Run { route, seconds, interactive } => device::run(&route, seconds, interactive, &plugin),
+        Command::Run { route, seconds, interactive } => {
+            let setup = plugin.resolve()?;
+            device::run(&route, seconds, interactive, &setup)
+        }
         Command::Scene { command } => match command {
             SceneCommand::Save { file, route } => {
-                DeviceScene::new(route)?.save_new(&file)?;
-                println!("Saved {}. No audio device was opened or verified; use scene check before scene run.", file.display());
+                if !plugin.vst3_editor.is_empty() || plugin.vst3_chain_out.is_some() {
+                    return Err("scene save does not run plugins; editor/chain-out options belong to run".into());
+                }
+                let scene = AudioScene::new(route, plugin.resolve()?.effects)?;
+                scene.save_new(&file)?;
+                println!("Saved {} with {} embedded VST3 slot(s). No audio device or native plugin was opened; use scene check before scene run.", file.display(), scene.effects.len());
                 Ok(())
             }
             SceneCommand::Show { file } => {
-                println!("{}", serde_json::to_string_pretty(&DeviceScene::read(&file)?)?);
+                println!("{}", serde_json::to_string_pretty(&AudioScene::read(&file)?)?);
                 Ok(())
             }
-            SceneCommand::Check { file } => device::check(&DeviceScene::read(&file)?.route),
-            SceneCommand::Run { file, seconds, interactive } => device::run(&DeviceScene::read(&file)?.route, seconds, interactive, &plugin),
+            SceneCommand::Check { file } => {
+                let scene = AudioScene::read(&file)?;
+                device::check(&scene.route)?;
+                println!("Scene contains {} VST3 slot(s). Their configuration was parsed; plugin availability, native compatibility and sound were NOT tested.", scene.effects.len());
+                Ok(())
+            }
+            SceneCommand::Run { file, seconds, interactive } => {
+                let scene = AudioScene::read(&file)?;
+                let setup = plugin.resolve_scene(scene.effects)?;
+                device::run(&scene.route, seconds, interactive, &setup)
+            }
         },
     }
 }
@@ -65,7 +81,7 @@ fn read_commands(reader: impl std::io::BufRead, mut feedback: impl std::io::Writ
 
 #[cfg(windows)]
 mod device {
-    use super::{PluginArgs, Result, RouteOptions};
+    use super::{ResolvedPlugins, Result, RouteOptions};
     use mixlive_audio_windows::windows::{Prepared, list_devices};
     use std::time::{Duration, Instant};
 
@@ -81,14 +97,14 @@ mod device {
         Ok(())
     }
 
-    pub fn run(route: &RouteOptions, seconds: u64, interactive: bool, plugin: &PluginArgs) -> Result<()> {
+    pub fn run(route: &RouteOptions, seconds: u64, interactive: bool, plugin: &ResolvedPlugins) -> Result<()> {
         let prepared = Prepared::new(route)?;
         println!("{}", prepared.describe());
         println!("Use headphones at LOW hardware volume. Disable other monitoring paths.\nStarting a {seconds}s live mic route; no recording. Sample clipping guard is not a mastering limiter.");
-        if plugin.enabled() {
+        if !plugin.effects.is_empty() {
             println!("Loading a trusted native VST3 chain in this process. A plugin crash/hang is not isolated. No delay compensation; all processing must finish before shutdown can complete.");
         }
-        if !plugin.vst3_editor.is_empty() {
+        if !plugin.editors.is_empty() {
             println!("Opening selected LIVE plugin editors. Closing a window keeps audio running. Restart/bus/latency requests stop the route. Use stop or the session time limit to finish.");
         }
         let mut active = prepared.start(plugin)?;
@@ -104,7 +120,7 @@ mod device {
         }
         let started = Instant::now();
         let mut next_report = Duration::ZERO;
-        let poll_interval = Duration::from_millis(if plugin.vst3_editor.is_empty() { 50 } else { 16 });
+        let poll_interval = Duration::from_millis(if plugin.editors.is_empty() { 50 } else { 16 });
         while started.elapsed() < Duration::from_secs(seconds) && !active.controls.stop_requested() {
             active.poll_plugin()?;
             if let Some(error) = active.health.error() { return Err(error.into()); }
@@ -115,21 +131,21 @@ mod device {
             std::thread::sleep(poll_interval);
         }
         let report = active.report();
-        let finished = active.finish(plugin.vst3_chain_out.as_deref());
+        let finished = active.finish(plugin.chain_out.as_deref());
         println!("Stopped. {report}");
         finished?;
-        if let Some(path) = &plugin.vst3_chain_out { println!("Saved VST3 chain: {}", path.display()); }
+        if let Some(path) = &plugin.chain_out { println!("Saved VST3 chain: {}", path.display()); }
         Ok(())
     }
 }
 
 #[cfg(not(windows))]
 mod device {
-    use super::{PluginArgs, Result, RouteOptions};
+    use super::{ResolvedPlugins, Result, RouteOptions};
     const UNSUPPORTED: &str = "audio devices are implemented for Windows only; scene save/show do not require devices";
     pub fn list() -> Result<()> { Err(UNSUPPORTED.into()) }
     pub fn check(_route: &RouteOptions) -> Result<()> { Err(UNSUPPORTED.into()) }
-    pub fn run(_route: &RouteOptions, _seconds: u64, _interactive: bool, _plugin: &PluginArgs) -> Result<()> { Err(UNSUPPORTED.into()) }
+    pub fn run(_route: &RouteOptions, _seconds: u64, _interactive: bool, _plugin: &ResolvedPlugins) -> Result<()> { Err(UNSUPPORTED.into()) }
 }
 
 #[cfg(test)]
@@ -170,20 +186,17 @@ mod tests {
     }
 
     #[test]
-    fn ordered_vst3_chains_work_for_direct_and_scene_runs_without_silent_persistence() {
-        for mut words in [vec!["mixlive-audio", "run", "--input", "mic", "--output", "phones"],
-            vec!["mixlive-audio", "scene", "run", "singing.json"]] {
-            words.extend(["--vst3", "eq.vst3", "--vst3", "room.vst3", "--vst3-editor", "2", "--vst3-editor", "1", "--vst3-chain-out", "voice.json"]);
-            let matches = parser().try_get_matches_from(words).unwrap();
-            let plugin = PluginArgs::from_arg_matches(&matches).unwrap();
-            assert_eq!(plugin.vst3, vec![std::path::PathBuf::from("eq.vst3"), "room.vst3".into()]);
-            assert_eq!(plugin.vst3_editor, [2, 1]);
-            assert_eq!(plugin.vst3_chain_out, Some("voice.json".into()));
-            assert!(plugin.validate().is_ok());
-            assert!(Cli::from_arg_matches(&matches).is_ok());
-        }
-        let matches = parser().try_get_matches_from(["mixlive-audio", "scene", "run", "singing.json", "--vst3-chain", "voice.json"]).unwrap();
-        assert_eq!(PluginArgs::from_arg_matches(&matches).unwrap().vst3_chain, Some("voice.json".into()));
+    fn chain_selection_and_per_run_editor_actions_are_not_silently_ignored() {
+        let words = ["mixlive-audio", "run", "--input", "mic", "--output", "phones",
+            "--vst3", "eq.vst3", "--vst3", "room.vst3", "--vst3-editor", "2", "--vst3-chain-out", "voice.json"];
+        let matches = parser().try_get_matches_from(words).unwrap();
+        let setup = PluginArgs::from_arg_matches(&matches).unwrap().resolve().unwrap();
+        assert_eq!(setup.effects.len(), 2);
+        assert_eq!(setup.editors, [2]);
+        assert_eq!(setup.chain_out, Some("voice.json".into()));
+        assert!(Cli::from_arg_matches(&matches).is_ok());
+        let matches = parser().try_get_matches_from(["mixlive-audio", "scene", "run", "singing.json", "--vst3-editor", "2"]).unwrap();
+        assert_eq!(PluginArgs::from_arg_matches(&matches).unwrap().vst3_editor, [2]);
         assert!(parser().try_get_matches_from(["mixlive-audio", "devices", "--vst3", "effect.vst3", "--vst3-chain", "voice.json"]).is_err());
         assert!(parser().try_get_matches_from(["mixlive-audio", "devices", "--vst3-editor", "0"]).is_err());
         for legacy in ["--vst3-state", "--vst3-state-out", "--vst3-class"] {
@@ -191,7 +204,8 @@ mod tests {
         }
         for words in [vec!["mixlive-audio", "devices", "--vst3-editor", "1"],
             vec!["mixlive-audio", "devices", "--vst3-chain-out", "voice.json"],
-            vec!["mixlive-audio", "devices", "--vst3", "effect.vst3"]] {
+            vec!["mixlive-audio", "devices", "--vst3", "effect.vst3"],
+            vec!["mixlive-audio", "scene", "save", "unused.json", "--input", "mic", "--output", "phones", "--vst3", "effect.vst3", "--vst3-editor", "1"]] {
             let matches = parser().try_get_matches_from(words).unwrap();
             assert!(run(Cli::from_arg_matches(&matches).unwrap(), PluginArgs::from_arg_matches(&matches).unwrap()).is_err());
         }

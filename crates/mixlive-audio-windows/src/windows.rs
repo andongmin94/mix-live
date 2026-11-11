@@ -2,7 +2,7 @@
 use std::{error::Error, sync::{Arc, atomic::Ordering}};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use mixlive_effects::VocalChain;
-use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, output_sample}, control::{LiveControls, PlaybackGains}, plugin::{PluginArgs, native::{self, CaptureSink, PluginWorker}}};
+use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, output_sample}, control::{LiveControls, PlaybackGains}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -132,7 +132,8 @@ impl Prepared {
         text
     }
 
-    pub fn start(self, plugin: &PluginArgs) -> Result<Active> {
+    pub fn start(self, plugin: &ResolvedPlugins) -> Result<Active> {
+        plugin.validate()?;
         let health = Arc::new(Health::default());
         let controls = Arc::new(LiveControls::new(self.output_gain_db, self.send_gain_db, self.aux_mix.is_some())?);
         let mut streams = Vec::new();

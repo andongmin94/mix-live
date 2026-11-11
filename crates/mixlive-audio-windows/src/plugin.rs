@@ -5,10 +5,10 @@ use std::{fs::File, io::{BufReader, Write}, path::{Path, PathBuf}};
 
 #[derive(Args, Clone, Debug, Default)]
 pub struct PluginArgs {
-    /// Append a trusted stereo VST3 in processing order. Repeat for multiple effects.
+    /// Append a trusted stereo VST3 in processing order. For run or scene save, not scene run.
     #[arg(long, global = true, conflicts_with = "vst3_chain")]
     pub vst3: Vec<PathBuf>,
-    /// Restore an ordered MixLive chain, including each instance's saved state.
+    /// Import an ordered chain for run or scene save. A saved scene owns its embedded chain.
     #[arg(long, global = true, conflicts_with = "vst3")]
     pub vst3_chain: Option<PathBuf>,
     /// Open the live editor for this one-based slot. Repeat to open more than one.
@@ -21,13 +21,11 @@ pub struct PluginArgs {
 
 impl PluginArgs {
     pub fn enabled(&self) -> bool { !self.vst3.is_empty() || self.vst3_chain.is_some() }
+    pub fn requested(&self) -> bool { self.enabled() || !self.vst3_editor.is_empty() || self.vst3_chain_out.is_some() }
 
     pub fn validate(&self) -> Result<(), String> {
         if !self.vst3.is_empty() && self.vst3_chain.is_some() {
             return Err("choose repeated --vst3 paths OR --vst3-chain, not both".into());
-        }
-        if !self.enabled() && (!self.vst3_editor.is_empty() || self.vst3_chain_out.is_some()) {
-            return Err("VST3 editor/save options require an explicit chain".into());
         }
         for path in self.vst3.iter().chain(self.vst3_chain.iter()).chain(self.vst3_chain_out.iter()) {
             if path.as_os_str().is_empty() { return Err("VST3 paths must not be empty".into()); }
@@ -41,29 +39,83 @@ impl PluginArgs {
         Ok(())
     }
 
-    /// Resolve configuration before loading any native library or starting device streams.
-    pub(crate) fn resolve(&self) -> Result<Vec<EffectSpec>, String> {
+    /// Resolve file/CLI selection once, before native libraries or device streams are opened.
+    pub fn resolve(&self) -> Result<ResolvedPlugins, String> {
         self.validate()?;
         let effects = match &self.vst3_chain {
             Some(path) => ChainFile::read(path)?.effects,
-            None => self.vst3.iter().map(|path| EffectSpec {
-                plugin: path.clone(), class_id: None, state: None,
-            }).collect(),
+            None => self.vst3.iter().map(|path| Ok(EffectSpec {
+                plugin: std::path::absolute(path).map_err(|e| e.to_string())?, class_id: None, state: None,
+            })).collect::<Result<Vec<_>, String>>()?,
         };
-        if self.vst3_editor.iter().any(|&slot| slot as usize > effects.len()) {
-            return Err("requested editor slot is outside this VST3 chain".into());
+        ResolvedPlugins::new(effects, self.vst3_editor.clone(), self.vst3_chain_out.clone())
+    }
+
+    /// A scene's chain is authoritative, including an intentionally empty chain.
+    /// Editor/output-file choices remain per-run actions, not persisted settings.
+    pub fn resolve_scene(&self, effects: Vec<EffectSpec>) -> Result<ResolvedPlugins, String> {
+        self.validate()?;
+        if self.enabled() {
+            return Err("scene run uses its embedded VST3 chain; --vst3/--vst3-chain belong to run or scene save".into());
         }
-        Ok(effects)
+        ResolvedPlugins::new(effects, self.vst3_editor.clone(), self.vst3_chain_out.clone())
+    }
+}
+
+/// The device adapter consumes resolved settings, not CLI flags or a second file read.
+#[derive(Debug)]
+pub struct ResolvedPlugins {
+    pub effects: Vec<EffectSpec>,
+    pub editors: Vec<u32>,
+    pub chain_out: Option<PathBuf>,
+}
+impl ResolvedPlugins {
+    fn new(effects: Vec<EffectSpec>, editors: Vec<u32>, chain_out: Option<PathBuf>) -> Result<Self, String> {
+        let setup = Self { effects, editors, chain_out };
+        setup.validate()?;
+        Ok(setup)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        validate_effects(&self.effects)?;
+        if self.effects.is_empty() && (!self.editors.is_empty() || self.chain_out.is_some()) {
+            return Err("VST3 editor/save options require a nonempty chain".into());
+        }
+        for (index, &slot) in self.editors.iter().enumerate() {
+            if slot == 0 || slot as usize > self.effects.len() || self.editors[..index].contains(&slot) {
+                return Err("editor slots must be distinct one-based indices inside this VST3 chain".into());
+            }
+        }
+        if let Some(path) = &self.chain_out {
+            if path.as_os_str().is_empty() { return Err("VST3 output path must not be empty".into()); }
+            require_new_file(path)?;
+        }
+        Ok(())
     }
 }
 
 /// Repeated paths are intentional: each entry is a separate native instance and state.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct EffectSpec {
+pub struct EffectSpec {
     pub plugin: PathBuf,
     pub class_id: Option<String>,
     pub state: Option<Vec<u8>>,
+}
+
+pub(crate) fn validate_effects(effects: &[EffectSpec]) -> Result<(), String> {
+    for (index, effect) in effects.iter().enumerate() {
+        if effect.plugin.as_os_str().is_empty() {
+            return Err(format!("VST3 slot {} has an empty plugin path", index + 1));
+        }
+        if effect.class_id.as_ref().is_some_and(|id| id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err(format!("VST3 slot {} needs a 32-digit hexadecimal class ID", index + 1));
+        }
+        if effect.state.is_some() && effect.class_id.is_none() {
+            return Err(format!("VST3 slot {}: saved state requires its audio class ID", index + 1));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,18 +128,7 @@ impl ChainFile {
     fn validate(&self) -> Result<(), String> {
         if self.schema != 1 { return Err("unsupported MixLive VST3 chain schema".into()); }
         if self.effects.is_empty() { return Err("a VST3 chain needs at least one effect".into()); }
-        for (index, effect) in self.effects.iter().enumerate() {
-            if effect.plugin.as_os_str().is_empty() {
-                return Err(format!("VST3 slot {} has an empty plugin path", index + 1));
-            }
-            if effect.class_id.as_ref().is_some_and(|id| id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit())) {
-                return Err(format!("VST3 slot {} needs a 32-digit hexadecimal class ID", index + 1));
-            }
-            if effect.state.is_some() && effect.class_id.is_none() {
-                return Err(format!("VST3 slot {}: saved state requires its audio class ID", index + 1));
-            }
-        }
-        Ok(())
+        validate_effects(&self.effects)
     }
 
     pub fn read(path: &Path) -> Result<Self, String> {
@@ -135,11 +176,12 @@ mod tests {
 
     #[test]
     fn chain_selection_is_ordered_and_editor_indices_are_explicit() {
-        assert!(PluginArgs::default().resolve().unwrap().is_empty());
+        assert!(PluginArgs::default().resolve().unwrap().effects.is_empty());
         let mut args = PluginArgs { vst3: vec!["eq.vst3".into(), "room.vst3".into(), "eq.vst3".into()],
             vst3_editor: vec![3, 1], ..PluginArgs::default() };
-        let effects = args.resolve().unwrap();
-        assert_eq!(effects.iter().map(|s| &s.plugin).collect::<Vec<_>>(), args.vst3.iter().collect::<Vec<_>>());
+        let setup = args.resolve().unwrap();
+        assert_eq!(setup.effects.iter().map(|s| s.plugin.clone()).collect::<Vec<_>>(),
+            args.vst3.iter().map(|p| std::path::absolute(p).unwrap()).collect::<Vec<_>>());
         for slots in [vec![0], vec![4], vec![1, 1]] { args.vst3_editor = slots; assert!(args.resolve().is_err()); }
         args.vst3_editor.clear();
         args.vst3_chain = Some("voice.json".into());
@@ -147,7 +189,24 @@ mod tests {
         for args in [PluginArgs { vst3_editor: vec![1], ..PluginArgs::default() },
             PluginArgs { vst3_chain_out: Some("out.json".into()), ..PluginArgs::default() },
             PluginArgs { vst3: vec![PathBuf::new()], ..PluginArgs::default() }] {
-            assert!(args.validate().is_err());
+            assert!(args.resolve().is_err());
+        }
+    }
+
+    #[test]
+    fn scene_chain_is_authoritative_and_editor_selection_uses_its_slots() {
+        let effects = vec![EffectSpec { plugin: "effect.vst3".into(), class_id: None, state: None }];
+        let args = PluginArgs { vst3_editor: vec![1], ..PluginArgs::default() };
+        let setup = args.resolve_scene(effects.clone()).unwrap();
+        assert_eq!(setup.effects, effects);
+        assert_eq!(setup.editors, [1]);
+        assert!(args.resolve_scene(vec![]).is_err());
+        let args = PluginArgs { vst3_editor: vec![2], ..PluginArgs::default() };
+        assert!(args.resolve_scene(effects.clone()).is_err());
+        for args in [PluginArgs { vst3: vec!["other.vst3".into()], ..PluginArgs::default() },
+            PluginArgs { vst3_chain: Some("must-not-be-read.json".into()), ..PluginArgs::default() }] {
+            assert!(args.resolve_scene(effects.clone()).unwrap_err().contains("embedded"));
+            assert!(args.resolve_scene(vec![]).is_err());
         }
     }
 
@@ -167,7 +226,7 @@ mod tests {
         assert_eq!(loaded.effects[0].state.as_deref(), Some([1, 2].as_slice()));
         assert_eq!(loaded.effects[1].state.as_deref(), Some([3, 4].as_slice()));
         let args = PluginArgs { vst3_chain: Some(path.clone()), vst3_editor: vec![2], ..PluginArgs::default() };
-        assert_eq!(args.resolve().unwrap(), loaded.effects);
+        assert_eq!(args.resolve().unwrap().effects, loaded.effects);
         let args = PluginArgs { vst3_chain_out: Some(path), ..args };
         assert!(args.validate().is_err());
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);

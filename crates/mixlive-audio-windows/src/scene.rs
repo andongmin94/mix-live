@@ -1,7 +1,7 @@
-//! Explicit device/vocal scene persistence on the control thread, never in an audio callback.
-//! One microphone plus optional AUX capture; not an unimplemented app/VST3 routing graph.
+//! Device/vocal settings and the ordered VST3 chain in one explicit startup scene.
+//! Reading/saving a scene never loads native plugins or opens an audio device.
 
-use crate::config::RouteOptions;
+use crate::{config::RouteOptions, plugin::{EffectSpec, validate_effects}};
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::{BufReader, Write}, path::Path};
 
@@ -9,32 +9,43 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + S
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeviceScene {
+pub struct AudioScene {
     schema: u32,
     pub route: RouteOptions,
+    /// Required even when empty. State bytes are embedded, not references to another file.
+    pub effects: Vec<EffectSpec>,
 }
 
-impl DeviceScene {
-    pub fn new(route: RouteOptions) -> Result<Self> {
+impl AudioScene {
+    pub fn new(route: RouteOptions, mut effects: Vec<EffectSpec>) -> Result<Self> {
         route.validate()?;
-        Ok(Self { schema: 2, route })
+        validate_effects(&effects)?;
+        // CLI paths refer to the current working directory, not a future scene directory.
+        // absolute() does not require the plugin to be present or execute its native code.
+        for effect in &mut effects { effect.plugin = std::path::absolute(&effect.plugin)?; }
+        Ok(Self { schema: 3, route, effects })
     }
 
-    /// Reject unsupported files and invalid settings. No default device substitution or migration.
+    /// Relative paths in a hand-authored scene are anchored to that scene, never the caller's cwd.
     pub fn read(path: &Path) -> Result<Self> {
-        let scene: Self = serde_json::from_reader(BufReader::new(File::open(path)?))?;
+        let path = path.canonicalize()?;
+        let mut scene: Self = serde_json::from_reader(BufReader::new(File::open(&path)?))?;
         scene.validate()?;
+        let parent = path.parent().ok_or("scene file has no parent directory")?;
+        for effect in &mut scene.effects {
+            if effect.plugin.is_relative() { effect.plugin = parent.join(&effect.plugin); }
+        }
         Ok(scene)
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != 2 { return Err("unsupported MixLive device scene schema".into()); }
+        if self.schema != 3 { return Err("unsupported MixLive scene schema; create a schema 3 scene".into()); }
         self.route.validate()?;
+        validate_effects(&self.effects)?;
         Ok(())
     }
 
-    /// Finish writing beside the destination, then publish a NEW file without overwriting it.
-    /// Saved endpoint IDs remain private local configuration; no audio or plugin state is stored.
+    /// Publish one complete NEW document. Endpoint IDs and plugin state are private local data.
     pub fn save_new(&self, path: &Path) -> Result<()> {
         self.validate()?;
         let bytes = serde_json::to_vec_pretty(self)?;
@@ -52,7 +63,7 @@ impl DeviceScene {
 mod tests {
     use super::*;
     use clap::Parser;
-    use crate::config::{Cli, Command};
+    use crate::{config::{Cli, Command}, plugin::{ChainFile, PluginArgs}};
     use mixlive_effects::Preset;
     use serde_json::json;
 
@@ -83,20 +94,49 @@ mod tests {
                 options.aux_gain_db = -9.0;
                 options.aux_to = crate::config::AuxDestination::Both;
             }
-            let scene = DeviceScene::new(options.clone()).unwrap();
+            let scene = AudioScene::new(options.clone(), vec![]).unwrap();
             let path = directory.path().join(format!("{index}.mixlive-scene.json"));
             scene.save_new(&path).unwrap();
-            let restored = DeviceScene::read(&path).unwrap();
+            let restored = AudioScene::read(&path).unwrap();
             assert_eq!(restored.route, options);
+            assert!(restored.effects.is_empty());
             assert_eq!(serde_json::to_value(&restored).unwrap()["route"]["vocal"], preset.to_string());
         }
+    }
+
+    #[test]
+    fn scene_embeds_all_states_and_does_not_depend_on_the_imported_chain_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain_path = directory.path().join("original.chain.json");
+        let first = EffectSpec { plugin: "not-installed.vst3".into(),
+            class_id: Some("0123456789ABCDEF0123456789abcdef".into()), state: Some(vec![1, 2]) };
+        ChainFile { schema: 1, effects: vec![first.clone(), EffectSpec { state: Some(vec![3, 4]), ..first }] }
+            .save_new(&chain_path).unwrap();
+        let effects = PluginArgs { vst3_chain: Some(chain_path.clone()), ..PluginArgs::default() }.resolve().unwrap().effects;
+        let folder = directory.path().join("다른 폴더");
+        std::fs::create_dir(&folder).unwrap();
+        let scene_path = folder.join("노래 설정.mixlive-scene.json");
+        AudioScene::new(route(), effects.clone()).unwrap().save_new(&scene_path).unwrap();
+        std::fs::remove_file(&chain_path).unwrap();
+        let scene = AudioScene::read(&scene_path).unwrap();
+        assert_eq!(scene.effects, effects);
+        let setup = PluginArgs { vst3_editor: vec![2], ..PluginArgs::default() }.resolve_scene(scene.effects).unwrap();
+        assert_eq!(setup.effects[0].state.as_deref(), Some([1, 2].as_slice()));
+        assert_eq!(setup.effects[1].state.as_deref(), Some([3, 4].as_slice()));
+        assert_eq!(setup.effects[0].plugin, chain_path.parent().unwrap().canonicalize().unwrap().join("not-installed.vst3"));
+        assert!(!setup.effects[0].plugin.exists()); // save/show/resolve did not load or require a DLL
+        let mut document = serde_json::to_value(AudioScene::new(route(), effects).unwrap()).unwrap();
+        document["effects"][0]["plugin"] = json!("relative.vst3");
+        std::fs::write(&scene_path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let scene = AudioScene::read(&scene_path).unwrap();
+        assert_eq!(scene.effects[0].plugin, scene_path.canonicalize().unwrap().parent().unwrap().join("relative.vst3"));
     }
 
     #[test]
     fn scene_save_preserves_existing_files_and_rejects_invalid_settings_before_writing() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("voice.mixlive-scene.json");
-        let mut scene = DeviceScene::new(route()).unwrap();
+        let mut scene = AudioScene::new(route(), vec![]).unwrap();
         scene.save_new(&path).unwrap();
         let original = std::fs::read(&path).unwrap();
         scene.route.output_gain_db = -30.0;
@@ -113,9 +153,9 @@ mod tests {
     fn files_reject_unsupported_schema_unknown_fields_missing_values_and_bad_routes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("invalid.mixlive-scene.json");
-        let original = serde_json::to_value(DeviceScene::new(route()).unwrap()).unwrap();
+        let original = serde_json::to_value(AudioScene::new(route(), vec![]).unwrap()).unwrap();
         let mut cases = Vec::new();
-        for (key, value) in [("schema", json!(1)), ("unknown", json!(true))] {
+        for (key, value) in [("schema", json!(2)), ("unknown", json!(true))] {
             let mut document = original.clone();
             document[key] = value;
             cases.push(document);
@@ -136,6 +176,15 @@ mod tests {
             document["route"][key] = value;
             cases.push(document);
         }
+        for effects in [json!([{"plugin": ""}]), json!([{"plugin": "x", "state": [1]}]),
+            json!([{"plugin": "x", "class_id": "wrong"}]), json!([{"plugin": "x", "typo": true}]), json!(null)] {
+            let mut document = original.clone();
+            document["effects"] = effects;
+            cases.push(document);
+        }
+        let mut missing_effects = original.clone();
+        missing_effects.as_object_mut().unwrap().remove("effects");
+        cases.push(missing_effects);
         let mut overlap = original.clone();
         overlap["route"]["send"] = json!("test-phones");
         overlap["route"]["send_channels"] = json!([4]);
@@ -145,10 +194,10 @@ mod tests {
         cases.push(missing);
         for document in cases {
             std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-            assert!(DeviceScene::read(&path).is_err(), "accepted invalid scene: {document}");
+            assert!(AudioScene::read(&path).is_err(), "accepted invalid scene: {document}");
         }
-        std::fs::write(&path, b"{\"schema\": 1,").unwrap();
-        assert!(DeviceScene::read(&path).is_err());
-        assert!(DeviceScene::read(&directory.path().join("missing.json")).is_err());
+        std::fs::write(&path, b"{\"schema\": 3,").unwrap();
+        assert!(AudioScene::read(&path).is_err());
+        assert!(AudioScene::read(&directory.path().join("missing.json")).is_err());
     }
 }
