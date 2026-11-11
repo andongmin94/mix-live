@@ -2,7 +2,7 @@
 use std::{error::Error, sync::{Arc, atomic::Ordering}};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use mixlive_effects::VocalChain;
-use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, output_sample}, control::{LiveControls, PlaybackGains}};
+use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, output_sample}, control::{LiveControls, PlaybackGains}, plugin::{PluginArgs, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -128,11 +128,11 @@ impl Prepared {
                 else { "separate capture stream; buffered/resampled to the microphone clock (additional AUX delay)" }));
             text.push_str("AUX must carry only the intended MR/line audio, not MixLive output or call return. No app filtering or external feedback detection. Enable output/both only when AUX is not already heard through another path.\n");
         }
-        text.push_str("Vocal preset/thresholds and device bindings are fixed for this run. --interactive enables live source/output mute and master/send gain with 5 ms ramps. Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain or lookahead buffer; IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. ASIO, live VST3 and driver installation are not implemented.\n");
+        text.push_str("Vocal preset/thresholds and device bindings are fixed for this run. --interactive enables live source/output mute and master/send gain with 5 ms ramps. Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain or lookahead buffer; IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
         text
     }
 
-    pub fn start(self) -> Result<Active> {
+    pub fn start(self, plugin: &PluginArgs) -> Result<Active> {
         let health = Arc::new(Health::default());
         let controls = Arc::new(LiveControls::new(self.output_gain_db, self.send_gain_db, self.aux_mix.is_some())?);
         let mut streams = Vec::new();
@@ -185,6 +185,8 @@ impl Prepared {
         };
         let capture = Capture::new(self.vocal, self.input_config.sample_rate(), self.aux_mix, writers, health.clone(), controls.clone())?;
         let vocal_stats = capture.vocal_stats.clone();
+        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, self.aux_mix.is_some(), health.clone())?;
+        if let Some(worker) = &plugin_worker { timing.push(worker.description.clone()); }
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
         let input_stream = match format {
@@ -200,16 +202,17 @@ impl Prepared {
         for stream in &streams { stream.play()?; }
         if let Some(stream) = &aux_stream { stream.play()?; }
         input_stream.play()?;
-        Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, health, outputs: stats,
+        Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, plugin_worker, health, outputs: stats,
             controls, aux_enabled: self.aux_mix.is_some(), aux_clock_stats, vocal_stats, timing })
     }
 }
 
 pub struct Active {
-    // Field drop order stops capture before the outputs.
+    // Drop devices, then join processing and release native plugin state on the loading thread.
     _input: Stream,
     _aux_input: Option<Stream>,
     _outputs: Vec<Stream>,
+    plugin_worker: Option<PluginWorker>,
     pub health: Arc<Health>,
     pub controls: Arc<LiveControls>,
     /// One set per physical playback endpoint, shared by its channel routes.
@@ -220,7 +223,7 @@ pub struct Active {
     pub timing: Vec<String>,
 }
 
-fn input<T>(device: &Device, config: StreamConfig, selected: usize, mut capture: Capture, mut aux: AuxFeed, health: Arc<Health>) -> Result<Stream>
+fn input<T>(device: &Device, config: StreamConfig, selected: usize, mut capture: CaptureSink, mut aux: AuxFeed, health: Arc<Health>) -> Result<Stream>
 where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
     let channels = usize::from(config.channels);
     let error_health = health.clone();
@@ -279,6 +282,11 @@ where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
 }
 
 impl Active {
+    /// Service fixed-configuration plugin requests on the loading/control thread.
+    pub fn poll_plugin(&self) -> Result<()> {
+        if let Some(worker) = &self.plugin_worker { worker.poll()?; }
+        Ok(())
+    }
     /// UI/CLI thread only. Peaks and gain reduction maxima are since the previous read.
     pub fn report(&self) -> String {
         let vocal = self.vocal_stats.take();

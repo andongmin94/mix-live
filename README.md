@@ -7,7 +7,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 사용자가 소유한 VST3를 적용하는 것이 목표다. DAW의 타임라인은 만들지 않는다.
 
 > **현재: 라우팅 코어 + Windows 마이크/AUX 믹서 CLI + 내장 모노 보컬 체인 + 별도 VST3 검사·편집·WAV 도구.**
-> VST3 검사는 비실시간이며 아직 마이크 체인에 연결하지 않았다.
+> VST3 검사·편집 도구는 비실시간이고, `mixlive-audio run --vst3`는 별도의 명시적 라이브 개발 경로다.
 > 완성된 방송 앱·가상 마이크 드라이버가 아니다. 실제 검사와 실장비·청취 미검증 범위는
 > [STATUS.md](STATUS.md)를 따른다.
 
@@ -15,7 +15,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 
 ```text
 선택한 마이크 → 입력 trim → HPF/EQ → 컴프레서 → 디에서 → 원음/보정 blend
-    → 목적지별 보내기 ─┐
+    → 선택적 VST3 → 목적지별 보내기 ─┐
 선택적 AUX → AUX trim ─┴→ 믹스 합산 → 출력별 clock bridge → 실시간 음량/mute → 최종 출력 보호 → 헤드폰/송출
 (AUX가 별도 입력 장치면 먼저 기존 clock bridge로 마이크 처리 클럭에 맞춘다.)
 ```
@@ -33,7 +33,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 - `mixlive-vst3`: 설치 경로 조회, 선택한 VST3의 별도 프로세스 로딩·합성 처리·파라미터
   및 상태 저장/복원. `mixlive-audio`의 callback과 별개다.
 
-**미구현:** ASIO, 앱별 캡처, 자체 가상 장치, VST3 라이브 연결,
+**미구현:** ASIO, 앱별 캡처, 자체 가상 장치, 라이브 VST3 편집/다중 플러그인 체인,
 reverb/delay, pitch correction, GPUI 화면, 앱/VST3까지 포함한 전체 Scene, 실행 중 장치·보컬 체인 교체.
 출력 clipping guard는 전문 리미터가 아니다.
 
@@ -80,7 +80,7 @@ A/B 청취는 원본/보정본 음량을 별도로 맞춰 평가해야 한다.
 보컬 프리셋의 입력은 32..192 kHz, off는 8..192 kHz다. 출력 샘플레이트는 기존
 clock bridge가 처리한다. 별도 lookahead buffer는 없지만 IIR의 위상·군지연과
 장치·queue·리샘플러 지연이 있어 '무지연' 또는 실측 저지연이라고 표시하지 않는다.
-`vocal_peak`는 최종 감쇠 전 sample peak, `comp_gr`/`deess_gr`는 직전 표시 이후 최대
+`vocal_peak`는 선택적 VST3와 최종 감쇠 전 내장 보컬 sample peak, `comp_gr`/`deess_gr`는 직전 표시 이후 최대
 gain reduction이다. blend 강도를 낮추면 이 값은 wet 경로의 억제량이지 최종 감쇠량이 아니다.
 
 ### 두 출력과 채널
@@ -253,6 +253,45 @@ level 범위는 -96..0 dB이고 0은 추가 감쇠 없음이다. AUX의 기존 `
 남는다. 이미 큐에 합쳐진 소리에서 한 소스만 소급 제거하지 않는다. 전체 송출을 끄려면
 출력 queue 뒤에서 적용되는 `mute send` 또는 `mute all`을 사용한다.
 이 기능은 프로세스 캡처나 통화 반환음 자동 제거를 추가하지 않는다.
+
+## 마이크에 VST3 하나 적용하기 (개발 경로)
+
+설치한 신뢰 가능한 **stereo 입력/출력 버스가 하나씩인 VST3 effect**를 내장 보컬 체인 뒤에
+넣을 수 있다. 원래 mono 보컬은 stereo 입력으로 복제하고 VST3의 좌우 출력은 그대로 보존한다.
+AUX/MR은 플러그인을 통과하지 않으며 기존 목적지별 route/level/mute는 VST3 뒤에서 유지된다.
+
+```powershell
+.\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --vocal natural --vst3 "C:\Plugins\Example.vst3" --interactive --seconds 30
+.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --vst3 "C:\Plugins\Example.vst3" --vst3-state voice.mixlive-vst3.json --interactive --seconds 30
+```
+
+`--vst3-state`는 기존 `mixlive-plugins edit/inspect --state-out`으로 저장한 상태다.
+`--vst3-class`로 32자리 class ID를 명시할 수 있고, 생략 시 상태 파일의 ID를 우선한다.
+플러그인과 상태의 class가 다르거나 sidechain/다중 버스가 있으면 송출을 시작하지 않는다.
+선택 플러그인이 실패했다고 원음으로 우회하거나 다른 효과를 대신 넣지 않는다.
+
+VST3 옵션은 **run / scene run의 실행 옵션**이다. Scene schema 2에는 포함되지 않으므로
+매번 명시한다. `scene save/show/check`, `devices`에 이 옵션을 주면 무시하지 않고 거절한다.
+플러그인 파일/상태를 수정하거나 자동 녹음하지 않는다. 상대 경로는 실행 작업 폴더 기준이다.
+
+장치 callback은 마이크와 같은 시간축으로 변환한 AUX를 함께 bounded queue로 전달한다.
+별도 처리 스레드가 내장 보컬→VST3→믹싱을 수행한다. VST3 로딩/상태/제어 요청/종료는
+로딩 스레드가 담당하고, 장치 스트림 종료 후 처리 스레드를 join한 다음 플러그인을 해제한다.
+호스트 내부 잠금 및 짧은 main-thread service와의 잠금 공유는 처리 스레드에 남아 있다.
+**이 경로를 완전 lock-free/hard-real-time이라고 표시하지 않는다.** 출력 callback은 플러그인을
+호출하거나 그 잠금을 기다리지 않는다. 플러그인 미선택 시 기존 직접 처리 경로를 유지한다.
+
+입력 queue는 `--queue-ms`에 따른 **용량 한도**이며 채워질 때까지 기다리는 목표 지연이 아니다.
+worker scheduling, 플러그인 신고 지연, 기존 출력 queue/리샘플러/OS/장치의 지연이 추가된다.
+플러그인의 신고 sample 수와 ms를 출력하지만 이것은 실측 왕복 지연이 아니다. AUX와 보컬 사이의
+플러그인 지연 보상, wet/dry 병렬 혼합, live editor/parameter 교체는 아직 없다.
+고지연 플러그인은 라이브 노래의 타이밍에 영향을 줄 수 있다.
+
+입력 queue 초과, 처리 실패 또는 비유한 샘플은 경로를 중단하고 원음으로 전환하지 않는다.
+실행 중 restart 요청은 자동 재설정하지 않고 명시적으로 멈춰 재구성을 요구한다.
+**플러그인은 현재 앱 프로세스 안에서 실행**된다. native crash/hang을 격리하지 않으며,
+플러그인이 반환하지 않으면 정상 종료도 기다릴 수 있다. 먼저 별도 inspect로 확인한 플러그인만
+사용한다. 실제 상용 플러그인·MiniFuse의 지연/장시간 안정성/청취 수용은 별도로 필요하다.
 
 ## 사용자 VST3 검사·편집
 

@@ -18,6 +18,8 @@ tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 cpal = "=0.18.2"
+mixlive-vst3 = { path = "../mixlive-vst3" }
+vst3-host = { version = "=0.11.1", default-features = false }
 
 [[bin]]
 name = "mixlive-audio"

@@ -23,7 +23,7 @@ ASIO feature는 꺼져 있다. 공식 설치 파일·드라이버 릴리스는 �
   biquad가 사용하는 num-traits 0.2.19의 libm feature 때문에 libm 0.2.16이 추가된다.
 - vst3-host 0.11.1 (MIT), Helge Sverre:
   https://github.com/HelgeSverre/rust-vst3-host/tree/6c64cdffc6740cce0b4c5b6916724697b0ef9ff8
-  기본 features를 끄고 Windows의 장치 독립 검사·편집·파일 처리 경계에서만 사용한다.
+  기본 features를 끄고 Windows의 검사·편집·파일 처리 및 선택적 라이브 worker에서 사용한다.
   VST3 bindings (`vst3`), libloading 등의 전이 의존성을 포함하며 원본 저작권을 유지한다.
 - serde / serde_json (MIT OR Apache-2.0), tempfile (MIT OR Apache-2.0),
   wait-timeout (MIT OR Apache-2.0): 설정 직렬화·새 파일 원자 저장·검사 자식 프로세스 제한.
@@ -110,3 +110,11 @@ DEALINGS IN THE SOFTWARE.
 - 기존 serde/serde_json과 tempfile 의존성을 장치 CLI에서도 직접 사용한다.
   JSON 직렬화와 완성된 새 파일 게시를 재사용하며 새 패키지·버전·checksum은 추가하지 않는다.
   DSP crate에는 직렬화 의존성을 넣지 않는다.
+
+## 라이브 VST3 경로
+
+`mixlive-audio-windows`도 기존 잠금 파일의 `vst3-host 0.11.1`을 직접 사용하고,
+`mixlive-vst3`의 상태 파일 검증을 재사용한다. 새 외부 패키지 버전이나 원본 코드 복사는 없다.
+플러그인은 in-process이며, 메인 스레드의 로딩/상태/종료와 별도 처리 스레드의 processing을
+분리한다. 장치 callback 바깥에서도 호스트의 내부 mutex와 plugin 자체 동작의 제약은 남는다.
+이 변경은 상용 플러그인 라이선스·인증을 제공하거나 바이너리를 재배포하지 않는다.

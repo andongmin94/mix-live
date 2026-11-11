@@ -48,8 +48,8 @@ jobs:
           Copy-Item (Join-Path $fixtureTarget 'debug/vst3_host_testplug.dll') $state
           "MIXLIVE_GAIN_VST3=$gain" >> $env:GITHUB_ENV
           "MIXLIVE_STATE_VST3=$state" >> $env:GITHUB_ENV
-      - name: Check native VST3 processing, state, editor contracts and WAV output
-        run: cargo test -p mixlive-vst3 --tests --locked -- --ignored
+      - name: Check native VST3 worker, state, editor contracts and WAV output
+        run: cargo test -p mixlive-vst3 -p mixlive-audio-windows --tests --locked -- --ignored
       - name: Lint current targets
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build Windows development tools

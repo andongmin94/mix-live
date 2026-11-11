@@ -528,11 +528,13 @@ dependencies = [
  "cpal",
  "mixlive-core",
  "mixlive-effects",
+ "mixlive-vst3",
  "rtrb 0.4.0",
  "rubato",
  "serde",
  "serde_json",
  "tempfile",
+ "vst3-host",
 ]
 
 [[package]]

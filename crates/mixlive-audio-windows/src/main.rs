@@ -1,21 +1,32 @@
-use clap::Parser;
+use clap::{Args, CommandFactory, FromArgMatches};
 use mixlive_audio_windows::{
     config::{Cli, Command, RouteOptions, SceneCommand},
+    plugin::PluginArgs,
     scene::{DeviceScene, Result},
 };
 
+fn parser() -> clap::Command { PluginArgs::augment_args(Cli::command()) }
+
 fn main() {
-    if let Err(error) = run(Cli::parse()) {
+    let matches = parser().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    let plugin = PluginArgs::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    if let Err(error) = run(cli, plugin) {
         eprintln!("MixLive: {error}");
         std::process::exit(1);
     }
 }
 
-fn run(cli: Cli) -> Result<()> {
+fn run(cli: Cli, plugin: PluginArgs) -> Result<()> {
+    plugin.validate()?;
+    if plugin.vst3.is_some() && !matches!(&cli.command,
+        Command::Run { .. } | Command::Scene { command: SceneCommand::Run { .. } }) {
+        return Err("VST3 launch options are supported by run and scene run only; use mixlive-plugins to inspect/edit".into());
+    }
     match cli.command {
         Command::Devices => device::list(),
         Command::Check(route) => device::check(&route),
-        Command::Run { route, seconds, interactive } => device::run(&route, seconds, interactive),
+        Command::Run { route, seconds, interactive } => device::run(&route, seconds, interactive, &plugin),
         Command::Scene { command } => match command {
             SceneCommand::Save { file, route } => {
                 DeviceScene::new(route)?.save_new(&file)?;
@@ -27,7 +38,7 @@ fn run(cli: Cli) -> Result<()> {
                 Ok(())
             }
             SceneCommand::Check { file } => device::check(&DeviceScene::read(&file)?.route),
-            SceneCommand::Run { file, seconds, interactive } => device::run(&DeviceScene::read(&file)?.route, seconds, interactive),
+            SceneCommand::Run { file, seconds, interactive } => device::run(&DeviceScene::read(&file)?.route, seconds, interactive, &plugin),
         },
     }
 }
@@ -48,14 +59,13 @@ fn read_commands(reader: impl std::io::BufRead, mut feedback: impl std::io::Writ
         }
         Ok(())
     })();
-    // EOF or terminal failure ends interactive mode; do not leave an unattended route running.
     let _ = controls.apply(LiveCommand::Stop);
     result
 }
 
 #[cfg(windows)]
 mod device {
-    use super::{Result, RouteOptions};
+    use super::{PluginArgs, Result, RouteOptions};
     use mixlive_audio_windows::windows::{Prepared, list_devices};
     use std::time::{Duration, Instant};
 
@@ -71,18 +81,18 @@ mod device {
         Ok(())
     }
 
-    pub fn run(route: &RouteOptions, seconds: u64, interactive: bool) -> Result<()> {
-        // Both direct and saved routes re-resolve exact IDs and actual formats at launch.
+    pub fn run(route: &RouteOptions, seconds: u64, interactive: bool, plugin: &PluginArgs) -> Result<()> {
         let prepared = Prepared::new(route)?;
         println!("{}", prepared.describe());
         println!("Use headphones at LOW hardware volume. Disable other monitoring paths.\nStarting a {seconds}s live mic route; no recording. Sample clipping guard is not a mastering limiter.");
-        let active = prepared.start()?;
+        if plugin.vst3.is_some() {
+            println!("Loading trusted native VST3 in this process. A plugin crash/hang is not isolated. No live editor or delay compensation; all processing must finish before shutdown can complete.");
+        }
+        let active = prepared.start(plugin)?;
         for line in &active.timing { println!("{line}"); }
         if interactive {
             println!("{}", mixlive_audio_windows::control::HELP);
             let controls = active.controls.clone();
-            // Only the CLI reads stdin. The audio callbacks never wait for this thread.
-            // A blocked terminal reader ends with this single-session executable's process.
             std::thread::Builder::new().name("mixlive-console".into()).spawn(move || {
                 if let Err(error) = super::read_commands(std::io::stdin().lock(), std::io::stderr(), &controls) {
                     eprintln!("Console closed: {error}");
@@ -92,6 +102,7 @@ mod device {
         let started = Instant::now();
         let mut next_report = Duration::ZERO;
         while started.elapsed() < Duration::from_secs(seconds) && !active.controls.stop_requested() {
+            active.poll_plugin()?;
             if let Some(error) = active.health.error() { return Err(error.into()); }
             if started.elapsed() >= next_report {
                 println!("{} | {}", active.report(), active.controls.describe());
@@ -100,28 +111,27 @@ mod device {
             std::thread::sleep(Duration::from_millis(50));
         }
         let report = active.report();
-        let error = active.health.error();
-        drop(active); // Stop capture and playback before claiming the route has stopped.
+        let health = active.health.clone();
+        drop(active); // Devices stop, then plugin worker joins and native teardown runs here.
         println!("Stopped. {report}");
-        if let Some(error) = error { return Err(error.into()); }
+        if let Some(error) = health.error() { return Err(error.into()); }
         Ok(())
     }
 }
 
 #[cfg(not(windows))]
 mod device {
-    use super::{Result, RouteOptions};
-
+    use super::{PluginArgs, Result, RouteOptions};
     const UNSUPPORTED: &str = "audio devices are implemented for Windows only; scene save/show do not require devices";
-
     pub fn list() -> Result<()> { Err(UNSUPPORTED.into()) }
     pub fn check(_route: &RouteOptions) -> Result<()> { Err(UNSUPPORTED.into()) }
-    pub fn run(_route: &RouteOptions, _seconds: u64, _interactive: bool) -> Result<()> { Err(UNSUPPORTED.into()) }
+    pub fn run(_route: &RouteOptions, _seconds: u64, _interactive: bool, _plugin: &PluginArgs) -> Result<()> { Err(UNSUPPORTED.into()) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use mixlive_audio_windows::control::LiveControls;
     use std::io::Cursor;
 
@@ -153,5 +163,22 @@ mod tests {
         let controls = LiveControls::new(-18.0, None, false).unwrap();
         read_commands(Cursor::new(b"status\n"), Vec::new(), &controls).unwrap();
         assert!(controls.stop_requested());
+    }
+
+    #[test]
+    fn vst3_launch_options_work_for_direct_and_scene_runs_but_never_silently_save() {
+        for mut words in [vec!["mixlive-audio", "run", "--input", "mic", "--output", "phones"],
+            vec!["mixlive-audio", "scene", "run", "singing.json"]] {
+            words.extend(["--vst3", "effect.vst3", "--vst3-state", "voice.json"]);
+            let matches = parser().try_get_matches_from(words).unwrap();
+            let plugin = PluginArgs::from_arg_matches(&matches).unwrap();
+            assert_eq!(plugin.vst3, Some("effect.vst3".into()));
+            assert_eq!(plugin.vst3_state, Some("voice.json".into()));
+            assert!(Cli::from_arg_matches(&matches).is_ok());
+        }
+        assert!(parser().try_get_matches_from(["mixlive-audio", "devices", "--vst3-state", "voice.json"]).is_err());
+        let matches = parser().try_get_matches_from(["mixlive-audio", "devices", "--vst3", "effect.vst3"]).unwrap();
+        let error = run(Cli::from_arg_matches(&matches).unwrap(), PluginArgs::from_arg_matches(&matches).unwrap()).unwrap_err();
+        assert!(error.to_string().contains("run and scene run only"));
     }
 }
