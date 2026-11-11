@@ -28,6 +28,9 @@ pub enum Command {
         /// Stop automatically after this many seconds. No audio is recorded to disk.
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         seconds: u64,
+        /// Read live mute/gain/status/stop commands from stdin. EOF stops the route.
+        #[arg(long)]
+        interactive: bool,
     },
 }
 
@@ -48,6 +51,9 @@ pub enum SceneCommand {
         file: PathBuf,
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         seconds: u64,
+        /// Read live commands; changes apply only to this run and never overwrite the Scene.
+        #[arg(long)]
+        interactive: bool,
     },
 }
 
@@ -115,10 +121,10 @@ pub struct RouteOptions {
     /// Digital mic trim BEFORE vocal processing (-36..18 dB). Cannot fix input clipping.
     #[arg(long, default_value = "0", allow_hyphen_values = true)]
     pub input_gain_db: f32,
-    /// Final attenuation on BOTH mixes, AFTER vocal processing and AUX summing (-96..0 dB).
+    /// Initial final attenuation on BOTH mixes, after output resampling (-96..0 dB).
     #[arg(long, default_value = "-18", allow_hyphen_values = true)]
     pub output_gain_db: f32,
-    /// Additional attenuation on the second mix.
+    /// Initial additional attenuation on the second mix.
     #[arg(long, default_value = "0", allow_hyphen_values = true)]
     pub send_gain_db: f32,
     /// Vocal starting point: off, natural, warm or bright. No pitch correction or reverb yet.

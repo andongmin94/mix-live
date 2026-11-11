@@ -2,7 +2,7 @@
 use std::{error::Error, sync::{Arc, atomic::Ordering}};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use mixlive_effects::VocalChain;
-use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, output_sample}};
+use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, output_sample}, control::{LiveControls, PlaybackGains}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -113,12 +113,12 @@ impl Prepared {
     }
 
     pub fn describe(&self) -> String {
-        let mut text = format!("WASAPI input: {}\n  {:?}; channel {}\nvocal: {:?}\nfinal mix attenuation: {} dB\nplayback streams: {}\n", self.input, self.input_config, self.input_channel + 1, self.vocal.config(), self.output_gain_db, self.outputs.len());
+        let mut text = format!("WASAPI input: {}\n  {:?}; channel {}\nvocal: {:?}\ninitial master attenuation: {} dB\nplayback streams: {}\n", self.input, self.input_config, self.input_channel + 1, self.vocal.config(), self.output_gain_db, self.outputs.len());
         for (index, endpoint) in self.outputs.iter().enumerate() {
             text.push_str(&format!("stream {index}: {}\n  {:?}; one queue/resampler for {} mix(es)\n", endpoint.device, endpoint.config, endpoint.routes.len()));
             for (mix, map) in &endpoint.routes {
                 let gain = if *mix == 0 { 0.0 } else { self.send_gain_db.unwrap_or(0.0) };
-                text.push_str(&format!("  mix {mix}: map {map:?} (zero-based); additional send gain {gain} dB\n"));
+                text.push_str(&format!("  mix {mix}: map {map:?} (zero-based); initial additional send gain {gain} dB\n"));
             }
         }
         if let Some(aux) = &self.auxiliary {
@@ -128,12 +128,13 @@ impl Prepared {
                 else { "separate capture stream; buffered/resampled to the microphone clock (additional AUX delay)" }));
             text.push_str("AUX must carry only the intended MR/line audio, not MixLive output or call return. No app filtering or external feedback detection. Enable output/both only when AUX is not already heard through another path.\n");
         }
-        text.push_str("Vocal settings are fixed for this run. No automatic makeup gain or lookahead buffer; IIR phase/group delay still exists.\nCheck validates configuration, not device operation or sound quality. ASIO, live VST3 and driver installation are not implemented.\n");
+        text.push_str("Vocal preset/thresholds and device bindings are fixed for this run. --interactive enables live source/output mute and master/send gain with 5 ms ramps. Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain or lookahead buffer; IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. ASIO, live VST3 and driver installation are not implemented.\n");
         text
     }
 
     pub fn start(self) -> Result<Active> {
         let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(self.output_gain_db, self.send_gain_db, self.aux_mix.is_some())?);
         let mut streams = Vec::new();
         let mut writers = Vec::new();
         let mut stats = Vec::new();
@@ -142,16 +143,18 @@ impl Prepared {
             let (writer, reader) = bridge::channel(self.input_config.sample_rate(), endpoint.config.sample_rate(), self.queue_ms, endpoint.routes.len(), health.clone())?;
             timing.push(format!("stream {index}: {} mix(es), shared queue target {:.2} ms + resampler delay {:.2} ms (excludes hardware and OS; NOT round-trip latency)", endpoint.routes.len(), reader.queue_ms, reader.resampler_delay_ms));
             stats.push(reader.stats.clone());
-            writers.push((writer, endpoint.routes.iter().map(|(mix, _)| *mix).collect()));
+            let mixes: Vec<usize> = endpoint.routes.iter().map(|(mix, _)| *mix).collect();
+            let gains = PlaybackGains::new(endpoint.config.sample_rate(), &mixes, controls.clone())?;
+            writers.push((writer, mixes));
             let maps: Vec<OutputMap> = endpoint.routes.iter().map(|(_, map)| *map).collect();
             let format = endpoint.config.sample_format();
             let config = endpoint.config.config();
             let stream = match format {
-                SampleFormat::F32 => output::<f32>(&endpoint.device, config, maps, reader, health.clone())?,
-                SampleFormat::F64 => output::<f64>(&endpoint.device, config, maps, reader, health.clone())?,
-                SampleFormat::I16 => output::<i16>(&endpoint.device, config, maps, reader, health.clone())?,
-                SampleFormat::I32 => output::<i32>(&endpoint.device, config, maps, reader, health.clone())?,
-                SampleFormat::U16 => output::<u16>(&endpoint.device, config, maps, reader, health.clone())?,
+                SampleFormat::F32 => output::<f32>(&endpoint.device, config, maps, reader, gains, health.clone())?,
+                SampleFormat::F64 => output::<f64>(&endpoint.device, config, maps, reader, gains, health.clone())?,
+                SampleFormat::I16 => output::<i16>(&endpoint.device, config, maps, reader, gains, health.clone())?,
+                SampleFormat::I32 => output::<i32>(&endpoint.device, config, maps, reader, gains, health.clone())?,
+                SampleFormat::U16 => output::<u16>(&endpoint.device, config, maps, reader, gains, health.clone())?,
                 _ => return Err("sample format changed after validation".into()),
             };
             timing.push(format!("output driver buffer query: {:?} frames", stream.buffer_size()));
@@ -180,7 +183,7 @@ impl Prepared {
                 AuxFeed::Independent(Box::new(reader))
             }
         };
-        let capture = Capture::new(self.vocal, self.output_gain_db, self.send_gain_db, self.aux_mix, writers, health.clone())?;
+        let capture = Capture::new(self.vocal, self.input_config.sample_rate(), self.aux_mix, writers, health.clone(), controls.clone())?;
         let vocal_stats = capture.vocal_stats.clone();
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
@@ -198,7 +201,7 @@ impl Prepared {
         if let Some(stream) = &aux_stream { stream.play()?; }
         input_stream.play()?;
         Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, health, outputs: stats,
-            aux_enabled: self.aux_mix.is_some(), aux_clock_stats, vocal_stats, timing })
+            controls, aux_enabled: self.aux_mix.is_some(), aux_clock_stats, vocal_stats, timing })
     }
 }
 
@@ -208,6 +211,7 @@ pub struct Active {
     _aux_input: Option<Stream>,
     _outputs: Vec<Stream>,
     pub health: Arc<Health>,
+    pub controls: Arc<LiveControls>,
     /// One set per physical playback endpoint, shared by its channel routes.
     pub outputs: Vec<Arc<OutputStats>>,
     aux_enabled: bool,
@@ -256,7 +260,7 @@ where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
     }, move |_| error_health.fail(Fault::Device), None)?)
 }
 
-fn output<T>(device: &Device, config: StreamConfig, maps: Vec<OutputMap>, mut reader: OutputReader, health: Arc<Health>) -> Result<Stream>
+fn output<T>(device: &Device, config: StreamConfig, maps: Vec<OutputMap>, mut reader: OutputReader, mut gains: PlaybackGains, health: Arc<Health>) -> Result<Stream>
 where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
     let channels = usize::from(config.channels);
     let error_health = health.clone();
@@ -264,9 +268,10 @@ where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
         data.fill(T::EQUILIBRIUM);
         if health.failed() { return; }
         if data.len() % channels != 0 { health.fail(Fault::Routing); return; }
+        gains.update();
         for frame in data.chunks_exact_mut(channels) {
-            // Consume ONCE per endpoint frame, not once per destination or physical channel.
-            let packed = reader.next_frame();
+            // Consume even while muted. An output toggle must not replay a stale queue on unmute.
+            let packed = reader.next_frame(gains.next_gains());
             for (channel, sample) in frame.iter_mut().enumerate() { *sample = T::from_sample(output_sample(&maps, channel, &packed)); }
         }
         if health.failed() { data.fill(T::EQUILIBRIUM); }

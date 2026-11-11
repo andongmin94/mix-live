@@ -16,7 +16,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 ```text
 선택한 마이크 → 입력 trim → HPF/EQ → 컴프레서 → 디에서 → 원음/보정 blend
     → 목적지별 보내기 ─┐
-선택적 AUX → AUX trim ─┴→ 믹스 합산 → 최종 출력 음량 → 출력별 clock bridge → 헤드폰/송출
+선택적 AUX → AUX trim ─┴→ 믹스 합산 → 출력별 clock bridge → 실시간 음량/mute → 최종 출력 보호 → 헤드폰/송출
 (AUX가 별도 입력 장치면 먼저 기존 clock bridge로 마이크 처리 클럭에 맞춘다.)
 ```
 
@@ -34,7 +34,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
   및 상태 저장/복원. `mixlive-audio`의 callback과 별개다.
 
 **미구현:** ASIO, 앱별 캡처, 자체 가상 장치, VST3 라이브 연결,
-reverb/delay, pitch correction, GPUI 화면, 앱/VST3까지 포함한 전체 Scene, 실행 중 설정 변경.
+reverb/delay, pitch correction, GPUI 화면, 앱/VST3까지 포함한 전체 Scene, 실행 중 장치·보컬 체인 교체.
 출력 clipping guard는 전문 리미터가 아니다.
 
 ## Windows에서 사용
@@ -106,8 +106,8 @@ mono 출력은 `--output-channels 1`. 장치 기본 샘플레이트와 포맷으
 ```
 
 이때 `check`는 `playback streams: 1`과 두 mix의 채널 매핑을 표시한다. 두 mix의 음량은
-각각 적용하지만, 한 프레임에 묶어 **같은 queue·4채널 리샘플러·출력 스트림**을 사용한다.
-두 채널 쌍이 따로 버퍼를 소비하거나 서로 다른 drift 보정을 받지 않는다. 다른 endpoint를
+각각 적용한다. 원본 믹스는 한 프레임에 묶어 **같은 queue·4채널 리샘플러·출력 스트림**을 사용한다.
+음량·출력 mute는 리샘플링 뒤 적용한다. 두 채널 쌍이 따로 버퍼를 소비하거나 서로 다른 drift 보정을 받지 않는다. 다른 endpoint를
 선택하면 기존처럼 각 endpoint의 clock bridge를 사용한다. 통계의 `stream0`/`stream1`은
 물리 스트림 단위이며, 공유 출력의 peak·clipping 횟수는 두 mix를 합친 통계다.
 
@@ -181,6 +181,47 @@ AUX 장치 오류·잘못된 sample·queue overflow는 전체 경로를 중단�
 외부 VST3 상태, 임의 라우팅 그래프 또는 실행 중 Scene 전환을 구현했다고 의미하지 않는다.
 음성은 저장하지 않는다. Scene에는 개인 endpoint ID가 있으므로 공유하지 않는 것이 좋고,
 문서의 `*.mixlive-scene.json` 확장자는 `.gitignore`로 제외한다.
+
+## 실행 중 음량·음소거·중지
+
+직접 `run` 또는 `scene run`에 `--interactive`를 붙이면 터미널에서 아래 명령을 입력한다.
+명령은 Enter로 실행한다. 별도 서버·포트·전역 단축키를 만들지 않으며, 이 옵션이 없으면
+기존 시간 제한 실행을 유지한다. 대화형 실행도 `--seconds` 상한 안에서 종료한다.
+
+```powershell
+.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --interactive --seconds 3600
+```
+
+| 실행 중 입력 | 효과 |
+|---|---|
+| `mute mic` / `unmute mic` | 보정된 목소리만 음소거/해제. MR은 유지 |
+| `mute aux` / `unmute aux` | MR/AUX만 음소거/해제. 마이크는 유지 |
+| `mute output` / `unmute output` | 첫 출력 믹스만 음소거/해제 |
+| `mute send` / `unmute send` | 두 번째 출력 믹스만 음소거/해제 |
+| `mute all` / `unmute all` | 두 출력의 전체 음소거/해제. 개별 mute 상태는 그대로 유지 |
+| `gain master -18` | 두 출력의 공통 최종 감쇠. 초기값은 `--output-gain-db` |
+| `gain send -6` | 두 번째 출력에만 추가 감쇠. 초기값은 `--send-gain-db` |
+| `status` | 현재 요청된 음량과 mute 상태 표시 |
+| `stop` | 실행 중인 capture/playback stream을 닫고 종료 |
+
+두 gain 명령은 -96..0 dB의 유한한 값만 받는다. AUX/두 번째 출력이 없는 경로에서
+해당 명령은 거절하며 이전 설정을 유지한다. gain을 바꾸어도 음소거는 풀리지 않는다.
+상태는 **현재 실행에만** 적용되고 Scene 파일에는 자동 저장되지 않는다. Scene schema 2는
+변하지 않았다. 장치·AUX 목적지·보컬 프리셋/threshold·source trim은 실행 중 바꾸지 않는다.
+
+source mute는 보컬 DSP 뒤 또는 AUX 합산 전에 적용한다. 마이크와 AUX 캡처는 계속되고
+보컬 검출기 상태도 유지한다. 따라서 mute는 마이크 장치 접근을 중단하는 기능이 아니다.
+input/vocal/AUX 미터는 source mute 전이며, stream peak/clipping 미터는 최종 gain/mute 후다.
+
+출력 gain/mute는 **출력 queue와 리샘플러 뒤, clipping guard 앞**에서 동작한다. 이미 MixLive
+queue에 쌓인 소리에도 적용하고 mute 중에도 queue를 계속 소비해 해제 후 과거 소리를
+재생하지 않는다. audio callback은 atomic target만 읽고, 잠금·stdin·파일·문자열 처리는 하지 않는다.
+목표 변경을 관측한 후 약 5 ms linear ramp를 사용한다. 이는 제어 명령 전달 시간이나
+OS/드라이버 버퍼까지 포함한 음소거 응답시간의 보장이 아니다. source mute에는 출력 queue
+지연이 남고, 이미 OS/다른 앱에 전달된 소리나 하드웨어 Direct Monitor는 되돌리거나 끄지 못한다.
+
+대화형 입력의 EOF/입력 오류도 종료 요청으로 처리한다. `stop`/시간 제한/오류로 종료할 때
+소스와 출력 스트림을 소유 스레드에서 닫는다. `Stopped`는 해당 스트림 해제 뒤 출력한다.
 
 ## 사용자 VST3 검사·편집
 
