@@ -255,7 +255,10 @@ pub(crate) mod native {
             assert!(!health.failed());
             let bad = PluginArgs { vst3: Some(std::env::var_os("MIXLIVE_STATE_VST3").unwrap().into()), ..PluginArgs::default() };
             let mut plugin = load(&bad, 48000).unwrap();
+            plugin.start_processing().unwrap();
             plugin.set_parameter(0, 0.37).unwrap();
+            mixlive_vst3::editor::flush_editor_changes(&mut plugin).unwrap();
+            plugin.stop_processing().unwrap();
             let directory = tempfile::tempdir().unwrap();
             let state_path = directory.path().join("voice.json");
             StateFile { schema: 1, class_id: plugin.info().uid.clone(), state: plugin.save_state().unwrap() }
