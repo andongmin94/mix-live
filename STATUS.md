@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-11
-단계: **GPUI Scene 실행·라이브 라우팅 화면 구현, Windows 통합 검증 진행 중**
+단계: **GPUI Scene 실행·라이브 라우팅 화면 구현, Windows 검증·개발 빌드 완료**
 
 ## 현재 구현
 
@@ -28,17 +28,35 @@
 
 ## 검증
 
-- 이전 기준 main `8862bb4e902bae04bcabcd428f216d670deb7d67`, 코드 `4ddfd6e`의
-  [Audio #17](https://github.com/andongmin94/mix-live/actions/runs/42976718650): 총 68 tests,
-  Clippy, Windows release CLI 빌드 성공. 이것을 새 GUI의 성공 근거로 사용하지 않는다.
-- 이번 환경: Linux, Rust 1.99.1 설치 완료. 실제 Windows 실행 환경은 아니며 Windows CI를 사용한다.
-- 로컬 관련 검사 `cargo test -p mixlive-audio-windows -p mixlive-app --locked`: 36 passed.
-  Windows MSVC 대상 앱 all-targets check 및 앱/오디오 all-targets Clippy(-D warnings) 통과.
-  이는 Windows 바이너리 실행 검사가 아니다. 실제 Windows 결과는 Actions 완료 후 갱신한다.
-- Windows Session 검사는 파일 열기에서 장치/DLL에 접근하지 않음, 잘못된 새 선택의 이전 Scene
-  제거, 미실행 상태의 제어 거절을 검사한다. 아직 Windows에서 실행 전이다.
-- 실제 MiniFuse/가상 케이블/상용 VST3 GUI·청취·왕복 지연·장시간 안정성은 미검증이다.
-  빈 GUI 창 또는 합성/native fixture 성공은 실제 장비/오디오/상용 호환성 검증이 아니다.
+코드: `9421b5d03baff0085ff126977298a1f33bfc0d0e`.
+[Audio #18](https://github.com/andongmin94/mix-live/actions/runs/42979977368),
+Windows job `130387890712`: 모든 단계 success.
+
+| 검사 | 결과 |
+|---|---|
+| Windows `cargo test --workspace --locked` | app 3 + audio lib 30 + audio CLI 3 + Scene CLI 3 + core 10 + effects 7 + plugins 7 = 63 passed |
+| 기존 native VST3 fixture 별도 검사 | chain/worker/state 3 + editor 2 + loading/state 2 + WAV 2 = 9 passed |
+| Windows Clippy all-targets, warnings denied | 통과 |
+| Windows release 실행 파일 | `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe` 빌드 성공 |
+| 기존 CLI 도움말 실행 | 통과 |
+| 새 GUI 실행 | 장치/플러그인 없는 빈 네이티브 창 생성, 창 닫기 요청, 정상 종료 코드 0 확인 |
+
+Windows tests 총 **72 passed, 0 failed**. 새 Session 검사는 파일 열기에서 장치/DLL에 접근하지
+않음, 잘못된 새 선택의 이전 Scene 제거, 미실행 상태의 제어 거절을 확인한다. typed live control
+검사는 실제 제어값과 mute/route/gain의 독립성을 확인한다. GUI 검사는 전체 클릭 시나리오나
+실장비 시작/정지 검사가 아니다.
+
+로컬 Linux/Rust 1.99.1에서도 관련 테스트 36개와 Windows MSVC 대상 앱 all-targets check,
+앱/오디오 all-targets Clippy를 통과했다. 실제 Windows 실행 결과는 위 Actions를 근거로 한다.
+
+[개발 artifact 13837513188](https://github.com/andongmin94/mix-live/actions/runs/42979977368/artifacts/13837513188)를
+내려받아 ZIP SHA256/CRC와 파일 9개, 세 실행 파일의 x64 PE header를 확인했다.
+SHA256 `ab93b952b03a5aa55fec01945981dbc52aecf5e94aed40f70301391bdea2fa22` — Actions digest와 일치.
+공식 릴리스가 아닌 보관 기간 7일의 개발 artifact다. 검증 기록만 바꾸는 후속 commit은 코드를
+바꾸지 않으므로 통과한 CI를 반복하지 않는다.
+
+실제 MiniFuse/가상 케이블/상용 VST3 GUI·청취·왕복 지연·장시간 안정성은 미검증이다.
+빈 GUI 창 또는 합성/native fixture 성공을 실제 장비/오디오/상용 호환성 검증으로 부르지 않는다.
 
 ## 남은 작업과 제한
 
