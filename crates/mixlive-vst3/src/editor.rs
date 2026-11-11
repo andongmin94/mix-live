@@ -60,7 +60,7 @@ pub fn edit(executable: &Path, options: &EditArgs) -> Result<Value> {
 }
 
 #[cfg(windows)]
-pub use native::{edit_in_child, flush_editor_changes};
+pub use native::{edit_in_child, flush_editor_changes, pump_editor_messages};
 
 #[cfg(windows)]
 mod native {
@@ -69,6 +69,11 @@ mod native {
     use serde_json::json;
     use std::{sync::{Arc, Mutex}, time::Duration};
     use vst3_host::{Plugin, PluginWindow, plugin::ProcessMode};
+
+    /// Dispatch the current editor thread's pending Win32 messages. The caller must own
+    /// the editor windows and must NOT hold a plugin mutex while callbacks are dispatched.
+    /// Shared by the offline editor tool and the live audio session; never an audio callback.
+    pub fn pump_editor_messages() -> bool { messages::pump() }
 
     /// Main/control-thread only, with no concurrent audio processing. Forward editor edits
     /// and consume them in VST3's zero-sample parameter-flush call before saving state.
@@ -102,7 +107,7 @@ mod native {
             loop {
                 // Never hold the plugin mutex while dispatching Windows messages: a plugin
                 // can synchronously call back into the host during repaint/resize/close.
-                if !messages::pump() { return Err("editor session was interrupted; no state was saved".into()); }
+                if !pump_editor_messages() { return Err("editor session was interrupted; no state was saved".into()); }
                 window.service_platform_events()?;
                 {
                     let mut plugin = shared.lock().map_err(|_| "editor plugin lock was poisoned")?;
@@ -149,7 +154,7 @@ mod native {
         pub(super) fn pump() -> bool {
             // SAFETY: MSG is an initialized POD output buffer, the null HWND selects this
             // calling thread's queue, and each retrieved MSG is dispatched before reuse.
-            // The caller is the child main thread and keeps all plugin windows alive.
+            // The caller is the main/loading thread and keeps all plugin windows alive.
             unsafe {
                 let mut message: MSG = std::mem::zeroed();
                 while PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {

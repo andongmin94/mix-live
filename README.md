@@ -2,323 +2,185 @@
 
 **내 소리를 만들고, 누구에게 들려줄지 정한다.**
 
-MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만드는 프로젝트다.
-마이크·반주·게임·통화 소리를 선택적으로 섞고, 입력과 최종 믹스에 내장 보정 및
-사용자가 소유한 VST3를 적용하는 것이 목표다. DAW의 타임라인은 만들지 않는다.
+Windows용 실시간 마이크·MR 라우팅/믹싱/보정 앱을 만드는 프로젝트다. DAW 타임라인이나
+OBS 전용 플러그인이 아니다. 현재는 **명령줄 개발 빌드**이며 GPUI 메인 화면·자체 가상 마이크·
+ASIO·앱별 직접 캡처는 아직 없다. 실제 검증 결과와 미검증 범위는 [STATUS.md](STATUS.md)를 따른다.
 
-> **현재: 라우팅 코어 + Windows 마이크/AUX 믹서 CLI + 내장 모노 보컬 체인 + 별도 VST3 검사·편집·WAV 도구.**
-> VST3 검사·편집 도구는 비실시간이고, `mixlive-audio run --vst3`는 별도의 명시적 라이브 개발 경로다.
-> 완성된 방송 앱·가상 마이크 드라이버가 아니다. 실제 검사와 실장비·청취 미검증 범위는
-> [STATUS.md](STATUS.md)를 따른다.
-
-## 구현 경로
+## 현재 처리 경로
 
 ```text
-선택한 마이크 → 입력 trim → HPF/EQ → 컴프레서 → 디에서 → 원음/보정 blend
-    → 선택적 VST3 → 목적지별 보내기 ─┐
-선택적 AUX → AUX trim ─┴→ 믹스 합산 → 출력별 clock bridge → 실시간 음량/mute → 최종 출력 보호 → 헤드폰/송출
-(AUX가 별도 입력 장치면 먼저 기존 clock bridge로 마이크 처리 클럭에 맞춘다.)
+마이크 → 입력 trim → 내장 보컬 보정 → 선택적 stereo VST3 하나 → 목적지별 보내기 ─┐
+AUX/MR → 필요 시 입력 clock bridge → AUX trim → 목적지별 보내기 ─────────────┴→ 믹스
+믹스 → 출력 clock bridge → master/send 음량·mute → sample clipping guard → 출력 장치
 ```
 
-- `mixlive-core`: mono/stereo, source/send/mix gain, mute, 믹스마이너스.
-- `mixlive-effects`: 장치·UI 독립 모노 보컬 처리. biquad 0.6.0 필터, RMS soft-knee
-  compression, 고역 비중과 레벨을 함께 보는 split-band de-essing. 자동 makeup gain 없음.
-- `mixlive-audio-windows`: WASAPI endpoint ID·기본 포맷, 명시적 입력 채널,
-  하나 또는 두 개의 독립 믹스와 채널 매핑. 같은 endpoint의 서로 다른 채널 쌍도 지원한다.
-  같은 보컬 체인을 두 믹스에서 중복 처리하지 않는다. AUX는 보컬 체인을 거치지 않는 별도 stereo 소스다.
-- 물리 출력 endpoint마다 bounded SPSC queue와 Rubato sinc resampler. 샘플레이트·클럭 경계를 처리하며
-  장치 오류·overflow에는 무음으로 멈춘다. 다른 장치를 임의로 선택하지 않는다.
-- 오디오 callback에서는 사전 준비된 필터와 버퍼만 사용한다. peak, gain reduction,
-  queue, correction ppm, underrun, clipping 횟수는 제어 스레드에서 표시한다.
-- `mixlive-vst3`: 설치 경로 조회, 선택한 VST3의 별도 프로세스 로딩·합성 처리·파라미터
-  및 상태 저장/복원. `mixlive-audio`의 callback과 별개다.
+보컬은 한 번만 처리하고, AUX에는 보컬 DSP/VST3를 걸지 않는다. 출력 믹스는 최대 두 개다.
+동일 endpoint의 분리 채널은 하나의 스트림/클럭을 공유하며 별도 장치는 bounded queue와
+Rubato sinc resampler로 연결한다. 오류 시 임의 장치 선택이나 원음 마이크 우회는 하지 않는다.
 
-**미구현:** ASIO, 앱별 캡처, 자체 가상 장치, 라이브 VST3 편집/다중 플러그인 체인,
-reverb/delay, pitch correction, GPUI 화면, 앱/VST3까지 포함한 전체 Scene, 실행 중 장치·보컬 체인 교체.
-출력 clipping guard는 전문 리미터가 아니다.
+VST3를 선택하면 장치 callback은 mic/AUX 프레임을 함께 bounded queue로 보낸다. 전용 worker가
+내장 보컬→VST3→믹싱을 수행한다. 로딩·editor·state·종료는 main/제어 스레드에서 한다.
+호스트 내부 및 editor/control과의 mutex 공유는 남아 있으므로 **hard-real-time/무중단 보장은 없다.**
+VST3 미선택 시 기존 직접 처리 경로를 사용한다. 처리 순서·품질 목표는 [DESIGN.md](DESIGN.md)에 있다.
 
-## Windows에서 사용
+## Windows에서 시작
 
-Rust stable로 빌드하거나 해당 커밋의 Actions 개발 artifact를 사용한다.
-드라이버 설치나 시스템 기본 장치 변경은 하지 않는다. 개발 바이너리는 미서명이다.
+Rust stable로 빌드하거나 해당 코드 커밋의 Actions 개발 artifact를 사용한다. 바이너리는 미서명이며
+드라이버 설치나 시스템 기본 장치 변경을 하지 않는다.
 
 ```powershell
-cargo build --release -p mixlive-audio-windows --bin mixlive-audio --locked
+cargo build --release -p mixlive-audio-windows -p mixlive-vst3 --bins --locked
 .\target\release\mixlive-audio.exe devices
-```
-
-표시된 INPUT/OUTPUT ID를 넣는다. `check`는 장치 설정과 보컬 계수만 검사하고 스트림을 시작하지 않는다.
-
-```powershell
 .\target\release\mixlive-audio.exe check --input "<INPUT ID>" --output "<OUTPUT ID>" --vocal natural
-.\target\release\mixlive-audio.exe run --input "<INPUT ID>" --input-channel 1 --output "<OUTPUT ID>" --output-channels 1,2 --vocal natural --output-gain-db -18 --seconds 30
+.\target\release\mixlive-audio.exe run --input "<INPUT ID>" --output "<OUTPUT ID>" --vocal natural --output-gain-db -18 --seconds 30
 ```
 
-반드시 헤드폰을 낮은 하드웨어 음량으로 사용하고 DAW/Windows/인터페이스의 중복 모니터링을 끈다.
-출력 sample clipping guard는 음향 피드백·청력 보호·true peak를 보장하지 않는다.
+`devices`는 목록만 보여주며 `check`는 장치·채널·보컬 설정만 검사한다. 실제 시작은 `run`이다.
+명시한 endpoint ID를 사용하고, 채널 번호는 선택한 WASAPI endpoint 안의 **1-based** 번호다.
+MiniFuse의 ASIO/루프백/물리 단자와 같다고 가정하지 않는다. `--help`로 전체 옵션을 확인한다.
 
-### 보컬 설정
+**헤드폰 하드웨어 음량을 낮추고** DAW·Windows·인터페이스의 중복 모니터링을 끈다.
+sample clipping guard는 전문 리미터, true-peak 제한, 음향 피드백 방지 또는 청력 보호 기능이 아니다.
+기본 실행은 30초, `--seconds` 범위는 1..3600이다. 자동 음성 녹음은 하지 않는다.
 
-| 옵션 | 역할 |
+### 내장 보컬
+
+`--vocal off|natural|warm|bright`를 지원한다. 기본은 off다. 보정은 HPF/EQ→RMS soft-knee
+컴프레서→split-band 디에서→원음/보정 blend이며 reverb/delay/pitch correction은 아직 없다.
+이름은 시작 설정이지 실제 청취 수용을 마친 고급 프리셋이라는 뜻이 아니다.
+
+| 옵션 | 적용 위치/범위 |
 |---|---|
-| `--vocal off` | 기본값. 보정 우회. 입력 trim과 출력 음량은 계속 적용 |
-| `--vocal natural` | 75 Hz HPF, 약한 presence, 2.5:1 compression, 최대 4 dB 고역 억제 |
-| `--vocal warm` | 65 Hz HPF, 저역 shelf +1.5 dB, 고역 shelf -1 dB, 2.5:1 compression |
-| `--vocal bright` | 85 Hz HPF, 저역 shelf -1.5 dB, presence +2 dB, 고역 shelf +1.5 dB, 3:1 compression, 최대 6 dB 고역 억제 |
-| `--input-gain-db 0` | 보정 검출기 앞 디지털 입력 trim, -36..18 dB |
-| `--output-gain-db -18` | 보정 뒤 두 믹스의 최종 음량, -96..0 dB |
-| `--vocal-threshold-db -24` | 컴프레서 RMS threshold, -60..0 dBFS |
-| `--deess-threshold-db -30` | 디에서 고역 threshold, -60..0 dBFS |
-| `--vocal-strength 1` | 원음/보정 blend, 0..1. 음량 일치 기능이 아님 |
+| `--input-gain-db 0` | 보컬 검출기 앞 trim, -36..18 dB. ADC clipping은 복원 못 함 |
+| `--vocal-strength 1` | 원음/보정 blend 0..1. 음량 일치 기능 아님 |
+| `--vocal-threshold-db -24` | 컴프레서 threshold -60..0 dBFS |
+| `--deess-threshold-db -30` | 디에서 고역 threshold -60..0 dBFS |
+| `--output-gain-db -18` | 두 믹스의 초기 최종 감쇠 -96..0 dB |
+| `--send-gain-db 0` | 두 번째 믹스의 초기 추가 감쇠 -96..0 dB |
 
-이름은 사운드 설계의 **출발값**이며 청취 수용을 마친 고급 프리셋이라는 뜻이 아니다.
-입력 trim은 ADC에서 이미 찌그러진 소리를 복원하지 못한다. 기본 -18 dB 출력 감쇠는
-컴프레서 뒤에 있어 검출기를 둔감하게 만들지 않는다. 기존 `--gain-db`는 제거했다.
-압축 후 소리가 작아질 수 있으며 이를 숨기려고 자동 makeup gain을 더하지 않는다.
-A/B 청취는 원본/보정본 음량을 별도로 맞춰 평가해야 한다.
+자동 makeup gain은 없다. A/B 청취 시 원본/보정본 음량은 따로 맞춰야 한다. 보컬 프리셋은
+32..192 kHz, off는 8..192 kHz를 받는다. 입력 trim/보컬 파라미터는 실행 중 고정이다.
 
-보컬 프리셋의 입력은 32..192 kHz, off는 8..192 kHz다. 출력 샘플레이트는 기존
-clock bridge가 처리한다. 별도 lookahead buffer는 없지만 IIR의 위상·군지연과
-장치·queue·리샘플러 지연이 있어 '무지연' 또는 실측 저지연이라고 표시하지 않는다.
-`vocal_peak`는 선택적 VST3와 최종 감쇠 전 내장 보컬 sample peak, `comp_gr`/`deess_gr`는 직전 표시 이후 최대
-gain reduction이다. blend 강도를 낮추면 이 값은 wet 경로의 억제량이지 최종 감쇠량이 아니다.
+### 출력 장치와 채널
 
-### 두 출력과 채널
+두 번째 믹스는 `--send "<OUTPUT ID>" --send-channels 1,2`로 지정한다. 이미 설치된 가상 케이블은
+재생 endpoint로 보내고 Discord/OBS에서 대응 녹음 endpoint를 선택한다. MixLive가 케이블을
+설치하거나 자동 연결하지 않는다. `output`/`send`는 앱 이름이 아니라 사용자가 지정한 믹스다.
 
-두 번째 출력: `--send "<별도 OUTPUT ID>" --send-channels 1,2 --send-gain-db -6`.
-가상 케이블이 이미 설치돼 있다면 그 **재생 endpoint**로 보내고 Discord/OBS에서 대응
-**녹음 endpoint**를 선택한다. MixLive가 케이블을 설치하거나 자동 연결했다고 표시하지 않는다.
-
-채널은 선택한 WASAPI endpoint 안의 1-based 번호다. MiniFuse ASIO 3/4, 제조사 루프백,
-물리 단자와 같다고 가정하지 않는다. 없는 채널과 같은 endpoint 안에서 겹치는 채널 선택은 거절한다.
-mono 출력은 `--output-channels 1`. 장치 기본 샘플레이트와 포맷으로 연다.
-`--queue-ms` 기본 30은 queue 목표이지 드라이버 버퍼나 왕복 지연이 아니다.
-`run`은 기본 30초 후 끝나며 최대 `--seconds 3600`. 음성 녹음 파일은 만들지 않는다.
-
-### 같은 장치의 1/2와 3/4로 보내기
-
-선택한 WASAPI **endpoint의 기본 구성이 4채널 이상일 때만** 다음 구성이 가능하다.
-같은 OUTPUT ID를 두 번 지정하되 채널을 분리한다. `check`로 실제 채널 수를 먼저 확인한다.
+같은 endpoint가 실제로 4채널 이상을 노출하면 다음 구성이 가능하다.
 
 ```powershell
-.\target\release\mixlive-audio.exe check --input "<INPUT ID>" --output "<같은 OUTPUT ID>" --output-channels 1,2 --send "<같은 OUTPUT ID>" --send-channels 3,4 --send-gain-db -6
-.\target\release\mixlive-audio.exe run --input "<INPUT ID>" --output "<같은 OUTPUT ID>" --output-channels 1,2 --send "<같은 OUTPUT ID>" --send-channels 3,4 --send-gain-db -6 --vocal natural --seconds 30
+.\target\release\mixlive-audio.exe check --input "<INPUT ID>" --output "<OUTPUT ID>" --output-channels 1,2 --send "<같은 OUTPUT ID>" --send-channels 3,4
 ```
 
-이때 `check`는 `playback streams: 1`과 두 mix의 채널 매핑을 표시한다. 두 mix의 음량은
-각각 적용한다. 원본 믹스는 한 프레임에 묶어 **같은 queue·4채널 리샘플러·출력 스트림**을 사용한다.
-음량·출력 mute는 리샘플링 뒤 적용한다. 두 채널 쌍이 따로 버퍼를 소비하거나 서로 다른 drift 보정을 받지 않는다. 다른 endpoint를
-선택하면 기존처럼 각 endpoint의 clock bridge를 사용한다. 통계의 `stream0`/`stream1`은
-물리 스트림 단위이며, 공유 출력의 peak·clipping 횟수는 두 mix를 합친 통계다.
+`check`에 `playback streams: 1`과 두 매핑이 표시된다. 공유 queue·다채널 리샘플러를 사용해
+두 경로를 함께 소비한다. 다른 endpoint는 각각의 스트림을 쓴다. 겹치는 채널은 거절하며
+mono(`1`)·역순 stereo(`2,1`)를 지원하고 미지정 채널은 무음이다. stereo로만 노출된 장치에
+ASIO 3/4를 만들어 주지 않는다. 통계의 `stream0`/`stream1`은 물리 출력 스트림 단위다.
 
-출력 채널이 겹치면 실행 전에 거절한다. 예를 들어 같은 endpoint의 `1,2`와 `2,3`은
-허용하지 않는다. mono 채널 또는 역순 stereo 매핑도 가능하며 미지정 채널은 무음이다.
-Windows에 stereo endpoint만 보이면 `3,4`를 만들 수 없다. 제조사 ASIO 채널·하드웨어
-loopback을 자동 노출하거나 설정하지 않으며, MiniFuse 모델별 동작은 실장비 검증이 남아 있다.
+### MR/AUX 입력
 
-## 마이크 + MR/AUX를 선택적으로 섞기
-
-`--aux-input`은 **INPUT 목록의 캡처 endpoint**다. 인터페이스의 실제 루프백/라인 입력 또는
-이미 설치된 가상 케이블의 녹음 쪽을 지정한다. Chrome 프로세스를 직접 잡거나 Windows 앱별
-재생 장치를 자동으로 바꾸는 기능이 아니다. 소스에는 의도한 MR만 넣고, MixLive 출력이나
-Discord 수신 음성이 섞인 전체 루프백을 되돌리지 않는다. 외부 피드백은 자동 검출하지 않는다.
-
-| 옵션 | 의미 |
-|---|---|
-| `--aux-input "<AUX INPUT ID>"` | 선택한 입력만 명시적으로 연다. 생략하면 마이크 경로만 실행 |
-| `--aux-channels 1,2` | 입력 내부 1-based stereo pair; 한 번호면 mono 복제, `2,1`이면 좌우 반전 |
-| `--aux-gain-db -12` | AUX만 줄이는 source trim, -96..0 dB. 마이크 보정과 별도 |
-| `--aux-to send` | 기본값. `--send` 믹스에만 합쳐 기존 MR 모니터와 중복하지 않음 |
-| `--aux-to output` | 첫 출력에만 합침. 두 번째 출력에는 보정된 마이크만 보냄 |
-| `--aux-to both` | 두 믹스에 합침. MR을 다른 경로로 듣지 않을 때만 선택 |
+`--aux-input`은 **INPUT 목록의 캡처 endpoint**다. 인터페이스의 분리된 루프백/라인 입력이나
+기존 가상 케이블의 녹음 쪽을 지정한다. Chrome 프로세스/PID나 특정 탭의 직접 캡처가 아니다.
+의도한 MR만 선택하고 MixLive 출력·통화 수신음이 포함된 전체 루프백을 다시 넣지 않는다.
+외부 피드백은 자동 검출하지 않는다.
 
 ```powershell
-.\target\release\mixlive-audio.exe check --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --aux-input "<MR CAPTURE ID>" --aux-channels 1,2 --aux-to send --vocal natural
-.\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --aux-input "<MR CAPTURE ID>" --aux-channels 1,2 --aux-to send --vocal natural --seconds 30
+.\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --aux-input "<MR CAPTURE ID>" --aux-channels 1,2 --aux-gain-db -12 --aux-to send --vocal natural --seconds 30
 ```
 
-보컬 EQ/컴프레서/디에서는 마이크에만 적용된다. AUX 좌우와 float headroom은 source trim까지
-보존하고, 두 소리를 합친 뒤 출력 음량과 최종 sample clipping guard를 적용한다.
-`--send-gain-db`는 **그 믹스에 포함된 마이크와 AUX 모두**에 적용한다.
+`--aux-to send|output|both`로 초기 목적지를 정한다. 기본 send-only는 이미 다른 경로로 듣는
+MR의 이중 모니터를 피하기 위한 값이다. send/both는 `--send`가 필요하다. AUX gain은 -96..0 dB,
+채널은 mono 복제·stereo·역순을 지원한다. 같은 INPUT ID의 mic 1/AUX 3,4는 한 캡처 스트림에서
+추출하며 채널이 겹치면 거절한다. 실제 endpoint가 필요한 채널을 제공해야 한다.
 
-같은 INPUT ID에서 마이크 `1`과 AUX `3,4`를 선택하면 한 입력 스트림에서 추출한다.
-이 경우 실제 endpoint가 필요한 채널을 노출해야 하며 마이크/AUX 채널이 겹치면 거절한다.
-별도 INPUT ID를 사용하면 AUX용 bounded queue와 기존 sinc resampler로 마이크 클럭에
-맞춘다. **AUX에는 입력 queue·리샘플러 지연이 추가**되며 이것은 두 소스의 녹음 시각이나
-외부에서 직접 듣는 MR과의 위상/시간 정렬을 보장하지 않는다. 마이크 경로는 지연 보상하지 않는다.
+별도 AUX 장치는 먼저 마이크 클럭으로 변환하므로 추가 queue/리샘플러 지연이 생긴다.
+이는 두 소스의 녹음 시각이나 직접 듣는 MR과의 시간/위상 정렬을 보장하지 않는다.
+AUX 부족은 AUX만 무음, 장치/비유한 sample/overflow 오류는 전체 경로 중단이다.
 
-AUX가 아직 priming 중이거나 일시적으로 부족하면 AUX만 무음이고 마이크는 계속된다.
-AUX 장치 오류·잘못된 sample·queue overflow는 전체 경로를 중단한다. 다른 입력으로 바꾸지 않는다.
-`aux_peak`는 AUX trim 이전 sample peak, 별도 장치의 `aux_queue`/`aux_correction`/`aux_underruns`는
-그 입력 clock boundary의 통계다. 입력 오류·실장비 동작·청취·왕복 지연 검증은 STATUS를 따른다.
-
-## 마이크 경로를 Scene으로 저장·재실행
-
-현재 마이크 입력, 채널, 헤드폰/송출 endpoint, 각 음량, 내장 보컬 프리셋·threshold·강도,
-선택적 AUX 장치·채널·목적지·음량과 queue 목표를 하나의 로컬 JSON으로 저장한다. `scene save`는 파일만 만들고, `scene show`는
-파일 형식과 값을 검사해 출력한다. 이 두 명령은 장치를 조회하거나 마이크를 시작하지 않는다.
+## Scene과 실행 중 조작
 
 ```powershell
-.\target\release\mixlive-audio.exe scene save singing.mixlive-scene.json --input "<INPUT ID>" --output "<OUTPUT ID>" --vocal natural --output-gain-db -18
+.\target\release\mixlive-audio.exe scene save singing.mixlive-scene.json --input "<INPUT ID>" --output "<OUTPUT ID>" --vocal natural
 .\target\release\mixlive-audio.exe scene show singing.mixlive-scene.json
 .\target\release\mixlive-audio.exe scene check singing.mixlive-scene.json
-.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --seconds 30
-```
-
-`save`에는 기존 `check/run`과 동일한 route 옵션을 사용한다. 두 출력도 저장하려면
-`--send "<별도 OUTPUT ID>" --send-channels 1,2 --send-gain-db -6`을 함께 지정한다.
-같은 endpoint의 `1/2`·`3/4` 구성도 동일한 Scene 형식으로 저장·검사·재실행한다.
-기존 파일은 덮어쓰지 않으며 다른 이름으로 저장한다. **AUX 필드를 포함한 `schema: 2`만 읽는다.**
-이전 개발 Scene은 현재 옵션으로 새로 저장해야 한다. 구식 포맷 변환이나
-누락된 필수 값의 기본값 복원은 하지 않는다. 오타·중복 채널·허용 범위 밖 음량은 거절한다.
-
-`scene check`는 **현재** Windows 장치와 채널·포맷을 다시 확인하되 스트림은 시작하지 않는다.
-`scene run`도 같은 확인을 거쳐야 시작한다. 저장한 장치가 없어졌다고 기본 마이크로 바꾸지 않는다.
-샘플레이트/포맷은 저장 당시 값으로 강제하지 않고 선택한 endpoint의 현재 기본 구성을 사용한다.
-실행 시간은 Scene에 저장하지 않으며 매번 기본 30초, `--seconds` 범위는 1..3600이다.
-
-이것은 현재 구현된 **마이크 하나·선택적 AUX 하나·출력 1~2개의 장치/보컬 Scene**이다. 앱별 소스,
-외부 VST3 상태, 임의 라우팅 그래프 또는 실행 중 Scene 전환을 구현했다고 의미하지 않는다.
-음성은 저장하지 않는다. Scene에는 개인 endpoint ID가 있으므로 공유하지 않는 것이 좋고,
-문서의 `*.mixlive-scene.json` 확장자는 `.gitignore`로 제외한다.
-
-## 실행 중 라우팅·음량·음소거·중지
-
-직접 `run` 또는 `scene run`에 `--interactive`를 붙이면 터미널에서 아래 명령을 입력한다.
-명령은 Enter로 실행한다. 별도 서버·포트·전역 단축키를 만들지 않으며, 이 옵션이 없으면
-기존 시간 제한 실행을 유지한다. 대화형 실행도 `--seconds` 상한 안에서 종료한다.
-
-```powershell
 .\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --interactive --seconds 3600
 ```
 
-| 실행 중 입력 | 효과 |
+`save`는 run과 같은 route 옵션으로 **새 파일**을 만들며 `show`는 검사·출력만 한다. 둘 다
+장치를 열지 않는다. check/run은 현재 장치와 채널을 다시 확인하고 기본 장치로 대체하지 않는다.
+Scene schema 2는 mic/AUX/출력/보컬/queue 설정만 저장한다. 이전 형식은 새로 저장해야 하며
+마이그레이션은 없다. VST3 launch 옵션·실행 시간·실시간 변경은 Scene에 자동 저장하지 않는다.
+개인 endpoint ID가 포함된 `*.mixlive-scene.json`은 Git에서 제외한다.
+
+`--interactive`를 지정했을 때만 터미널에 다음 명령을 입력한다.
+
+| 명령 | 동작 |
 |---|---|
-| `mute mic` / `unmute mic` | 보정된 목소리만 음소거/해제. MR은 유지 |
-| `mute aux` / `unmute aux` | MR/AUX만 음소거/해제. 마이크는 유지 |
-| `mute output` / `unmute output` | 첫 출력 믹스만 음소거/해제 |
-| `mute send` / `unmute send` | 두 번째 출력 믹스만 음소거/해제 |
-| `mute all` / `unmute all` | 두 출력의 전체 음소거/해제. 개별 mute 상태는 그대로 유지 |
-| `gain master -18` | 두 출력의 공통 최종 감쇠. 초기값은 `--output-gain-db` |
-| `gain send -6` | 두 번째 출력에만 추가 감쇠. 초기값은 `--send-gain-db` |
-| `status` | 현재 요청된 음량·mute·소스별 목적지와 경로 음량 표시 |
-| `stop` | 실행 중인 capture/playback stream을 닫고 종료 |
-
-두 gain 명령은 -96..0 dB의 유한한 값만 받는다. AUX/두 번째 출력이 없는 경로에서
-해당 명령은 거절하며 이전 설정을 유지한다. gain을 바꾸어도 음소거는 풀리지 않는다.
-상태는 **현재 실행에만** 적용되고 Scene 파일에는 자동 저장되지 않는다. Scene schema 2는
-변하지 않았다. 장치·보컬 프리셋/threshold·source trim은 실행 중 바꾸지 않는다.
-마이크와 AUX의 목적지별 연결 및 추가 감쇠는 아래 명령으로 변경할 수 있다.
-
-source mute는 보컬 DSP 뒤 또는 AUX 합산 전에 적용한다. 마이크와 AUX 캡처는 계속되고
-보컬 검출기 상태도 유지한다. 따라서 mute는 마이크 장치 접근을 중단하는 기능이 아니다.
-input/vocal/AUX 미터는 source mute 전이며, stream peak/clipping 미터는 최종 gain/mute 후다.
-
-출력 gain/mute는 **출력 queue와 리샘플러 뒤, clipping guard 앞**에서 동작한다. 이미 MixLive
-queue에 쌓인 소리에도 적용하고 mute 중에도 queue를 계속 소비해 해제 후 과거 소리를
-재생하지 않는다. audio callback은 atomic target만 읽고, 잠금·stdin·파일·문자열 처리는 하지 않는다.
-목표 변경을 관측한 후 약 5 ms linear ramp를 사용한다. 이는 제어 명령 전달 시간이나
-OS/드라이버 버퍼까지 포함한 음소거 응답시간의 보장이 아니다. source mute에는 출력 queue
-지연이 남고, 이미 OS/다른 앱에 전달된 소리나 하드웨어 Direct Monitor는 되돌리거나 끄지 못한다.
-
-대화형 입력의 EOF/입력 오류도 종료 요청으로 처리한다. `stop`/시간 제한/오류로 종료할 때
-소스와 출력 스트림을 소유 스레드에서 닫는다. `Stopped`는 해당 스트림 해제 뒤 출력한다.
-
-### 목소리·MR을 목적지별로 따로 조절
-
-`output`은 첫 번째 믹스, `send`는 `--send`로 정한 두 번째 믹스다. 앱 이름을 뜻하지 않는다.
-헤드폰을 output, 통화 송신을 send로 구성한 경우 아래 명령을 대화형 터미널에 입력한다.
-
-| 명령 | 효과 |
-|---|---|
-| `route mic output off` | 내 헤드폰에서 목소리만 제외. 상대에게 보내는 목소리와 MR은 유지 |
-| `route mic output on` | 헤드폰 보컬을 해당 경로의 기존 음량으로 다시 포함 |
-| `route aux send off` | 상대에게 MR을 보내지 않음. 헤드폰 MR 설정은 유지 |
-| `route aux output on` | MR을 첫 믹스에도 포함. 이미 다른 경로로 듣는다면 중복 모니터링에 주의 |
-| `level aux send -6` | 상대에게 보내는 MR만 추가 6 dB 감쇠. 목소리·헤드폰 MR은 그대로 |
-| `level mic output -9` | 헤드폰 목소리만 추가 9 dB 감쇠. 보컬 DSP 입력/검출기는 그대로 |
+| `mute/unmute mic|aux|output|send|all` | 소스·출력·전체 음소거 |
+| `gain master -18`, `gain send -6` | 공통 출력/두 번째 믹스 추가 감쇠 |
+| `route mic output off`, `route mic output on` | 내 목소리의 첫 믹스 포함 여부 |
+| `route aux send off` | 두 번째 믹스의 MR만 제외 |
+| `level aux send -6`, `level mic output -9` | 지정 경로만 추가 감쇠, -96..0 dB |
+| `status`, `stop` | 요청된 제어 상태 / 장치 해제 후 종료 |
 
 일반형은 `route mic|aux output|send on|off`, `level mic|aux output|send <dB>`다.
-level 범위는 -96..0 dB이고 0은 추가 감쇠 없음이다. AUX의 기존 `--aux-gain-db`도 별도로 적용된다.
-`gain send`는 두 번째 믹스 전체, `level aux send`는 그 안의 MR만 바꾸므로 서로 다르다.
-**꺼둔 경로의 level을 바꿔도 켜지지 않는다.** route on 역시 mic/aux/output/send/all mute를
-풀지 않는다. status에는 각 경로의 on/off와 저장된 추가 감쇠를 따로 표시한다.
+꺼둔 경로의 level 변경은 켜짐을 뜻하지 않고, 전체 unmute도 개별 mute를 풀지 않는다.
+보컬은 한 번 처리하며 목적지별 gain은 합산 전에 적용한다. 출력 mute/master/send gain은
+queue 뒤에 적용하고 mute 중에도 queue를 소비한다. 이미 OS에 보낸 소리나 Direct Monitor에는
+작용하지 않는다. source/route mute에는 출력 queue 지연이 남으므로 급한 송출 중단은
+`mute send`/`mute all`을 사용한다. 음소거는 장치의 마이크 접근 자체를 종료하지 않는다.
 
-처음 시작할 때는 마이크를 기존처럼 모든 출력에 보내고 AUX는 `--aux-to` 또는 Scene의
-초기 목적지를 따른다. 없는 AUX/두 번째 믹스에는 경로를 만들지 않으며 장치 재시작도 하지 않는다.
-현재 실행의 라우팅 변경은 Scene에 자동 저장하지 않는다. 장치 바인딩·Scene 형식은 그대로다.
+gain/route는 약 5 ms sample ramp를 사용한다. 전체 응답시간 보장이 아니며 설정은 현재 실행만
+바꾼다. EOF도 종료 요청이다. `--interactive` 없이 실행하면 지정한 시간까지 동작한다.
 
-보컬은 한 번 처리한 뒤 같은 신호를 두 목적지에 보낸다. 경로별 gain은 기존 5 ms ramp를
-재사용하며 믹스 합산 **앞**에 적용한다. 따라서 route off/level 변경에는 출력 queue 지연이
-남는다. 이미 큐에 합쳐진 소리에서 한 소스만 소급 제거하지 않는다. 전체 송출을 끄려면
-출력 queue 뒤에서 적용되는 `mute send` 또는 `mute all`을 사용한다.
-이 기능은 프로세스 캡처나 통화 반환음 자동 제거를 추가하지 않는다.
-
-## 마이크에 VST3 하나 적용하기 (개발 경로)
-
-설치한 신뢰 가능한 **stereo 입력/출력 버스가 하나씩인 VST3 effect**를 내장 보컬 체인 뒤에
-넣을 수 있다. 원래 mono 보컬은 stereo 입력으로 복제하고 VST3의 좌우 출력은 그대로 보존한다.
-AUX/MR은 플러그인을 통과하지 않으며 기존 목적지별 route/level/mute는 VST3 뒤에서 유지된다.
+## VST3를 실시간 보컬에 적용하고 조절하기
 
 ```powershell
-.\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --vocal natural --vst3 "C:\Plugins\Example.vst3" --interactive --seconds 30
-.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --vst3 "C:\Plugins\Example.vst3" --vst3-state voice.mixlive-vst3.json --interactive --seconds 30
+.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --vst3 "C:\Plugins\Example.vst3" --vst3-editor --vst3-state-out edited.mixlive-vst3.json --interactive --seconds 3600
 ```
 
-`--vst3-state`는 기존 `mixlive-plugins edit/inspect --state-out`으로 저장한 상태다.
-`--vst3-class`로 32자리 class ID를 명시할 수 있고, 생략 시 상태 파일의 ID를 우선한다.
-플러그인과 상태의 class가 다르거나 sidechain/다중 버스가 있으면 송출을 시작하지 않는다.
-선택 플러그인이 실패했다고 원음으로 우회하거나 다른 효과를 대신 넣지 않는다.
+`--vst3`는 **단일 active stereo 입출력 버스의 effect 하나**만 받는다. sidechain/multibus를
+조용히 생략하지 않는다. `--vst3-class`는 32자리 audio class ID, `--vst3-state`는 기존
+MixLive VST3 상태 파일이다. 직접 run과 scene run에만 허용하며 클래스 불일치는 거절한다.
+마이크의 내장 보정 뒤에 한 번 적용하고 stereo 결과를 믹스별로 보낸다. AUX는 우회한다.
 
-VST3 옵션은 **run / scene run의 실행 옵션**이다. Scene schema 2에는 포함되지 않으므로
-매번 명시한다. `scene save/show/check`, `devices`에 이 옵션을 주면 무시하지 않고 거절한다.
-플러그인 파일/상태를 수정하거나 자동 녹음하지 않는다. 상대 경로는 실행 작업 폴더 기준이다.
+`--vst3-editor`는 현재 마이크를 처리하는 **같은 인스턴스**의 원본 창을 연다. 별도 오프라인
+편집 인스턴스가 아니다. 일반 노브 변경은 기존 호스트의 editor→processor 전달 경로를 따른다.
+창 닫기는 editor만 분리하고 송출은 계속한다. 현재 실행에서 창 다시 열기는 미구현이다.
+명시적으로 요청한 편집창이 없거나 열기 실패 시 스트림을 시작하지 않는다.
 
-장치 callback은 마이크와 같은 시간축으로 변환한 AUX를 함께 bounded queue로 전달한다.
-별도 처리 스레드가 내장 보컬→VST3→믹싱을 수행한다. VST3 로딩/상태/제어 요청/종료는
-로딩 스레드가 담당하고, 장치 스트림 종료 후 처리 스레드를 join한 다음 플러그인을 해제한다.
-호스트 내부 잠금 및 짧은 main-thread service와의 잠금 공유는 처리 스레드에 남아 있다.
-**이 경로를 완전 lock-free/hard-real-time이라고 표시하지 않는다.** 출력 callback은 플러그인을
-호출하거나 그 잠금을 기다리지 않는다. 플러그인 미선택 시 기존 직접 처리 경로를 유지한다.
+`--vst3-state-out`을 지정한 경우에만 정상 종료 후 **새 파일**에 설정을 저장한다.
+입출력 중지→worker join→editor 제거→최종 parameter flush→processing stop→상태 취득→
+native 해제→파일 저장 순서다. 기존 파일은 보존하고 오류·restart·강제 종료에서는 저장하지 않는다.
+생략하면 변경은 현재 실행에만 남는다. 다음 실행에서 `--vst3-state edited.mixlive-vst3.json`으로
+불러온다. 플러그인 바이너리나 사용자 음성을 파일에 담지 않는다.
 
-입력 queue는 `--queue-ms`에 따른 **용량 한도**이며 채워질 때까지 기다리는 목표 지연이 아니다.
-worker scheduling, 플러그인 신고 지연, 기존 출력 queue/리샘플러/OS/장치의 지연이 추가된다.
-플러그인의 신고 sample 수와 ms를 출력하지만 이것은 실측 왕복 지연이 아니다. AUX와 보컬 사이의
-플러그인 지연 보상, wet/dry 병렬 혼합, live editor/parameter 교체는 아직 없다.
-고지연 플러그인은 라이브 노래의 타이밍에 영향을 줄 수 있다.
+**현재는 모든 plugin restart 요청을 중단 사유로 처리한다.** oversampling·bus·latency 변경은
+물론 일부 preset/parameter 갱신도 중단될 수 있다. 자동 재구성이나 dry 우회는 하지 않는다.
+메시지 펌프는 plugin mutex를 잡지 않은 main 스레드에서 실행한다. 그 뒤의 제어·창 API는
+worker와 mutex를 공유하므로 GUI 조작 중 dropout 없는 hard-real-time 동작을 보장하지 않는다.
+실제 상용 GUI·DPI·닫힘·MiniFuse 청취 검증은 별도 수용이 필요하다.
 
-입력 queue 초과, 처리 실패 또는 비유한 샘플은 경로를 중단하고 원음으로 전환하지 않는다.
-실행 중 restart 요청은 자동 재설정하지 않고 명시적으로 멈춰 재구성을 요구한다.
-**플러그인은 현재 앱 프로세스 안에서 실행**된다. native crash/hang을 격리하지 않으며,
-플러그인이 반환하지 않으면 정상 종료도 기다릴 수 있다. 먼저 별도 inspect로 확인한 플러그인만
-사용한다. 실제 상용 플러그인·MiniFuse의 지연/장시간 안정성/청취 수용은 별도로 필요하다.
+VST3는 in-process native 코드다. crash/hang은 격리되지 않으며 플러그인이 반환하지 않으면
+종료도 기다릴 수 있다. 신뢰하고 적법하게 설치한 플러그인만 사용한다. 입력 queue는
+`--queue-ms`에 따른 **용량 한도**이지 고정 지연이 아니다. 플러그인 신고 지연·worker scheduling·
+출력 queue·OS/장치 지연이 추가되고 플러그인 지연 보상·다중 체인·실행 중 교체는 아직 없다.
 
-## 사용자 VST3 검사·편집
+## 별도 VST3 검사·파일 도구
 
 ```powershell
-cargo build --release -p mixlive-vst3 --bin mixlive-plugins --locked
 .\target\release\mixlive-plugins.exe list
-.\target\release\mixlive-plugins.exe inspect "C:\Program Files\Common Files\VST3\Example.vst3"
-```
-
-플러그인 고유 ID, 버스·파라미터·신고 지연, 합성 PCM 처리 결과를 확인한다.
-`--set`, `--state-in`, `--state-out` 사용법과 제한은 [VST3 안내](crates/mixlive-vst3/README.md)에 있다.
-검사 시 마이크/스피커를 열지 않으며, 성공해도 실시간 호환성이나 음질 수용을 뜻하지 않는다.
-검사는 자식 프로세스에서 한 번 수행한다. native crash 분리이지 권한 sandbox가 아니다.
-신뢰하고 적법하게 설치한 플러그인만 선택한다.
-
-원본 편집창을 열어 설정한 뒤 새 상태 파일로 저장할 수 있다.
-
-```powershell
+.\target\release\mixlive-plugins.exe inspect "C:\Plugins\Example.vst3"
 .\target\release\mixlive-plugins.exe edit "C:\Plugins\Example.vst3" --state-out voice.mixlive-vst3.json
 .\target\release\mixlive-plugins.exe render "C:\Plugins\Example.vst3" --input dry.wav --output wet.wav --state-in voice.mixlive-vst3.json
 ```
 
-`edit`는 사용자 플러그인의 실제 창을 열지만 소리 미리듣기나 실시간 마이크 연결은 하지 않는다.
-`--state-out`을 지정하면 창을 정상적으로 닫은 뒤 저장하고, 생략하면 편집 결과를 버린다.
-기존 파일은 덮어쓰지 않는다. GPUI 메인 화면과는 별개의 네이티브 플러그인 창이다.
+이 별도 도구의 `edit`는 오디오 미리듣기가 없다. 검사·편집·WAV 처리는 자식 프로세스에서
+수행하며 native crash 분리이지 권한 sandbox가 아니다. 상태·파라미터·WAV 형식·잔향 옵션은
+[VST3 안내](crates/mixlive-vst3/README.md)를 따른다. 성공한 inspect는 라이브 호환성 승인이 아니다.
 
-## 개발 검사
+## 검증·개발 계약
 
 ```sh
 cargo test --workspace --locked
@@ -326,13 +188,11 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run -p mixlive-core --example discord_singing --locked
 ```
 
-합성 routing 예제는 통화/헤드폰 peak 0.300 / 0.600을 계산한다. 실제 Discord가 아니다.
-Windows CI는 core·clock·DSP 수치 검사, VST3 native fixture·상태 복원, 어댑터 빌드와 CLI 도움말을
-검사하며 마이크를 열지 않는다. native fixture 검사는 별도 명령으로 실행되므로 상세 명령은
-[VST3 안내](crates/mixlive-vst3/README.md)를 따른다. 빌드 통과와 실제 장비·청취 수용을 구분한다.
-
-## 제품·개발 계약
+CI는 수치/CLI/상태/실제 native fixture와 Windows 빌드를 검사하며 실제 오디오 장치를 열지 않는다.
+추가 native 검사는 기존 CI 명령을 따른다. sample peak/GR은 LUFS/true peak가 아니고
+`queue-ms`/driver buffer/플러그인 신고 지연은 실측 왕복 지연이 아니다. 실제 장비·청취 수용과
+자동 검사 결과를 구별한다. 내장 reverb/delay/pitch correction·기본 프리셋의 음질 수용도 남아 있다.
 
 [DESIGN.md](DESIGN.md) · [STATUS.md](STATUS.md) · [AGENTS.md](AGENTS.md) · [NOTICE.md](NOTICE.md)
 
-저장소는 공개다. 제품 라이선스는 미정이며 공식 설치 파일·가상 장치·드라이버 릴리스는 없다.
+공개 저장소이며 제품 라이선스는 미정이다. 자동 녹음·클라우드 전송·드라이버 설치·공식 릴리스는 없다.

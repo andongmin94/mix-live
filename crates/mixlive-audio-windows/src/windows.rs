@@ -282,11 +282,25 @@ where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
 }
 
 impl Active {
-    /// Service fixed-configuration plugin requests on the loading/control thread.
-    pub fn poll_plugin(&self) -> Result<()> {
-        if let Some(worker) = &self.plugin_worker { worker.poll()?; }
+    /// Service plugin/editor requests on the loading/control thread, never a device callback.
+    pub fn poll_plugin(&mut self) -> Result<()> {
+        if let Some(worker) = &mut self.plugin_worker { worker.poll()?; }
         Ok(())
     }
+
+    /// Explicit normal completion. Stop all devices before joining/snapshotting the plugin.
+    /// Errors and implicit Drop still tear down everything, but never save plugin state.
+    pub fn finish(self, state_out: Option<&std::path::Path>) -> Result<()> {
+        let Self { _input, _aux_input, _outputs, plugin_worker, health, .. } = self;
+        drop(_input);
+        drop(_aux_input);
+        drop(_outputs);
+        if let Some(worker) = plugin_worker { worker.finish(state_out)?; }
+        else if state_out.is_some() { return Err("no live VST3 instance to save".into()); }
+        if let Some(error) = health.error() { return Err(error.into()); }
+        Ok(())
+    }
+
     /// UI/CLI thread only. Peaks and gain reduction maxima are since the previous read.
     pub fn report(&self) -> String {
         let vocal = self.vocal_stats.take();

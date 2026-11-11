@@ -86,9 +86,12 @@ mod device {
         println!("{}", prepared.describe());
         println!("Use headphones at LOW hardware volume. Disable other monitoring paths.\nStarting a {seconds}s live mic route; no recording. Sample clipping guard is not a mastering limiter.");
         if plugin.vst3.is_some() {
-            println!("Loading trusted native VST3 in this process. A plugin crash/hang is not isolated. No live editor or delay compensation; all processing must finish before shutdown can complete.");
+            println!("Loading trusted native VST3 in this process. A plugin crash/hang is not isolated. No delay compensation; all processing must finish before shutdown can complete.");
         }
-        let active = prepared.start(plugin)?;
+        if plugin.vst3_editor {
+            println!("Opening the LIVE plugin editor. Closing its window keeps audio running. Restart/bus/latency requests stop the route. Use stop or the session time limit to finish.");
+        }
+        let mut active = prepared.start(plugin)?;
         for line in &active.timing { println!("{line}"); }
         if interactive {
             println!("{}", mixlive_audio_windows::control::HELP);
@@ -101,6 +104,7 @@ mod device {
         }
         let started = Instant::now();
         let mut next_report = Duration::ZERO;
+        let poll_interval = Duration::from_millis(if plugin.vst3_editor { 16 } else { 50 });
         while started.elapsed() < Duration::from_secs(seconds) && !active.controls.stop_requested() {
             active.poll_plugin()?;
             if let Some(error) = active.health.error() { return Err(error.into()); }
@@ -108,13 +112,14 @@ mod device {
                 println!("{} | {}", active.report(), active.controls.describe());
                 next_report += Duration::from_secs(1);
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(poll_interval);
         }
         let report = active.report();
-        let health = active.health.clone();
-        drop(active); // Devices stop, then plugin worker joins and native teardown runs here.
+        // Finish stops devices, joins processing, closes the editor, and optionally saves state.
+        let finished = active.finish(plugin.vst3_state_out.as_deref());
         println!("Stopped. {report}");
-        if let Some(error) = health.error() { return Err(error.into()); }
+        finished?;
+        if let Some(path) = &plugin.vst3_state_out { println!("Saved VST3 state: {}", path.display()); }
         Ok(())
     }
 }
@@ -169,14 +174,18 @@ mod tests {
     fn vst3_launch_options_work_for_direct_and_scene_runs_but_never_silently_save() {
         for mut words in [vec!["mixlive-audio", "run", "--input", "mic", "--output", "phones"],
             vec!["mixlive-audio", "scene", "run", "singing.json"]] {
-            words.extend(["--vst3", "effect.vst3", "--vst3-state", "voice.json"]);
+            words.extend(["--vst3", "effect.vst3", "--vst3-state", "voice.json", "--vst3-editor", "--vst3-state-out", "edited.json"]);
             let matches = parser().try_get_matches_from(words).unwrap();
             let plugin = PluginArgs::from_arg_matches(&matches).unwrap();
             assert_eq!(plugin.vst3, Some("effect.vst3".into()));
             assert_eq!(plugin.vst3_state, Some("voice.json".into()));
+            assert!(plugin.vst3_editor);
+            assert_eq!(plugin.vst3_state_out, Some("edited.json".into()));
             assert!(Cli::from_arg_matches(&matches).is_ok());
         }
         assert!(parser().try_get_matches_from(["mixlive-audio", "devices", "--vst3-state", "voice.json"]).is_err());
+        assert!(parser().try_get_matches_from(["mixlive-audio", "devices", "--vst3-editor"]).is_err());
+        assert!(parser().try_get_matches_from(["mixlive-audio", "devices", "--vst3-state-out", "edited.json"]).is_err());
         let matches = parser().try_get_matches_from(["mixlive-audio", "devices", "--vst3", "effect.vst3"]).unwrap();
         let error = run(Cli::from_arg_matches(&matches).unwrap(), PluginArgs::from_arg_matches(&matches).unwrap()).unwrap_err();
         assert!(error.to_string().contains("run and scene run only"));

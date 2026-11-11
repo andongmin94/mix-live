@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 #[derive(Args, Clone, Debug, Default)]
 pub struct PluginArgs {
-    /// Apply one trusted stereo VST3 to the voice, after built-in DSP. No live editor.
+    /// Apply one trusted stereo VST3 to the voice, after built-in DSP.
     #[arg(long, global = true)]
     pub vst3: Option<PathBuf>,
     /// Load a MixLive VST3 state made by mixlive-plugins. Requires --vst3.
@@ -13,15 +13,29 @@ pub struct PluginArgs {
     /// Select the audio component by its 32-digit class ID. Requires --vst3.
     #[arg(long, global = true, requires = "vst3")]
     pub vst3_class: Option<String>,
+    /// Open this live instance's native editor. Closing its window does not stop audio.
+    #[arg(long, global = true, requires = "vst3")]
+    pub vst3_editor: bool,
+    /// Save plugin state to a NEW file after a successful stop, never during audio processing.
+    #[arg(long, global = true, requires = "vst3")]
+    pub vst3_state_out: Option<PathBuf>,
 }
 
 impl PluginArgs {
     pub fn validate(&self) -> Result<(), String> {
-        if self.vst3.is_none() && (self.vst3_state.is_some() || self.vst3_class.is_some()) {
-            return Err("VST3 state/class requires an explicit plugin".into());
+        if self.vst3.is_none() && (self.vst3_state.is_some() || self.vst3_class.is_some()
+            || self.vst3_editor || self.vst3_state_out.is_some()) {
+            return Err("VST3 state/class/editor options require an explicit plugin".into());
         }
-        for path in [&self.vst3, &self.vst3_state].into_iter().flatten() {
+        for path in [&self.vst3, &self.vst3_state, &self.vst3_state_out].into_iter().flatten() {
             if path.as_os_str().is_empty() { return Err("VST3 paths must not be empty".into()); }
+        }
+        if let Some(path) = &self.vst3_state_out {
+            match path.symlink_metadata() {
+                Ok(_) => return Err("VST3 state output already exists; choose a new file".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(error.to_string()),
+            }
         }
         if self.vst3_class.as_ref().is_some_and(|id| id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit())) {
             return Err("VST3 class ID must be 32 hexadecimal digits".into());
@@ -34,10 +48,10 @@ impl PluginArgs {
 pub(crate) mod native {
     use super::PluginArgs;
     use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}};
-    use mixlive_vst3::StateFile;
+    use mixlive_vst3::{StateFile, editor::{flush_editor_changes, pump_editor_messages}};
     use rtrb::{Producer, RingBuffer};
-    use std::{sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
-    use vst3_host::{Plugin, Vst3Host, audio::BusAudioBuffers, plugin::ProcessMode};
+    use std::{path::Path, sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
+    use vst3_host::{Plugin, PluginWindow, Vst3Host, audio::BusAudioBuffers, plugin::ProcessMode};
 
     // Mic and the already clock-converted AUX travel together. Never queue them independently.
     pub(crate) struct QueuedInput {
@@ -80,6 +94,8 @@ pub(crate) mod native {
         thread: Option<JoinHandle<()>>,
         stop: Arc<AtomicBool>,
         plugin: Arc<Mutex<Plugin>>,
+        editor: Option<PluginWindow>,
+        stopped: bool,
         health: Arc<Health>,
         pub description: String,
     }
@@ -112,10 +128,20 @@ pub(crate) mod native {
         -> Result<(CaptureSink, Option<PluginWorker>), String> {
         args.validate()?;
         if args.vst3.is_none() { return Ok((CaptureSink::Direct(Box::new(capture)), None)); }
-        // Initialization and state access happen before any capture/playback starts.
         let plugin = load(args, rate)?;
-        let (input, worker) = spawn(capture, plugin, rate, queue_ms, has_aux, health)?;
+        let (input, mut worker) = spawn(capture, plugin, rate, queue_ms, has_aux, health)?;
+        // No device streams have started yet. An explicitly requested missing editor is an error.
+        if args.vst3_editor { worker.editor = Some(open_editor(worker.plugin.clone())?); }
         Ok((CaptureSink::Queued(input), Some(worker)))
+    }
+
+    fn open_editor(plugin: Arc<Mutex<Plugin>>) -> Result<PluginWindow, String> {
+        if !plugin.lock().map_err(|_| "VST3 processing state was poisoned")?.has_editor() {
+            return Err("this VST3 has no native editor; omit --vst3-editor or choose another effect".into());
+        }
+        let mut window = PluginWindow::new(plugin);
+        window.open().map_err(|e| e.to_string())?;
+        Ok(window)
     }
 
     fn spawn(mut capture: Capture, mut plugin: Plugin, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>)
@@ -131,17 +157,17 @@ pub(crate) mod native {
         }
         let latency = plugin.latency_samples();
         let capacity = (rate as usize * queue_ms as usize / 1000).max(CAPTURE_BLOCK * 2);
-        let description = format!("VST3: {} [{}]; reported latency {} samples ({:.2} ms).\nDedicated processing thread; input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. No dry fallback, live editor or plugin-delay compensation.",
+        let description = format!("VST3: {} [{}]; reported latency {} samples ({:.2} ms).\nDedicated processing thread; input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. No dry fallback or plugin-delay compensation. Native editor is opt-in; restart requests stop the route.",
             plugin.info().name, plugin.info().uid, latency, latency as f64 * 1000.0 / f64::from(rate), capacity as f64 * 1000.0 / f64::from(rate));
         let mut buffers = BusAudioBuffers::new(&layout, CAPTURE_BLOCK, f64::from(rate));
         let (writer, mut reader) = RingBuffer::<[f32; 3]>::new(capacity);
-        // State/configuration notifications raised during setup describe the layout just checked.
         let _ = plugin.take_restart_flags();
         let _ = plugin.take_host_notifications();
         let _ = plugin.take_parameter_edits();
         plugin.start_processing().map_err(|e| e.to_string())?;
         let plugin = Arc::new(Mutex::new(plugin));
-        let mut owner = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), plugin: plugin.clone(), health: health.clone(), description };
+        let mut owner = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), plugin: plugin.clone(),
+            editor: None, stopped: false, health: health.clone(), description };
         let stop = owner.stop.clone();
         let worker_health = health.clone();
         owner.thread = Some(thread::Builder::new().name("mixlive-vst3-audio".into()).spawn(move || {
@@ -159,7 +185,7 @@ pub(crate) mod native {
                     buffers.clear();
                     buffers.inputs[0].channels[0][..voice.len()].copy_from_slice(voice);
                     buffers.inputs[0].channels[1][..voice.len()].copy_from_slice(voice);
-                    // This may contend with brief main-thread service, NEVER with a device callback.
+                    // This may contend with editor/control calls, NEVER with a device callback.
                     let Ok(mut plugin) = plugin.lock() else { return false; };
                     if plugin.process_bus_audio(&mut buffers).is_err() { return false; }
                     left.copy_from_slice(&buffers.outputs[0].channels[0][..voice.len()]);
@@ -171,9 +197,34 @@ pub(crate) mod native {
         Ok((QueuedInput { writer, has_aux, health }, owner))
     }
 
+    /// No processing thread may be running. Flush the final UI edit without rendering audio,
+    /// stop even if flushing fails, then read the processor/controller snapshot if requested.
+    fn stop_and_snapshot(plugin: &mut Plugin, save: bool) -> Result<Option<StateFile>, String> {
+        let flushed = if save { flush_editor_changes(plugin).map(|_| ()).map_err(|e| e.to_string()) } else { Ok(()) };
+        let stopped = plugin.stop_processing().map_err(|e| e.to_string());
+        flushed?;
+        stopped?;
+        if !save { return Ok(None); }
+        Ok(Some(StateFile { schema: 1, class_id: plugin.info().uid.clone(), state: plugin.save_state().map_err(|e| e.to_string())? }))
+    }
+
     impl PluginWorker {
-        /// Main/control thread only. Do not reconfigure a running plugin from an audio callback.
-        pub fn poll(&self) -> Result<(), String> {
+        /// Main/loading thread only. Dispatch messages WITHOUT holding the plugin mutex.
+        pub fn poll(&mut self) -> Result<(), String> {
+            if let Some(editor) = &mut self.editor {
+                if !pump_editor_messages() {
+                    self.health.fail(Fault::Routing);
+                    return Err("native editor message loop was interrupted".into());
+                }
+                if let Err(error) = editor.service_platform_events() {
+                    self.health.fail(Fault::Routing);
+                    return Err(error.to_string());
+                }
+                if editor.closed_by_user() {
+                    // Detach before destroying the parent window. Keep this audio instance alive.
+                    drop(self.editor.take());
+                }
+            }
             if self.thread.as_ref().is_some_and(|worker| worker.is_finished()) && !self.stop.load(Ordering::Relaxed) && !self.health.failed() {
                 self.health.fail(Fault::Routing);
                 return Err("VST3 processing thread stopped unexpectedly".into());
@@ -185,27 +236,52 @@ pub(crate) mod native {
                     self.health.fail(Fault::Routing); return Err("VST3 processing state was poisoned".into());
                 }
             };
-            // This first live path has fixed state/buses/latency. Stop rather than silently
-            // accepting a restart request or changing routing while samples are queued.
+            // Knob performEdit changes already reach process_bus_audio in the host library.
+            // Do not replay their UI notification stream as a second set of automation events.
+            // This live path keeps buses/latency fixed; do not service a restart while queued.
             if plugin.take_restart_flags() != Default::default() {
                 self.health.fail(Fault::Routing);
                 return Err("VST3 requested a restart; stop, configure and start the route again".into());
             }
+            let _ = plugin.get_parameter_changes();
             let _ = plugin.take_host_notifications();
             let _ = plugin.take_parameter_edits();
             Ok(())
         }
-    }
-    impl Drop for PluginWorker {
-        fn drop(&mut self) {
+
+        fn shutdown(&mut self, save: bool) -> Result<Option<StateFile>, String> {
+            if self.stopped { return Ok(None); }
             self.stop.store(true, Ordering::Relaxed);
             if let Some(worker) = self.thread.take() {
                 if worker.join().is_err() { self.health.fail(Fault::Routing); }
             }
-            // Even after a Rust panic, native state is released on its loading thread.
-            let mut plugin = self.plugin.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            if plugin.stop_processing().is_err() { self.health.fail(Fault::Routing); }
+            drop(self.editor.take());
+            self.stopped = true;
+            let mut plugin = self.plugin.lock().unwrap_or_else(|poisoned| {
+                self.health.fail(Fault::Routing);
+                poisoned.into_inner()
+            });
+            if plugin.take_restart_flags() != Default::default() { self.health.fail(Fault::Routing); }
+            let snapshot = stop_and_snapshot(&mut plugin, save && !self.health.failed());
+            if snapshot.is_err() { self.health.fail(Fault::Routing); }
+            let snapshot = snapshot?;
+            if let Some(error) = self.health.error() { return Err(error.into()); }
+            Ok(snapshot)
         }
+
+        /// Explicit successful-session completion only. Drop never creates a file.
+        /// The caller has already stopped device streams; native teardown precedes publication.
+        pub fn finish(mut self, state_out: Option<&Path>) -> Result<(), String> {
+            let snapshot = self.shutdown(state_out.is_some())?;
+            drop(self);
+            if let (Some(path), Some(snapshot)) = (state_out, snapshot) {
+                snapshot.save_new(path).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+    }
+    impl Drop for PluginWorker {
+        fn drop(&mut self) { let _ = self.shutdown(false); }
     }
 
     #[cfg(test)]
@@ -240,7 +316,8 @@ pub(crate) mod native {
             let (writer, mut reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
             let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
                 Some((0.0, AuxDestination::Send)), vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
-            let (mut input, worker) = spawn(capture, plugin, 48000, 100, true, health.clone()).unwrap();
+            let (mut input, mut worker) = spawn(capture, plugin, 48000, 100, true, health.clone()).unwrap();
+            assert!(open_editor(worker.plugin.clone()).err().unwrap().contains("no native editor"));
             for count in [1, 137, 256, 219, 923] { input.push(&vec![0.4; count], Some(&vec![[0.1, -0.2]; count])); }
             let deadline = Instant::now() + Duration::from_secs(3);
             while health.captured_frames.load(Ordering::Relaxed) < 1536 && !health.failed() && Instant::now() < deadline {
@@ -251,19 +328,30 @@ pub(crate) mod native {
             for _ in 0..512 { reader.next_frame([1.0; 2]); }
             let frame = reader.next_frame([1.0; 2]);
             for (actual, expected) in frame.into_iter().zip([0.1, 0.1, 0.2, -0.1]) { assert!((actual - expected).abs() < 0.001); }
-            drop(worker); // join, stop_processing, and native teardown on this loading thread
+            // Change a controller parameter while the worker is alive, then verify new audio.
+            for _ in 0..4096 { reader.next_frame([1.0; 2]); }
+            worker.plugin.lock().unwrap().set_parameter(0, 0.5).unwrap();
+            input.push(&[0.4; 1536], Some(&[[0.1, -0.2]; 1536]));
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while health.captured_frames.load(Ordering::Relaxed) < 3072 && !health.failed() && Instant::now() < deadline {
+                worker.poll().unwrap(); thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(health.captured_frames.load(Ordering::Relaxed), 3072);
+            for _ in 0..512 { reader.next_frame([1.0; 2]); }
+            for (actual, expected) in reader.next_frame([1.0; 2]).into_iter().zip([0.2, 0.2, 0.3, 0.0]) {
+                assert!((actual - expected).abs() < 0.001);
+            }
+            worker.finish(None).unwrap();
             assert!(!health.failed());
             let bad = PluginArgs { vst3: Some(std::env::var_os("MIXLIVE_STATE_VST3").unwrap().into()), ..PluginArgs::default() };
             let mut plugin = load(&bad, 48000).unwrap();
             plugin.start_processing().unwrap();
             plugin.set_parameter(0, 0.37).unwrap();
-            mixlive_vst3::editor::flush_editor_changes(&mut plugin).unwrap();
-            plugin.stop_processing().unwrap();
+            let snapshot = stop_and_snapshot(&mut plugin, true).unwrap().unwrap();
             let directory = tempfile::tempdir().unwrap();
             let state_path = directory.path().join("voice.json");
-            StateFile { schema: 1, class_id: plugin.info().uid.clone(), state: plugin.save_state().unwrap() }
-                .save_new(&state_path).unwrap();
             drop(plugin);
+            snapshot.save_new(&state_path).unwrap();
             let saved = PluginArgs { vst3_state: Some(state_path.clone()), ..bad };
             let plugin = load(&saved, 48000).unwrap();
             let value = plugin.get_parameters().unwrap().into_iter().find(|p| p.id == 0).unwrap().value;
@@ -275,6 +363,38 @@ pub(crate) mod native {
             let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
                 None, vec![(writer, vec![0])], health.clone(), controls).unwrap();
             assert!(spawn(capture, plugin, 48000, 30, false, health).is_err());
+        }
+
+        #[test]
+        #[ignore = "requires the existing MIXLIVE_STATE_VST3 native fixture; opens no windows/devices"]
+        fn native_finish_saves_only_explicit_healthy_sessions_and_preserves_files() {
+            let directory = tempfile::tempdir().unwrap();
+            let args = PluginArgs { vst3: Some(std::env::var_os("MIXLIVE_STATE_VST3").unwrap().into()), ..PluginArgs::default() };
+            for case in ["save", "fault", "discard", "exists"] {
+                let mut plugin = load(&args, 48000).unwrap();
+                let _ = plugin.take_restart_flags();
+                plugin.start_processing().unwrap();
+                // An edit immediately before stop must be flushed into processor state.
+                plugin.set_parameter(0, 0.61).unwrap();
+                let health = Arc::new(Health::default());
+                // Exercise the same teardown path without a capture stream or a worker to join.
+                let worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)),
+                    plugin: Arc::new(Mutex::new(plugin)), editor: None, stopped: false,
+                    health: health.clone(), description: String::new() };
+                let path = directory.path().join(format!("{case}.json"));
+                if case == "exists" { std::fs::write(&path, b"keep").unwrap(); }
+                if case == "fault" { health.fail(Fault::Device); }
+                match case {
+                    "discard" => { drop(worker); assert!(!path.exists()); },
+                    "fault" => { assert!(worker.finish(Some(&path)).is_err()); assert!(!path.exists()); },
+                    "exists" => { assert!(worker.finish(Some(&path)).is_err()); assert_eq!(std::fs::read(&path).unwrap(), b"keep"); },
+                    _ => {
+                        worker.finish(Some(&path)).unwrap();
+                        let restored = load(&PluginArgs { vst3_state: Some(path), ..args.clone() }, 48000).unwrap();
+                        assert!((restored.get_parameters().unwrap().into_iter().find(|p| p.id == 0).unwrap().value - 0.61).abs() < 1e-6);
+                    }
+                }
+            }
         }
     }
 }
@@ -293,5 +413,23 @@ mod tests {
         assert!(args.validate().is_err());
         args.vst3_class = Some("0123456789abcdef0123456789ABCDEF".into());
         assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn live_editor_and_state_output_are_explicit_and_never_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("voice.json");
+        for args in [PluginArgs { vst3_editor: true, ..PluginArgs::default() },
+            PluginArgs { vst3_state_out: Some(path.clone()), ..PluginArgs::default() }] {
+            assert!(args.validate().is_err());
+        }
+        let mut args = PluginArgs { vst3: Some("effect.vst3".into()), vst3_editor: true,
+            vst3_state_out: Some(path.clone()), ..PluginArgs::default() };
+        assert!(args.validate().is_ok());
+        std::fs::write(&path, b"keep").unwrap();
+        assert!(args.validate().unwrap_err().contains("already exists"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        args.vst3_state_out = Some(PathBuf::new());
+        assert!(args.validate().is_err());
     }
 }
