@@ -5,6 +5,7 @@ pub mod bridge;
 pub mod capture;
 pub mod config;
 pub mod control;
+pub mod devices;
 pub mod plugin;
 pub mod scene;
 #[cfg(windows)]

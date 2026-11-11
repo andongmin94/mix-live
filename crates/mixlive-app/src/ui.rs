@@ -14,17 +14,21 @@ use gpui::{
 };
 use gpui_design::{Button, Root, Slider, SliderEvent, SliderState, StyledExt as _, Switch};
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
+use mixlive_audio_windows::windows::device_catalog;
 
-use crate::session::Session;
+use crate::{
+    form::{FormEvent, SceneForm},
+    session::Session,
+};
 
-const BACKGROUND: u32 = 0x0b1120;
-const SURFACE: u32 = 0x121d30;
-const RAISED: u32 = 0x19273c;
-const BORDER: u32 = 0x2b3b52;
-const TEXT: u32 = 0xe8eef8;
-const MUTED: u32 = 0x9badc7;
-const ACCENT: u32 = 0x73ddc3;
-const DANGER: u32 = 0xff8997;
+pub(crate) const BACKGROUND: u32 = 0x0b1120;
+pub(crate) const SURFACE: u32 = 0x121d30;
+pub(crate) const RAISED: u32 = 0x19273c;
+pub(crate) const BORDER: u32 = 0x2b3b52;
+pub(crate) const TEXT: u32 = 0xe8eef8;
+pub(crate) const MUTED: u32 = 0x9badc7;
+pub(crate) const ACCENT: u32 = 0x73ddc3;
+pub(crate) const DANGER: u32 = 0xff8997;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FaderTarget {
@@ -48,6 +52,7 @@ struct Fader {
 
 #[derive(Clone, Copy)]
 enum Operation {
+    Devices,
     Start,
     Stop,
     Close,
@@ -61,6 +66,8 @@ pub struct MixLive {
     selected_name: String,
     faders: Vec<Fader>,
     subscriptions: Vec<Subscription>,
+    form: Option<Entity<SceneForm>>,
+    form_subscription: Option<Subscription>,
     last_refresh: Instant,
 }
 
@@ -114,6 +121,8 @@ impl MixLive {
             selected_name,
             faders: Vec::new(),
             subscriptions: Vec::new(),
+            form: None,
+            form_subscription: None,
             last_refresh: Instant::now(),
         }
     }
@@ -133,7 +142,7 @@ impl MixLive {
     }
 
     fn choose_scene(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy.is_some() || self.picking || self.session.running() {
+        if self.busy.is_some() || self.picking || self.session.running() || self.form.is_some() {
             return;
         }
         self.picking = true;
@@ -167,12 +176,82 @@ impl MixLive {
         .detach();
     }
 
+    fn save_scene(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picking || self.busy.is_some() || self.session.running() {
+            return;
+        }
+        let Some(form) = self.form.clone() else {
+            return;
+        };
+        let scene = match form.read(cx).build_scene(cx) {
+            Ok(scene) => scene,
+            Err(error) => {
+                form.update(cx, |form, cx| form.show_error(Some(error), cx));
+                return;
+            }
+        };
+        let directory = self
+            .session
+            .path()
+            .and_then(|path| path.parent())
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir);
+        let directory = match directory {
+            Ok(directory) => directory,
+            Err(error) => {
+                form.update(cx, |form, cx| form.show_error(Some(error.to_string()), cx));
+                return;
+            }
+        };
+        self.picking = true;
+        form.update(cx, |form, cx| {
+            form.show_error(None, cx);
+            form.set_busy(true, window, cx);
+        });
+        let path = cx.prompt_for_new_path(&directory, Some("새 Scene.mixlive-scene.json"));
+        cx.notify();
+        cx.spawn_in(window, async move |owner, cx| {
+            let result = path.await;
+            let _ = cx.update(move |window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.picking = false;
+                    form.update(cx, |form, cx| form.set_busy(false, window, cx));
+                    let error = match result {
+                        Ok(Ok(Some(path))) => match this.session.save_new(path, scene) {
+                            Ok(()) => {
+                                this.selected_name = scene_name(&this.session);
+                                this.form = None;
+                                this.form_subscription = None;
+                                None
+                            }
+                            Err(error) => Some(format!("새 파일로 저장하지 못했습니다: {error}")),
+                        },
+                        Ok(Ok(None)) => None,
+                        Ok(Err(error)) => Some(error.to_string()),
+                        Err(error) => Some(error.to_string()),
+                    };
+                    if let Some(error) = error {
+                        form.update(cx, |form, cx| form.show_error(Some(error), cx));
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn perform(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
         }
-        if matches!(operation, Operation::Start) && (self.picking || self.session.scene().is_none())
+        if matches!(operation, Operation::Start | Operation::Devices)
+            && (self.picking || self.form.is_some() || self.session.running())
         {
+            return;
+        }
+        if matches!(operation, Operation::Start) && self.session.scene().is_none() {
             return;
         }
         self.busy = Some(operation);
@@ -182,18 +261,45 @@ impl MixLive {
         cx.notify();
         cx.spawn_in(window, async move |owner, cx| {
             // These synchronous native calls MUST be outside App/entity update.
-            match operation {
+            let catalog = match operation {
+                Operation::Devices => Some(device_catalog().map_err(|error| error.to_string())),
                 Operation::Start => {
                     let _ = session.start();
+                    None
                 }
                 Operation::Stop | Operation::Close => {
                     let _ = session.stop();
+                    None
                 }
-            }
+            };
             let _ = cx.update(move |window, cx| {
                 let _ = owner.update(cx, |this, cx| {
                     this.session = session;
                     this.busy = None;
+                    if let Some(catalog) = catalog {
+                        match catalog {
+                            Ok(catalog) => {
+                                this.session.error = None;
+                                let form = cx.new(|cx| SceneForm::new(catalog, window, cx));
+                                this.form_subscription = Some(cx.subscribe_in(&form, window, |this, _, event, window, cx| {
+                                    match event {
+                                        FormEvent::Save => this.save_scene(window, cx),
+                                        FormEvent::Cancel if !this.picking => {
+                                            this.form = None;
+                                            this.form_subscription = None;
+                                            cx.notify();
+                                        }
+                                        FormEvent::Cancel => {}
+                                    }
+                                }));
+                                this.form = Some(form);
+                            }
+                            Err(error) => {
+                                this.session.message = "장치 목록을 읽지 못했습니다. 연결을 확인하고 새 Scene을 다시 누르세요.".into();
+                                this.session.error = Some(error);
+                            }
+                        }
+                    }
                     this.install_faders(cx);
                     cx.notify();
                 });
@@ -343,9 +449,11 @@ impl MixLive {
     fn header(&self, cx: &Context<Self>) -> Div {
         let running = self.session.running();
         let (status, color) = match self.busy {
+            Some(Operation::Devices) => ("장치 조회 중", MUTED),
             Some(Operation::Start) => ("시작 중", MUTED),
             Some(Operation::Stop | Operation::Close) => ("정지 중", MUTED),
             None if running => ("오디오 실행 중", ACCENT),
+            None if self.form.is_some() => ("새 Scene 설정", MUTED),
             None if self.session.error.is_some() => ("확인 필요", DANGER),
             None if self.session.scene().is_some() => ("시작 준비", MUTED),
             None => ("정지", MUTED),
@@ -419,8 +527,25 @@ impl MixLive {
                             .child(self.mute("mute-all", "전체 출력 음소거", MuteTarget::All, cx))
                     }))
                     .child(
+                        button("new-scene", "새 Scene", false)
+                            .disabled(
+                                running
+                                    || self.busy.is_some()
+                                    || self.picking
+                                    || self.form.is_some(),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.perform(Operation::Devices, window, cx)
+                            })),
+                    )
+                    .child(
                         button("open-scene", "Scene 열기", false)
-                            .disabled(running || self.busy.is_some() || self.picking)
+                            .disabled(
+                                running
+                                    || self.busy.is_some()
+                                    || self.picking
+                                    || self.form.is_some(),
+                            )
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.choose_scene(window, cx)),
                             ),
@@ -434,7 +559,8 @@ impl MixLive {
                             .disabled(
                                 self.session.scene().is_none()
                                     || self.busy.is_some()
-                                    || self.picking,
+                                    || self.picking
+                                    || self.form.is_some(),
                             )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.perform(Operation::Start, window, cx)
@@ -452,8 +578,8 @@ impl MixLive {
                 )
             } else {
                 (
-                    "Scene을 열어 시작하세요".to_owned(),
-                    "저장된 장치와 보컬 체인을 확인한 뒤, 오디오 시작을 누르세요.",
+                    "새 Scene으로 시작하세요".to_owned(),
+                    "장치를 선택해 새 Scene을 만들거나, 저장한 파일을 열어 주세요.",
                 )
             };
             return panel()
@@ -935,7 +1061,9 @@ impl Render for MixLive {
             .flex()
             .flex_col()
             .gap_6();
-        if let Some(error) = &self.session.error {
+        if let Some(error) = &self.session.error
+            && self.form.is_none()
+        {
             body = body.child(
                 panel()
                     .border_color(rgb(DANGER))
@@ -949,12 +1077,18 @@ impl Render for MixLive {
                     .child(div().text_sm().child(error.clone())),
             );
         }
-        body = body.child(self.scene_summary());
-        if self.session.running() {
-            body = body.child(self.mixer(cx));
-        }
-        if self.busy.is_none() && (self.session.scene().is_some() || self.session.error.is_some()) {
-            body = body.child(self.diagnostics(cx));
+        if let Some(form) = &self.form {
+            body = body.child(form.clone());
+        } else {
+            body = body.child(self.scene_summary());
+            if self.session.running() {
+                body = body.child(self.mixer(cx));
+            }
+            if self.busy.is_none()
+                && (self.session.scene().is_some() || self.session.error.is_some())
+            {
+                body = body.child(self.diagnostics(cx));
+            }
         }
         div().size_full().flex().flex_col().bg(rgb(BACKGROUND)).text_color(rgb(TEXT))
             .font_family("Malgun Gothic").text_sm()
@@ -995,7 +1129,7 @@ fn mix_name(mix: RouteMix) -> &'static str {
     }
 }
 
-fn panel() -> Div {
+pub(crate) fn panel() -> Div {
     div()
         .flex_shrink_0()
         .flex()
@@ -1007,7 +1141,7 @@ fn panel() -> Div {
         .bg(rgb(SURFACE))
 }
 
-fn section_title(number: &'static str, title: &'static str) -> Div {
+pub(crate) fn section_title(number: &'static str, title: &'static str) -> Div {
     div()
         .flex()
         .items_center()
@@ -1050,8 +1184,9 @@ fn detail_text(label: &'static str, text: &str) -> Div {
         .child(div().text_xs().child(text.to_owned()))
 }
 
-fn button(id: &'static str, label: &'static str, primary: bool) -> Button {
+pub(crate) fn button(id: &'static str, label: &'static str, primary: bool) -> Button {
     Button::new(id)
+        .accessibility_label(label)
         .child(label)
         .h(px(38.))
         .px_4()

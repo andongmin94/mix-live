@@ -68,8 +68,36 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-plugins.exe edit --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Open and close the native screen without devices or plugins
+      - name: Check native New Scene validation without opening audio or plugins
+        shell: powershell
+        timeout-minutes: 2
+        env:
+          # Preserve Unicode labels when the generated script is read by Windows PowerShell 5.1.
+          MIXLIVE_UI_NEW: '새 Scene'
+          MIXLIVE_UI_START: '오디오 시작'
+          MIXLIVE_UI_SAVE: '새 Scene 파일로 저장'
+          MIXLIVE_UI_CANCEL: '새 Scene 취소'
+          MIXLIVE_UI_MIC: '내 목소리 · 필수'
+          MIXLIVE_UI_OUTPUT: '주 출력 · 필수'
+          MIXLIVE_UI_REQUIRED: '내 목소리 입력 장치를 선택하세요.'
         run: |
+          Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+          function Find-UiName([string]$name) {
+            $condition = [System.Windows.Automation.PropertyCondition]::new(
+              [System.Windows.Automation.AutomationElement]::NameProperty, $name)
+            $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+          }
+          function Wait-UiName([string]$name, [switch]$Enabled) {
+            $limit = [DateTime]::UtcNow.AddSeconds(10)
+            do {
+              $app.Refresh()
+              if ($app.HasExited) { throw "MixLive exited while waiting for a control: $($app.ExitCode)" }
+              $element = Find-UiName $name
+              if ($null -ne $element -and (!$Enabled -or $element.Current.IsEnabled)) { return $element }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $limit)
+            throw "MixLive did not expose the expected control: $name"
+          }
           $app = Start-Process ./target/release/mixlive.exe -PassThru
           try {
             $deadline = [DateTime]::UtcNow.AddSeconds(20)
@@ -79,9 +107,39 @@ jobs:
             } while (!$app.HasExited -and $app.MainWindowHandle -eq 0 -and [DateTime]::UtcNow -lt $deadline)
             if ($app.HasExited) { throw "MixLive exited before opening its window: $($app.ExitCode)" }
             if ($app.MainWindowHandle -eq 0) { throw 'MixLive did not open its native window' }
+            $window = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindowHandle)
+            $new = Wait-UiName $env:MIXLIVE_UI_NEW -Enabled
+            $start = Wait-UiName $env:MIXLIVE_UI_START
+            if ($start.Current.IsEnabled) { throw 'Audio start must be disabled without a saved Scene' }
+            ([System.Windows.Automation.InvokePattern]$new.GetCurrentPattern(
+              [System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+            $save = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
+            $cancel = Wait-UiName $env:MIXLIVE_UI_CANCEL -Enabled
+            foreach ($label in @($env:MIXLIVE_UI_MIC, $env:MIXLIVE_UI_OUTPUT)) {
+              $select = Wait-UiName $label
+              if ($select.Current.ControlType -ne [System.Windows.Automation.ControlType]::ComboBox) {
+                throw "A required device control is not a native-accessible select: $label"
+              }
+              $value = $select.GetCurrentPropertyValue([System.Windows.Automation.ValuePattern]::ValueProperty, $true)
+              if ($value -ne [System.Windows.Automation.AutomationElement]::NotSupported -and
+                  ![string]::IsNullOrEmpty([string]$value)) {
+                throw "A required device was selected automatically: $label"
+              }
+            }
+            ([System.Windows.Automation.InvokePattern]$save.GetCurrentPattern(
+              [System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+            $null = Wait-UiName $env:MIXLIVE_UI_REQUIRED
+            $cancel = Wait-UiName $env:MIXLIVE_UI_CANCEL -Enabled
+            ([System.Windows.Automation.InvokePattern]$cancel.GetCurrentPattern(
+              [System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+            $null = Wait-UiName $env:MIXLIVE_UI_NEW -Enabled
+            if ($null -ne (Find-UiName $env:MIXLIVE_UI_SAVE)) { throw 'New Scene form remained after cancelling' }
+            $start = Wait-UiName $env:MIXLIVE_UI_START
+            if ($start.Current.IsEnabled) { throw 'Cancelling an unsaved Scene must not enable audio start' }
             if (!$app.CloseMainWindow()) { throw 'MixLive did not accept window close' }
-            if (!$app.WaitForExit(10000)) { throw 'MixLive did not exit after closing the empty screen' }
+            if (!$app.WaitForExit(10000)) { throw 'MixLive did not exit after closing the screen' }
             if ($app.ExitCode -ne 0) { throw "MixLive exited with code $($app.ExitCode)" }
+            Write-Output 'Native New Scene form, required-device validation, cancel and normal exit passed.'
           } finally {
             if (!$app.HasExited) { Stop-Process -Id $app.Id -Force }
           }

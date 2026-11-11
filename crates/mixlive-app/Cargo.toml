@@ -8,9 +8,10 @@ publish.workspace = true
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
+mixlive-audio-windows = { path = "../mixlive-audio-windows" }
+mixlive-effects = { path = "../mixlive-effects" }
 
 [target.'cfg(windows)'.dependencies]
-mixlive-audio-windows = { path = "../mixlive-audio-windows" }
 gpui = { package = "gpui-pre", version = "=0.3.11" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", default-features = false }
 gpui-design = { git = "https://github.com/andongmin94/gpui-design", rev = "385b0178fbbaa3d30de79fe04329aab62a257dc0" }

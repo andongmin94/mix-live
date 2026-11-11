@@ -36,7 +36,23 @@ cargo build --release -p mixlive-app -p mixlive-audio-windows -p mixlive-vst3 --
 
 ### 네이티브 Scene 화면
 
-`mixlive.exe`에서 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작** 순서로 실행한다.
+`mixlive.exe`에서 **새 Scene → 장치 선택 → 새 파일로 저장 → 오디오 시작** 순서로 시작할 수 있다.
+마이크와 주 출력은 직접 선택하며, AUX/MR 녹음 장치와 추가 송출 재생 장치는 선택 사항이다.
+목록은 실제 WASAPI endpoint 이름·ID·기본 채널/샘플레이트/형식을 표시한다. 같은 이름이어도
+ID로 구분하며, 사용할 수 없는 설정은 이유를 표시한다. 장치를 연결한 뒤에는 새 Scene을 다시
+열어 목록을 조회한다. 조회는 스트림을 만들지 않고 시스템 기본 장치를 바꾸지 않는다.
+
+채널 입력은 마이크 한 개, 나머지는 mono 한 개 또는 좌/우 두 개(`1` 또는 `1,2`)다.
+선택한 장치가 mono이면 `1`, 그 외 출력/AUX에는 `1,2`를 제안한다. 실제 endpoint 범위를 넘거나
+같은 endpoint의 mic/AUX 또는 output/send 채널이 겹치면 저장 전에 거절한다.
+AUX를 추가 송출로 보내려면 해당 출력 장치도 선택해야 한다.
+
+내장 보정 `off/natural/warm/bright`를 고를 수 있으며, 새 Scene의 초기값은 출력 −18 dB,
+AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. VST3는 포함하지 않는다.
+저장은 기존 schema 3의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
+이전 Scene 선택을 유지한다. 장치와 현재 설정은 실제 시작 때 다시 검사한다.
+
+기존 체인은 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작**으로 실행한다.
 파일 경로를 `mixlive.exe singing.mixlive-scene.json`으로 전달해도 읽기만 하며 자동으로 시작하지 않는다.
 시작할 때 기존 장치/채널 검증과 VST3 로딩을 수행한다. Scene의 실제 DLL과 장치가 필요하며,
 누락되면 오류를 표시하고 시작하지 않는다. 다른 장치나 원음 경로로 바꾸지 않는다.
@@ -53,13 +69,13 @@ cargo build --release -p mixlive-app -p mixlive-audio-windows -p mixlive-vst3 --
 GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 crash/hang은 여전히 격리되지 않는다.
 명시적으로 정지하거나 오류가 나기 전까지 실행하며 CLI의 실행 시간 제한은 적용하지 않는다.
 
-이 첫 화면은 기존 Scene을 실행한다. Scene 생성과 장치 ID 확인은 아래 CLI를 사용한다.
-장치 선택 마법사, 화면에서 보컬 설정/체인 편집, 원본 plugin editor, 실행 상태 저장은 아직 없다.
+화면에서 기존 Scene의 보컬 세부 설정/체인을 편집하거나 원본 plugin editor를 여는 기능,
+전체 실행 상태 저장은 아직 없다. VST3 체인은 아래 CLI에서 만든 Scene으로 불러온다.
 음소거·음량·경로 변경은 이번 실행에만 적용되며 다시 시작하면 파일의 설정을 사용한다.
 표시된 endpoint 채널은 WASAPI 채널이고, 신고된 queue/plugin 지연은 실측 왕복 지연이 아니다.
 
 GPUI Design은 [고정 revision](https://github.com/andongmin94/gpui-design/tree/385b0178fbbaa3d30de79fe04329aab62a257dc0)의
-Button/Switch/Slider/Root를 재사용하고 GPUI engine family 0.3.11을 사용한다.
+Button/Switch/Slider/Select/Input/Root를 재사용하고 GPUI engine family 0.3.11을 사용한다.
 
 ### 장치 확인과 Scene 생성용 CLI
 

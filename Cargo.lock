@@ -3099,6 +3099,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "mixlive-audio-windows",
+ "mixlive-effects",
  "tempfile",
 ]
 

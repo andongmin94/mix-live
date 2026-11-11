@@ -1,5 +1,5 @@
 //! One UI-owned session. All native calls stay on GPUI's foreground/loading thread.
-//! Scene reads do not resolve endpoints or load plugins. No scene/state files are rewritten.
+//! Scene reads/writes do not resolve endpoints or load plugins. Existing files are never replaced.
 
 use mixlive_audio_windows::{
     control::{LiveCommand, LiveControls},
@@ -29,7 +29,7 @@ impl Default for Session {
             loaded: None,
             active: None,
             last_report: Instant::now(),
-            message: "Scene을 열어 시작 설정을 확인하세요.".into(),
+            message: "새 Scene을 만들거나 파일을 열어 시작 설정을 확인하세요.".into(),
             error: None,
             device_details: String::new(),
             timing: Vec::new(),
@@ -83,6 +83,30 @@ impl Session {
             }
             Err(error) => self.fail("Scene을 열지 못했습니다.", error),
         }
+    }
+
+    /// Save an explicit startup configuration, then select it without opening devices or plugins.
+    /// Failure leaves the previously loaded Scene intact; save_new never overwrites a file.
+    pub fn save_new(&mut self, path: PathBuf, scene: AudioScene) -> Result<(), String> {
+        if self.running() {
+            return self.fail(
+                "Scene을 만들려면 먼저 정지하세요.",
+                "audio is still running",
+            );
+        }
+        if let Err(error) = scene.save_new(&path) {
+            return self.fail(
+                "새 Scene을 저장하지 못했습니다. 다른 파일 이름을 선택하세요.",
+                error,
+            );
+        }
+        self.loaded = Some((path, scene));
+        self.error = None;
+        self.device_details.clear();
+        self.timing.clear();
+        self.report.clear();
+        self.message = "새 Scene을 저장했습니다. 설정을 확인한 뒤 오디오 시작을 누르세요.".into();
+        Ok(())
     }
 
     /// Call outside a mutable GPUI app/entity update: COM/native loading may dispatch messages.
@@ -259,6 +283,54 @@ mod tests {
         );
         assert!(session.controls().is_none());
         session.stop().unwrap();
+        assert!(!session.running());
+    }
+
+    #[test]
+    fn saving_selects_a_new_scene_without_starting_and_collision_keeps_the_previous_scene() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("new.mixlive-scene.json");
+        let cli = Cli::parse_from([
+            "mixlive-audio",
+            "check",
+            "--input",
+            "absent-mic",
+            "--output",
+            "absent-output",
+        ]);
+        let Command::Check(route) = cli.command else {
+            panic!("expected route")
+        };
+        let mut session = Session::default();
+        session
+            .save_new(
+                path.clone(),
+                AudioScene::new(route.clone(), vec![]).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(session.path(), Some(path.as_path()));
+        assert_eq!(session.scene().unwrap().route, route);
+        assert!(!session.running());
+        assert!(session.controls().is_none());
+        assert!(session.device_details.is_empty());
+        let original = std::fs::read(&path).unwrap();
+
+        let occupied = directory.path().join("existing.json");
+        std::fs::write(&occupied, b"do not replace").unwrap();
+        let mut different = route.clone();
+        different.input = "different-absent-mic".into();
+        assert!(
+            session
+                .save_new(
+                    occupied.clone(),
+                    AudioScene::new(different, vec![]).unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"do not replace");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(session.path(), Some(path.as_path()));
+        assert_eq!(session.scene().unwrap().route, route);
         assert!(!session.running());
     }
 }

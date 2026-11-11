@@ -3,6 +3,10 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+#[cfg(any(windows, test))]
+mod draft;
+#[cfg(windows)]
+mod form;
 #[cfg(windows)]
 mod session;
 #[cfg(windows)]

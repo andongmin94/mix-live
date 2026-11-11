@@ -2,18 +2,52 @@
 use std::{error::Error, sync::{Arc, atomic::Ordering}};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use mixlive_effects::VocalChain;
+use crate::devices::{DeviceCatalog, DeviceConfig, DeviceInfo};
 use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, output_sample}, control::{LiveControls, PlaybackGains}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-pub fn list_devices() -> Result<Vec<String>> {
+/// Query endpoint IDs and default configurations without choosing a default device or
+/// creating audio streams. A per-device configuration error remains in the catalog.
+pub fn device_catalog() -> Result<DeviceCatalog> {
     let host = cpal::host_from_id(cpal::HostId::Wasapi)?;
-    let mut rows = Vec::new();
+    let mut catalog = DeviceCatalog::default();
     for device in host.input_devices()? {
-        rows.push(format!("INPUT  {device}\n  id: {}\n  default: {:?}", device.id()?, device.default_input_config()));
+        catalog.inputs.push(device_info(&device, device.default_input_config())?);
     }
     for device in host.output_devices()? {
-        rows.push(format!("OUTPUT {device}\n  id: {}\n  default: {:?}", device.id()?, device.default_output_config()));
+        catalog.outputs.push(device_info(&device, device.default_output_config())?);
+    }
+    Ok(catalog)
+}
+
+fn device_info(device: &Device, config: std::result::Result<SupportedStreamConfig, cpal::Error>) -> Result<DeviceInfo> {
+    let config = config.map_err(|error| error.to_string()).and_then(|config| {
+        validate_config(&config).map_err(|error| error.to_string())?;
+        Ok(DeviceConfig {
+            channels: config.channels(),
+            sample_rate: config.sample_rate(),
+            sample_format: config.sample_format().to_string(),
+        })
+    });
+    Ok(DeviceInfo {
+        id: device.id()?.to_string(),
+        name: device.description()?.name().to_owned(),
+        config,
+    })
+}
+
+pub fn list_devices() -> Result<Vec<String>> {
+    let catalog = device_catalog()?;
+    let mut rows = Vec::new();
+    for (direction, devices) in [("INPUT ", catalog.inputs), ("OUTPUT", catalog.outputs)] {
+        for device in devices {
+            let config = match device.config {
+                Ok(config) => format!("{} channels, {} Hz, {}", config.channels, config.sample_rate, config.sample_format),
+                Err(error) => format!("unavailable: {error}"),
+            };
+            rows.push(format!("{direction} {}\n  id: {}\n  default: {config}", device.name, device.id));
+        }
     }
     Ok(rows)
 }
