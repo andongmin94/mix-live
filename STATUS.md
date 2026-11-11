@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-11
-단계: **GPUI 장치 선택·새 Scene 저장 구현, Windows 통합 검증 대기**
+단계: **GPUI 장치 선택·새 Scene 저장 구현, Windows 검증·개발 빌드 완료**
 
 ## 현재 구현
 
@@ -28,18 +28,33 @@
 
 ## 검증
 
-이번 변경의 로컬 `cargo test -p mixlive-app --locked`: **6 passed**.
-정확한 ID/방향, 기본값 일치, 실제 채널 범위/겹침, AUX 목적지, 보컬 sample rate,
-새 Scene 저장/재열기를 검사했다. 실제 장치/DLL을 열지 않았다.
-로컬 Windows MSVC 대상 앱/오디오 all-targets Clippy(`-D warnings`)도 통과했다.
-기존 단일 Windows Actions에서 workspace/native fixture/Clippy/release를 통합 검증한다.
-GUI smoke는 실제 UIAutomation으로 새 Scene 열기, 장치 미선택 오류, 취소, 정상 종료를 확인한다.
-새 Session 검사는 장치 없는 저장/선택, 파일 충돌 시 파일·이전 선택 보존, 자동 시작 없음을 확인한다.
+코드: `48a90d7836a38058ba2c02a71227827b919ed0cc`.
+[Audio #19](https://github.com/andongmin94/mix-live/actions/runs/42995739629),
+Windows job `130439273717`: 모든 단계 success.
 
-이전 배포 코드 `9421b5d03baff0085ff126977298a1f33bfc0d0e`는
-[Audio #18](https://github.com/andongmin94/mix-live/actions/runs/42979977368)에서 Windows 검사
-72개, Clippy, release 실행 파일 3개, 빈 GUI 창 생성/닫기가 통과했다. 이번 변경의 결과는
-해당 코드 commit의 Actions 완료 후 이 파일에 기록한다.
+| 검사 | 결과 |
+|---|---|
+| Windows `cargo test --workspace --locked` | app 9 + audio lib 30 + audio CLI 3 + Scene CLI 3 + core 10 + effects 7 + plugins 7 = 69 passed |
+| 기존 native VST3 fixture 별도 검사 | chain/worker/state 3 + editor 2 + loading/state 2 + WAV 2 = 9 passed |
+| Windows Clippy all-targets, warnings denied | 통과 |
+| Windows release 실행 파일 | `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe` 빌드 성공 |
+| 기존 CLI 도움말 실행 | 통과 |
+| Windows 실제 GUI 조작 | UIAutomation으로 새 Scene 열기 → 필수 장치 미선택 오류 → 취소 → 정상 종료 코드 0 확인 |
+
+Windows tests 총 **78 passed, 0 failed**. 새 검사는 정확한 ID/방향, CLI 기본값 일치,
+실제 채널 범위/겹침, AUX 목적지, 보컬 sample rate, schema 3 저장/재열기, 저장 충돌 시
+파일·이전 선택 보존을 확인한다. GUI 검사는 장치를 자동 선택하지 않음, 저장 전/취소 후
+시작 비활성, 접근성 오류 표시를 확인했다. 실제 장치 선택·유효 파일 저장 대화상자·오디오
+시작의 전체 클릭 시나리오는 미검증이다. 장치 스트림이나 상용 플러그인을 열지 않았다.
+
+로컬 Linux/Rust 1.99.1: 앱 관련 검사 **6 passed**, Windows MSVC 대상 앱/오디오
+all-targets Clippy(`-D warnings`) 통과. 실제 Windows 실행은 위 Actions가 근거다.
+
+[개발 artifact 13844192589](https://github.com/andongmin94/mix-live/actions/runs/42995739629/artifacts/13844192589)를
+내려받아 ZIP SHA256/CRC, 파일 9개, 실행 파일 3개의 x64 PE header를 확인했다.
+SHA256 `9beb600a868d756768216cef329cbbd40fc03b2d413c8f4bb411afe0046c757d` — Actions digest와 일치.
+공식 릴리스가 아닌 7일 보관 개발 artifact다. 검증 기록만 바꾸는 후속 commit은 코드를
+바꾸지 않으므로 통과한 CI를 반복하지 않는다.
 
 ## 남은 작업과 제한
 
