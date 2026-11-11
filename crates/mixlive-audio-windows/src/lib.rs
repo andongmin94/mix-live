@@ -4,5 +4,6 @@
 pub mod bridge;
 pub mod capture;
 pub mod config;
+pub mod scene;
 #[cfg(windows)]
 pub mod windows;

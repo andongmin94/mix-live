@@ -104,3 +104,9 @@ DEALINGS IN THE SOFTWARE.
 - winapi 0.3.9 (MIT OR Apache-2.0): https://docs.rs/crate/winapi/0.3.9
   기존 전이 의존성을 직접 선언하며 버전·checksum은 바꾸지 않았다. Win32 MSG와
   PeekMessageW/TranslateMessage/DispatchMessageW를 통한 메인 스레드 메시지 처리에만 쓴다.
+
+## 장치 Scene 파일
+
+- 기존 serde/serde_json과 tempfile 의존성을 장치 CLI에서도 직접 사용한다.
+  JSON 직렬화와 완성된 새 파일 게시를 재사용하며 새 패키지·버전·checksum은 추가하지 않는다.
+  DSP crate에는 직렬화 의존성을 넣지 않는다.

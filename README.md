@@ -31,7 +31,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
   및 상태 저장/복원. `mixlive-audio`의 callback과 별개다.
 
 **미구현:** ASIO, 앱별 캡처, 자체 가상 장치, VST3 라이브 연결,
-reverb/delay, pitch correction, GPUI 화면, Scene 저장, 실행 중 설정 변경.
+reverb/delay, pitch correction, GPUI 화면, 앱/VST3까지 포함한 전체 Scene, 실행 중 설정 변경.
 출력 clipping guard는 전문 리미터가 아니다.
 
 ## Windows에서 사용
@@ -91,6 +91,34 @@ gain reduction이다. blend 강도를 낮추면 이 값은 wet 경로의 억제�
 mono 출력은 `--output-channels 1`. 장치 기본 샘플레이트와 포맷으로 연다.
 `--queue-ms` 기본 30은 queue 목표이지 드라이버 버퍼나 왕복 지연이 아니다.
 `run`은 기본 30초 후 끝나며 최대 `--seconds 3600`. 음성 녹음 파일은 만들지 않는다.
+
+## 마이크 경로를 Scene으로 저장·재실행
+
+현재 마이크 입력, 채널, 헤드폰/송출 endpoint, 각 음량, 내장 보컬 프리셋·threshold·강도,
+queue 목표를 하나의 로컬 JSON으로 저장한다. `scene save`는 파일만 만들고, `scene show`는
+파일 형식과 값을 검사해 출력한다. 이 두 명령은 장치를 조회하거나 마이크를 시작하지 않는다.
+
+```powershell
+.\target\release\mixlive-audio.exe scene save singing.mixlive-scene.json --input "<INPUT ID>" --output "<OUTPUT ID>" --vocal natural --output-gain-db -18
+.\target\release\mixlive-audio.exe scene show singing.mixlive-scene.json
+.\target\release\mixlive-audio.exe scene check singing.mixlive-scene.json
+.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --seconds 30
+```
+
+`save`에는 기존 `check/run`과 동일한 route 옵션을 사용한다. 두 출력도 저장하려면
+`--send "<별도 OUTPUT ID>" --send-channels 1,2 --send-gain-db -6`을 함께 지정한다.
+기존 파일은 덮어쓰지 않으며 다른 이름으로 저장한다. `schema: 1`만 읽고 구식 포맷 변환이나
+누락된 필수 값의 기본값 복원은 하지 않는다. 오타·중복 채널·허용 범위 밖 음량은 거절한다.
+
+`scene check`는 **현재** Windows 장치와 채널·포맷을 다시 확인하되 스트림은 시작하지 않는다.
+`scene run`도 같은 확인을 거쳐야 시작한다. 저장한 장치가 없어졌다고 기본 마이크로 바꾸지 않는다.
+샘플레이트/포맷은 저장 당시 값으로 강제하지 않고 선택한 endpoint의 현재 기본 구성을 사용한다.
+실행 시간은 Scene에 저장하지 않으며 매번 기본 30초, `--seconds` 범위는 1..3600이다.
+
+이것은 현재 구현된 **마이크 하나·출력 1~2개의 장치/보컬 Scene**이다. 앱별 소스,
+외부 VST3 상태, 임의 라우팅 그래프 또는 실행 중 Scene 전환을 구현했다고 의미하지 않는다.
+음성은 저장하지 않는다. Scene에는 개인 endpoint ID가 있으므로 공유하지 않는 것이 좋고,
+문서의 `*.mixlive-scene.json` 확장자는 `.gitignore`로 제외한다.
 
 ## 사용자 VST3 검사·편집
 

@@ -12,6 +12,9 @@ mixlive-effects = { path = "../mixlive-effects" }
 rtrb = "=0.4.0"
 rubato = { version = "=5.0.1", default-features = false }
 clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
 cpal = "=0.18.2"

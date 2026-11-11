@@ -1,5 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use mixlive_effects::{Preset, VocalConfig};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "mixlive-audio", version, about = "MixLive development audio path (WASAPI, not a finished broadcast app)")]
@@ -14,6 +16,11 @@ pub enum Command {
     Devices,
     /// Validate devices, channels and vocal settings. Does not capture or play sound.
     Check(RouteOptions),
+    /// Save, inspect, validate or run a device/vocal scene. Loading alone never starts audio.
+    Scene {
+        #[command(subcommand)]
+        command: SceneCommand,
+    },
     /// Capture a mic, optionally process its voice, and route it. Use headphones at low volume.
     Run {
         #[command(flatten)]
@@ -24,7 +31,28 @@ pub enum Command {
     },
 }
 
-#[derive(Args, Clone, Debug)]
+#[derive(Subcommand, Debug)]
+pub enum SceneCommand {
+    /// Save settings to a NEW JSON file. Does not open or verify audio devices.
+    Save {
+        file: PathBuf,
+        #[command(flatten)]
+        route: RouteOptions,
+    },
+    /// Read and validate saved settings, then print JSON. Does not open audio devices.
+    Show { file: PathBuf },
+    /// Resolve the saved device IDs and channel configuration without starting streams.
+    Check { file: PathBuf },
+    /// Recheck the saved devices, then explicitly start this route. Use headphones at low volume.
+    Run {
+        file: PathBuf,
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        seconds: u64,
+    },
+}
+
+#[derive(Args, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouteOptions {
     /// Exact capture endpoint ID printed by devices, not its display name.
     #[arg(long)]
@@ -54,6 +82,7 @@ pub struct RouteOptions {
     pub send_gain_db: f32,
     /// Vocal starting point: off, natural, warm or bright. No pitch correction or reverb yet.
     #[arg(long, default_value_t = Preset::Off)]
+    #[serde(with = "preset_serde")]
     pub vocal: Preset,
     /// Dry/processed blend (0..1), not loudness matching. Fixed for this run.
     #[arg(long, default_value = "1")]
@@ -75,9 +104,16 @@ impl RouteOptions {
             compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db }
     }
     pub fn validate(&self) -> Result<(), String> {
-        if self.input.is_empty() || self.output.is_empty() || self.input_channel == 0 {
+        if self.input.trim().is_empty() || self.output.trim().is_empty() || self.input_channel == 0 {
             return Err("explicit endpoint IDs and a one-based input channel are required".into());
         }
+        if self.send.as_ref().is_some_and(|id| id.trim().is_empty()) {
+            return Err("send endpoint ID must not be blank".into());
+        }
+        // File-based settings do not pass through clap. Check channel shape here;
+        // Prepared::new checks the actual device's channel count before opening streams.
+        OutputMap::new(&self.output_channels, u16::MAX)?;
+        OutputMap::new(&self.send_channels, u16::MAX)?;
         if self.send.as_deref() == Some(self.output.as_str()) {
             return Err("output and send must be distinct endpoints; two streams on one endpoint are not supported yet".into());
         }
@@ -89,6 +125,20 @@ impl RouteOptions {
         }
         if !(10..=100).contains(&self.queue_ms) { return Err("queue-ms must be in 10..=100".into()); }
         Ok(())
+    }
+}
+
+// Persist the existing preset names without making the DSP crate depend on file formats.
+mod preset_serde {
+    use mixlive_effects::Preset;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Preset, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Preset, D::Error> {
+        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
     }
 }
 

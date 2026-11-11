@@ -530,6 +530,9 @@ dependencies = [
  "mixlive-effects",
  "rtrb 0.4.0",
  "rubato",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
