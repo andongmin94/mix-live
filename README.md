@@ -9,7 +9,7 @@ ASIO·앱별 직접 캡처는 아직 없다. 실제 검증 결과와 미검증 �
 ## 현재 처리 경로
 
 ```text
-마이크 → 입력 trim → 내장 보컬 보정 → 선택적 stereo VST3 하나 → 목적지별 보내기 ─┐
+마이크 → 입력 trim → 내장 보컬 보정 → 순서대로 연결한 stereo VST3 체인 → 목적지별 보내기 ─┐
 AUX/MR → 필요 시 입력 clock bridge → AUX trim → 목적지별 보내기 ─────────────┴→ 믹스
 믹스 → 출력 clock bridge → master/send 음량·mute → sample clipping guard → 출력 장치
 ```
@@ -18,8 +18,8 @@ AUX/MR → 필요 시 입력 clock bridge → AUX trim → 목적지별 보내�
 동일 endpoint의 분리 채널은 하나의 스트림/클럭을 공유하며 별도 장치는 bounded queue와
 Rubato sinc resampler로 연결한다. 오류 시 임의 장치 선택이나 원음 마이크 우회는 하지 않는다.
 
-VST3를 선택하면 장치 callback은 mic/AUX 프레임을 함께 bounded queue로 보낸다. 전용 worker가
-내장 보컬→VST3→믹싱을 수행한다. 로딩·editor·state·종료는 main/제어 스레드에서 한다.
+VST3를 선택하면 장치 callback은 mic/AUX 프레임을 함께 bounded queue로 보낸다. 체인 전체의 전용 worker 하나가
+내장 보컬→VST3 체인→믹싱을 수행한다. 플러그인마다 스레드나 오디오 queue를 추가하지 않는다. 로딩·editor·state·종료는 main/제어 스레드에서 한다.
 호스트 내부 및 editor/control과의 mutex 공유는 남아 있으므로 **hard-real-time/무중단 보장은 없다.**
 VST3 미선택 시 기존 직접 처리 경로를 사용한다. 처리 순서·품질 목표는 [DESIGN.md](DESIGN.md)에 있다.
 
@@ -134,38 +134,70 @@ queue 뒤에 적용하고 mute 중에도 queue를 소비한다. 이미 OS에 보
 gain/route는 약 5 ms sample ramp를 사용한다. 전체 응답시간 보장이 아니며 설정은 현재 실행만
 바꾼다. EOF도 종료 요청이다. `--interactive` 없이 실행하면 지정한 시간까지 동작한다.
 
-## VST3를 실시간 보컬에 적용하고 조절하기
+## 여러 VST3를 순서대로 연결하고 조절하기
+
+`--vst3`를 처리 순서대로 반복한다. 각 슬롯은 **단일 active stereo 입출력 버스**의 effect다.
+마이크에 내장 보정→1번→2번→…을 한 번만 적용하고 그 결과를 각 믹스에 보낸다. AUX는 체인 전체를
+우회한다. 같은 DLL을 두 번 지정해도 서로 다른 인스턴스/상태를 만든다. 중간 결과의 좌우를
+다음 슬롯에 그대로 넘기며 mono로 다시 합치지 않는다. sidechain/multibus는 조용히 생략하지 않는다.
 
 ```powershell
-.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --vst3 "C:\Plugins\Example.vst3" --vst3-editor --vst3-state-out edited.mixlive-vst3.json --interactive --seconds 3600
+.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json `
+  --vst3 "C:\Plugins\EQ.vst3" --vst3 "C:\Plugins\Compressor.vst3" --vst3 "C:\Plugins\Reverb.vst3" `
+  --vst3-editor 1 --vst3-editor 3 --vst3-chain-out voice.mixlive-chain.json `
+  --interactive --seconds 3600
 ```
 
-`--vst3`는 **단일 active stereo 입출력 버스의 effect 하나**만 받는다. sidechain/multibus를
-조용히 생략하지 않는다. `--vst3-class`는 32자리 audio class ID, `--vst3-state`는 기존
-MixLive VST3 상태 파일이다. 직접 run과 scene run에만 허용하며 클래스 불일치는 거절한다.
-마이크의 내장 보정 뒤에 한 번 적용하고 stereo 결과를 믹스별로 보낸다. AUX는 우회한다.
+`--vst3-editor 1`은 **1번 슬롯의 실제 라이브 인스턴스** 원본 창을 연다. 원하는 슬롯마다
+반복한다. 창 하나를 닫아도 체인과 다른 창은 유지된다. 창 다시 열기는 아직 없다. 없는 번호,
+중복 번호, 편집창이 없는 슬롯 또는 열기 실패는 오디오 스트림 시작 전에 거절한다.
 
-`--vst3-editor`는 현재 마이크를 처리하는 **같은 인스턴스**의 원본 창을 연다. 별도 오프라인
-편집 인스턴스가 아니다. 일반 노브 변경은 기존 호스트의 editor→processor 전달 경로를 따른다.
-창 닫기는 editor만 분리하고 송출은 계속한다. 현재 실행에서 창 다시 열기는 미구현이다.
-명시적으로 요청한 편집창이 없거나 열기 실패 시 스트림을 시작하지 않는다.
+`--vst3-chain-out`을 지정한 정상 종료에서만 **모든 슬롯의 순서·절대 경로·class ID·opaque state**를
+하나의 새 파일에 저장한다. 입력/출력 중지→worker join→모든 editor 제거→마지막 편집 flush→각
+plugin processing stop→state 취득→모든 native 해제→파일 게시 순서다. 어느 슬롯이든 실패하면
+부분 체인 파일을 만들지 않는다. 기존 파일은 보존하고 오류·restart·암묵적 Drop에서는 저장하지 않는다.
+상태 취득 중 하나가 실패해도 나머지 슬롯의 종료를 수행한다. 생략하면 변경은 현재 실행에만 남는다.
 
-`--vst3-state-out`을 지정한 경우에만 정상 종료 후 **새 파일**에 설정을 저장한다.
-입출력 중지→worker join→editor 제거→최종 parameter flush→processing stop→상태 취득→
-native 해제→파일 저장 순서다. 기존 파일은 보존하고 오류·restart·강제 종료에서는 저장하지 않는다.
-생략하면 변경은 현재 실행에만 남는다. 다음 실행에서 `--vst3-state edited.mixlive-vst3.json`으로
-불러온다. 플러그인 바이너리나 사용자 음성을 파일에 담지 않는다.
+다음 실행은 긴 플러그인 목록 대신 저장한 체인을 선택한다.
 
-**현재는 모든 plugin restart 요청을 중단 사유로 처리한다.** oversampling·bus·latency 변경은
-물론 일부 preset/parameter 갱신도 중단될 수 있다. 자동 재구성이나 dry 우회는 하지 않는다.
-메시지 펌프는 plugin mutex를 잡지 않은 main 스레드에서 실행한다. 그 뒤의 제어·창 API는
-worker와 mutex를 공유하므로 GUI 조작 중 dropout 없는 hard-real-time 동작을 보장하지 않는다.
-실제 상용 GUI·DPI·닫힘·MiniFuse 청취 검증은 별도 수용이 필요하다.
+```powershell
+.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json `
+  --vst3-chain voice.mixlive-chain.json --vst3-editor 2 --interactive --seconds 3600
+```
 
-VST3는 in-process native 코드다. crash/hang은 격리되지 않으며 플러그인이 반환하지 않으면
-종료도 기다릴 수 있다. 신뢰하고 적법하게 설치한 플러그인만 사용한다. 입력 queue는
-`--queue-ms`에 따른 **용량 한도**이지 고정 지연이 아니다. 플러그인 신고 지연·worker scheduling·
-출력 queue·OS/장치 지연이 추가되고 플러그인 지연 보상·다중 체인·실행 중 교체는 아직 없다.
+`--vst3` 목록과 `--vst3-chain`은 함께 지정하지 않는다. 수정 결과를 보존하려면 새 이름의
+`--vst3-chain-out voice-edited.mixlive-chain.json`을 추가한다. 체인은 route Scene과 별도 파일이며
+마이크 장치·MR·실시간 경로 변경까지 저장하는 전체 Scene은 아니다. 이 파일에 음성이나 DLL은
+넣지 않는다. 플러그인 경로·상태가 들어가므로 `*.mixlive-chain.json`은 Git에서 제외한다.
+
+특정 audio class를 선택하거나 수동으로 시작 구성을 만들 때는 아래 JSON을 사용할 수 있다.
+`class_id`와 `state`는 생략 가능하지만 state가 있으면 해당 class ID도 반드시 있어야 한다.
+플러그인 상대 경로는 현재 작업 폴더가 아니라 **체인 파일이 있는 폴더**를 기준으로 해석한다.
+정상 실행 후 저장한 파일에는 절대 경로와 확인된 class ID가 들어간다.
+
+```json
+{
+  "schema": 1,
+  "effects": [
+    { "plugin": "plugins/EQ.vst3" },
+    { "plugin": "plugins/Reverb.vst3" }
+  ]
+}
+```
+
+이전 단일 플러그인용 `--vst3-state`, `--vst3-class`, `--vst3-state-out` 경로는 제거했다.
+`--vst3-editor`는 이제 슬롯 번호가 필요하다. 별도 `mixlive-plugins` 도구의 단일 상태 파일은
+그 도구에서 계속 사용하지만, 새 라이브 체인 파일로 자동 변환하지 않는다.
+
+**모든 plugin restart 요청은 중단 사유다.** oversampling·bus·latency뿐 아니라 일부 preset/parameter
+갱신도 중단될 수 있다. 자동 재구성·dry 우회·실행 중 체인 삽입/삭제/순서 변경은 없다.
+메시지는 plugin mutex를 잡지 않은 main 스레드에서 처리한다. 나머지 제어/창 API는 worker와
+mutex를 공유하므로 GUI 조작 중 dropout 없는 hard-real-time 동작을 보장하지 않는다.
+
+체인은 in-process native 코드다. crash/hang은 격리되지 않으며 플러그인이 반환하지 않으면
+종료도 기다릴 수 있다. 신뢰하고 적법하게 설치한 효과만 사용한다. 각 슬롯과 전체 체인의
+**신고 지연 합계**를 표시하지만 실제 왕복 지연 측정이나 지연 보상은 아니다. 입력 queue 용량,
+worker scheduling, 출력 queue, OS/장치 지연은 별도다. 실제 MiniFuse·상용 GUI·청취 수용은 남아 있다.
 
 ## 별도 VST3 검사·파일 도구
 

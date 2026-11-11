@@ -6,6 +6,7 @@
 *.mp3
 *.vstpreset
 *.mixlive-vst3.json
+*.mixlive-chain.json
 *.mixlive-scene.json
 .env
 .env.*
