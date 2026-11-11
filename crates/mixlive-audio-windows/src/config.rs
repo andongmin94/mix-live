@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use mixlive_effects::{Preset, VocalConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ pub enum Command {
         #[command(subcommand)]
         command: SceneCommand,
     },
-    /// Capture a mic, optionally process its voice, and route it. Use headphones at low volume.
+    /// Mix a processed mic with optional AUX audio. Use headphones at low volume.
     Run {
         #[command(flatten)]
         route: RouteOptions,
@@ -51,6 +51,35 @@ pub enum SceneCommand {
     },
 }
 
+/// Which existing mix receives AUX. Send-only avoids replaying MR already heard elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AuxDestination { Output, Send, Both }
+impl AuxDestination {
+    pub fn includes(self, mix: usize) -> bool {
+        match self { Self::Output => mix == 0, Self::Send => mix == 1, Self::Both => mix < 2 }
+    }
+}
+
+/// Selected capture channels. Mono is duplicated; stereo order is preserved, never downmixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputMap { pub left: usize, pub right: usize }
+impl InputMap {
+    pub fn new(channels: &[u16], device_channels: u16) -> Result<Self, String> {
+        if channels.iter().any(|&c| c == 0 || c > device_channels) {
+            return Err(format!("AUX channels must be in 1..={device_channels}"));
+        }
+        match channels {
+            [one] => Ok(Self { left: usize::from(*one - 1), right: usize::from(*one - 1) }),
+            [left, right] if left != right => Ok(Self { left: usize::from(*left - 1), right: usize::from(*right - 1) }),
+            _ => Err("AUX requires one channel or two distinct channels".into()),
+        }
+    }
+    pub fn contains(self, channel: usize) -> bool { self.left == channel || self.right == channel }
+    /// Caller supplies a complete device frame matching the channel count validated at setup.
+    pub fn read<T: Copy>(self, frame: &[T]) -> [T; 2] { [frame[self.left], frame[self.right]] }
+}
+
 #[derive(Args, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteOptions {
@@ -60,6 +89,18 @@ pub struct RouteOptions {
     /// One-based channel within that endpoint's default stream (not an ASIO channel number).
     #[arg(long, default_value_t = 1)]
     pub input_channel: u16,
+    /// Optional capture endpoint carrying MR/line/virtual-cable audio, NOT an app name or playback ID.
+    #[arg(long)]
+    pub aux_input: Option<String>,
+    /// One-based mono channel or stereo pair. May share the mic endpoint on other channels.
+    #[arg(long, value_delimiter = ',', default_value = "1,2")]
+    pub aux_channels: Vec<u16>,
+    /// AUX trim before mixing (-96..0 dB); vocal effects never process this source.
+    #[arg(long, default_value = "-12", allow_hyphen_values = true)]
+    pub aux_gain_db: f32,
+    /// Send-only by default to avoid duplicate monitoring. Send/both require --send.
+    #[arg(long, value_enum, default_value = "send")]
+    pub aux_to: AuxDestination,
     /// Exact playback endpoint ID. Can be headphones or an installed virtual cable's playback end.
     #[arg(long)]
     pub output: String,
@@ -74,7 +115,7 @@ pub struct RouteOptions {
     /// Digital mic trim BEFORE vocal processing (-36..18 dB). Cannot fix input clipping.
     #[arg(long, default_value = "0", allow_hyphen_values = true)]
     pub input_gain_db: f32,
-    /// Final attenuation on BOTH mixes, AFTER vocal processing (-96..0 dB).
+    /// Final attenuation on BOTH mixes, AFTER vocal processing and AUX summing (-96..0 dB).
     #[arg(long, default_value = "-18", allow_hyphen_values = true)]
     pub output_gain_db: f32,
     /// Additional attenuation on the second mix.
@@ -116,6 +157,19 @@ impl RouteOptions {
         let send = OutputMap::new(&self.send_channels, u16::MAX)?;
         if self.send.as_deref() == Some(self.output.as_str()) && output.overlaps(send) {
             return Err("output and send channels must not overlap on the same endpoint".into());
+        }
+        let aux = InputMap::new(&self.aux_channels, u16::MAX)?;
+        if let Some(id) = &self.aux_input {
+            if id.trim().is_empty() { return Err("AUX endpoint ID must not be blank".into()); }
+            if self.aux_to.includes(1) && self.send.is_none() {
+                return Err("AUX destination send/both requires --send; use --aux-to output for one mix".into());
+            }
+            if id == &self.input && aux.contains(usize::from(self.input_channel - 1)) {
+                return Err("microphone and AUX channels must not overlap on the same input endpoint".into());
+            }
+        }
+        if !self.aux_gain_db.is_finite() || !(-96.0..=0.0).contains(&self.aux_gain_db) {
+            return Err("AUX gain must be finite and between -96 and 0 dB".into());
         }
         self.vocal_config().validate().map_err(|e| e.to_string())?;
         for db in [self.output_gain_db, self.send_gain_db] {
@@ -228,4 +282,35 @@ mod tests {
         }
         assert!(OutputMap::new(&[3, 4], 2).is_err());
     }
+    #[test]
+    fn aux_selection_is_explicit_and_shared_capture_cannot_duplicate_the_mic() {
+        let cli = Cli::try_parse_from(["mixlive-audio", "check", "--input", "mic", "--output", "phones", "--aux-input", "mr"]).unwrap();
+        let Command::Check(mut options) = cli.command else { panic!("expected check") };
+        assert_eq!(options.aux_to, AuxDestination::Send);
+        assert!(options.validate().unwrap_err().contains("requires --send"));
+        options.aux_to = AuxDestination::Output;
+        assert!(options.validate().is_ok());
+        options.aux_to = AuxDestination::Both;
+        options.send = Some("call".into());
+        assert!(options.validate().is_ok());
+        options.aux_input = Some("mic".into());
+        assert!(options.validate().unwrap_err().contains("overlap"));
+        options.aux_channels = vec![4, 3];
+        assert!(options.validate().is_ok());
+        let stereo = InputMap::new(&options.aux_channels, 4).unwrap();
+        assert_eq!((stereo.left, stereo.right), (3, 2));
+        assert!(!stereo.contains(0));
+        assert_eq!(stereo.read(&[0.1, 0.2, 0.3, 0.4]), [0.4, 0.3]);
+        assert_eq!(InputMap::new(&[2], 2).unwrap().read(&[0.1, 0.2]), [0.2, 0.2]);
+        assert_eq!(InputMap::new(&[2], 2).unwrap(), InputMap { left: 1, right: 1 });
+        assert!(InputMap::new(&[3, 4], 2).is_err());
+        for channels in [vec![], vec![0], vec![1, 1], vec![1, 2, 3]] {
+            options.aux_channels = channels;
+            assert!(options.validate().is_err());
+        }
+        options.aux_channels = vec![3, 4];
+        options.aux_gain_db = f32::NAN;
+        assert!(options.validate().is_err());
+    }
+
 }

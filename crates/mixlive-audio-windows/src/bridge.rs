@@ -1,4 +1,4 @@
-//! Bounded SPSC transport per playback endpoint. All mixes on one endpoint share a clock.
+//! Bounded SPSC clock transport. Output mixes share a bridge; AUX uses one at its input boundary.
 //! Rubato owns the anti-alias filter; we only steer its ratio from queue occupancy.
 use std::sync::{Arc, atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering}};
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -20,6 +20,7 @@ pub struct Health {
     fault: AtomicU8,
     pub captured_frames: AtomicU64,
     pub input_peak: AtomicU32,
+    pub aux_peak: AtomicU32,
 }
 impl Health {
     pub fn fail(&self, fault: Fault) {
@@ -31,7 +32,7 @@ impl Health {
             0 => None,
             1 => Some("audio device error; streams stopped, no replacement device selected"),
             2 => Some("invalid or non-finite capture samples"),
-            3 => Some("output queue overflow; stopped instead of building unbounded latency"),
+            3 => Some("audio clock queue overflow; stopped instead of building unbounded latency"),
             4 => Some("resampler failed"),
             _ => Some("routing failed"),
         }
@@ -113,8 +114,26 @@ pub fn channel(input_rate: u32, output_rate: u32, queue_ms: u32, mixes: usize, h
 }
 
 impl OutputReader {
-    /// All mixes for ONE endpoint frame. Underrun/fault silences them together.
+    /// All mixes for ONE output frame, with the final sample clipping guard.
     pub fn next_frame(&mut self) -> OutputFrame {
+        let mut frame = self.read_frame();
+        if frame.iter().any(|x| x.abs() > CEILING) {
+            self.stats.clipped_frames.fetch_add(1, Ordering::Relaxed);
+            frame.iter_mut().for_each(|x| *x = x.clamp(-CEILING, CEILING));
+        }
+        let peak = frame.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        self.stats.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
+        frame
+    }
+
+    /// Input-clock boundary for AUX. Preserve float headroom until source gain and mixing.
+    /// Silence on starvation; a latched device/format/overflow error stops the entire route.
+    pub fn next_source_frame(&mut self) -> [f32; 2] {
+        let frame = self.read_frame();
+        [frame[0], frame[1]]
+    }
+
+    fn read_frame(&mut self) -> OutputFrame {
         if self.health.failed() || (self.cursor == self.valid && !self.refill()) { return [0.0; 4]; }
         let mut frame = [0.0; 4];
         let start = self.cursor * self.channels;
@@ -124,12 +143,6 @@ impl OutputReader {
             self.health.fail(Fault::Resampler);
             return [0.0; 4];
         }
-        if frame.iter().any(|x| x.abs() > CEILING) {
-            self.stats.clipped_frames.fetch_add(1, Ordering::Relaxed);
-            frame.iter_mut().for_each(|x| *x = x.clamp(-CEILING, CEILING));
-        }
-        let peak = frame.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-        self.stats.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
         frame
     }
 
@@ -267,4 +280,25 @@ mod tests {
         health.fail(Fault::Device);
         assert_eq!(reader.next_frame(), [0.0; 4]);
     }
+    #[test]
+    fn aux_clock_conversion_preserves_headroom_before_source_attenuation() {
+        let health = Arc::new(Health::default());
+        let (mut writer, mut reader) = channel(44_100, 48_000, 10, 1, health.clone()).unwrap();
+        assert_eq!(reader.next_source_frame(), [0.0; 2]);
+        for _ in 0..reader.target { writer.push([2.0, -1.5, 0.0, 0.0]); }
+        let mut sample = [0.0; 2];
+        for _ in 0..12 {
+            for _ in 0..reader.resampler.input_frames_next() { writer.push([2.0, -1.5, 0.0, 0.0]); }
+            for _ in 0..QUANTUM { sample = reader.next_source_frame(); }
+        }
+        assert!((sample[0] - 2.0).abs() < 0.001 && (sample[1] + 1.5).abs() < 0.001);
+        assert_eq!(reader.stats.clipped_frames.load(Ordering::Relaxed), 0);
+        for _ in 0..reader.target * 3 { reader.next_source_frame(); }
+        assert!(reader.stats.underruns.load(Ordering::Relaxed) > 0);
+        assert_eq!(reader.next_source_frame(), [0.0; 2]);
+        writer.push([f32::NAN, 0.0, 0.0, 0.0]);
+        assert!(health.failed());
+        assert_eq!(reader.next_source_frame(), [0.0; 2]);
+    }
+
 }

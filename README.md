@@ -6,7 +6,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 마이크·반주·게임·통화 소리를 선택적으로 섞고, 입력과 최종 믹스에 내장 보정 및
 사용자가 소유한 VST3를 적용하는 것이 목표다. DAW의 타임라인은 만들지 않는다.
 
-> **현재: 라우팅 코어 + Windows 장치 CLI + 내장 모노 보컬 체인 + 별도 VST3 검사·편집·WAV 도구.**
+> **현재: 라우팅 코어 + Windows 마이크/AUX 믹서 CLI + 내장 모노 보컬 체인 + 별도 VST3 검사·편집·WAV 도구.**
 > VST3 검사는 비실시간이며 아직 마이크 체인에 연결하지 않았다.
 > 완성된 방송 앱·가상 마이크 드라이버가 아니다. 실제 검사와 실장비·청취 미검증 범위는
 > [STATUS.md](STATUS.md)를 따른다.
@@ -15,7 +15,9 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
 
 ```text
 선택한 마이크 → 입력 trim → HPF/EQ → 컴프레서 → 디에서 → 원음/보정 blend
-    → 목적지별 보내기 → 최종 출력 음량 → 출력별 clock bridge → 헤드폰/기존 가상 케이블
+    → 목적지별 보내기 ─┐
+선택적 AUX → AUX trim ─┴→ 믹스 합산 → 최종 출력 음량 → 출력별 clock bridge → 헤드폰/송출
+(AUX가 별도 입력 장치면 먼저 기존 clock bridge로 마이크 처리 클럭에 맞춘다.)
 ```
 
 - `mixlive-core`: mono/stereo, source/send/mix gain, mute, 믹스마이너스.
@@ -23,7 +25,7 @@ MixLive는 Windows용 실시간 오디오 라우팅·믹싱·보정 앱을 만�
   compression, 고역 비중과 레벨을 함께 보는 split-band de-essing. 자동 makeup gain 없음.
 - `mixlive-audio-windows`: WASAPI endpoint ID·기본 포맷, 명시적 입력 채널,
   하나 또는 두 개의 독립 믹스와 채널 매핑. 같은 endpoint의 서로 다른 채널 쌍도 지원한다.
-  같은 보컬 체인을 두 믹스에서 중복 처리하지 않는다.
+  같은 보컬 체인을 두 믹스에서 중복 처리하지 않는다. AUX는 보컬 체인을 거치지 않는 별도 stereo 소스다.
 - 물리 출력 endpoint마다 bounded SPSC queue와 Rubato sinc resampler. 샘플레이트·클럭 경계를 처리하며
   장치 오류·overflow에는 무음으로 멈춘다. 다른 장치를 임의로 선택하지 않는다.
 - 오디오 callback에서는 사전 준비된 필터와 버퍼만 사용한다. peak, gain reduction,
@@ -114,10 +116,46 @@ mono 출력은 `--output-channels 1`. 장치 기본 샘플레이트와 포맷으
 Windows에 stereo endpoint만 보이면 `3,4`를 만들 수 없다. 제조사 ASIO 채널·하드웨어
 loopback을 자동 노출하거나 설정하지 않으며, MiniFuse 모델별 동작은 실장비 검증이 남아 있다.
 
+## 마이크 + MR/AUX를 선택적으로 섞기
+
+`--aux-input`은 **INPUT 목록의 캡처 endpoint**다. 인터페이스의 실제 루프백/라인 입력 또는
+이미 설치된 가상 케이블의 녹음 쪽을 지정한다. Chrome 프로세스를 직접 잡거나 Windows 앱별
+재생 장치를 자동으로 바꾸는 기능이 아니다. 소스에는 의도한 MR만 넣고, MixLive 출력이나
+Discord 수신 음성이 섞인 전체 루프백을 되돌리지 않는다. 외부 피드백은 자동 검출하지 않는다.
+
+| 옵션 | 의미 |
+|---|---|
+| `--aux-input "<AUX INPUT ID>"` | 선택한 입력만 명시적으로 연다. 생략하면 마이크 경로만 실행 |
+| `--aux-channels 1,2` | 입력 내부 1-based stereo pair; 한 번호면 mono 복제, `2,1`이면 좌우 반전 |
+| `--aux-gain-db -12` | AUX만 줄이는 source trim, -96..0 dB. 마이크 보정과 별도 |
+| `--aux-to send` | 기본값. `--send` 믹스에만 합쳐 기존 MR 모니터와 중복하지 않음 |
+| `--aux-to output` | 첫 출력에만 합침. 두 번째 출력에는 보정된 마이크만 보냄 |
+| `--aux-to both` | 두 믹스에 합침. MR을 다른 경로로 듣지 않을 때만 선택 |
+
+```powershell
+.\target\release\mixlive-audio.exe check --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --aux-input "<MR CAPTURE ID>" --aux-channels 1,2 --aux-to send --vocal natural
+.\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --aux-input "<MR CAPTURE ID>" --aux-channels 1,2 --aux-to send --vocal natural --seconds 30
+```
+
+보컬 EQ/컴프레서/디에서는 마이크에만 적용된다. AUX 좌우와 float headroom은 source trim까지
+보존하고, 두 소리를 합친 뒤 출력 음량과 최종 sample clipping guard를 적용한다.
+`--send-gain-db`는 **그 믹스에 포함된 마이크와 AUX 모두**에 적용한다.
+
+같은 INPUT ID에서 마이크 `1`과 AUX `3,4`를 선택하면 한 입력 스트림에서 추출한다.
+이 경우 실제 endpoint가 필요한 채널을 노출해야 하며 마이크/AUX 채널이 겹치면 거절한다.
+별도 INPUT ID를 사용하면 AUX용 bounded queue와 기존 sinc resampler로 마이크 클럭에
+맞춘다. **AUX에는 입력 queue·리샘플러 지연이 추가**되며 이것은 두 소스의 녹음 시각이나
+외부에서 직접 듣는 MR과의 위상/시간 정렬을 보장하지 않는다. 마이크 경로는 지연 보상하지 않는다.
+
+AUX가 아직 priming 중이거나 일시적으로 부족하면 AUX만 무음이고 마이크는 계속된다.
+AUX 장치 오류·잘못된 sample·queue overflow는 전체 경로를 중단한다. 다른 입력으로 바꾸지 않는다.
+`aux_peak`는 AUX trim 이전 sample peak, 별도 장치의 `aux_queue`/`aux_correction`/`aux_underruns`는
+그 입력 clock boundary의 통계다. 입력 오류·실장비 동작·청취·왕복 지연 검증은 STATUS를 따른다.
+
 ## 마이크 경로를 Scene으로 저장·재실행
 
 현재 마이크 입력, 채널, 헤드폰/송출 endpoint, 각 음량, 내장 보컬 프리셋·threshold·강도,
-queue 목표를 하나의 로컬 JSON으로 저장한다. `scene save`는 파일만 만들고, `scene show`는
+선택적 AUX 장치·채널·목적지·음량과 queue 목표를 하나의 로컬 JSON으로 저장한다. `scene save`는 파일만 만들고, `scene show`는
 파일 형식과 값을 검사해 출력한다. 이 두 명령은 장치를 조회하거나 마이크를 시작하지 않는다.
 
 ```powershell
@@ -130,7 +168,8 @@ queue 목표를 하나의 로컬 JSON으로 저장한다. `scene save`는 파일
 `save`에는 기존 `check/run`과 동일한 route 옵션을 사용한다. 두 출력도 저장하려면
 `--send "<별도 OUTPUT ID>" --send-channels 1,2 --send-gain-db -6`을 함께 지정한다.
 같은 endpoint의 `1/2`·`3/4` 구성도 동일한 Scene 형식으로 저장·검사·재실행한다.
-기존 파일은 덮어쓰지 않으며 다른 이름으로 저장한다. `schema: 1`만 읽고 구식 포맷 변환이나
+기존 파일은 덮어쓰지 않으며 다른 이름으로 저장한다. **AUX 필드를 포함한 `schema: 2`만 읽는다.**
+이전 개발 Scene은 현재 옵션으로 새로 저장해야 한다. 구식 포맷 변환이나
 누락된 필수 값의 기본값 복원은 하지 않는다. 오타·중복 채널·허용 범위 밖 음량은 거절한다.
 
 `scene check`는 **현재** Windows 장치와 채널·포맷을 다시 확인하되 스트림은 시작하지 않는다.
@@ -138,7 +177,7 @@ queue 목표를 하나의 로컬 JSON으로 저장한다. `scene save`는 파일
 샘플레이트/포맷은 저장 당시 값으로 강제하지 않고 선택한 endpoint의 현재 기본 구성을 사용한다.
 실행 시간은 Scene에 저장하지 않으며 매번 기본 30초, `--seconds` 범위는 1..3600이다.
 
-이것은 현재 구현된 **마이크 하나·출력 1~2개의 장치/보컬 Scene**이다. 앱별 소스,
+이것은 현재 구현된 **마이크 하나·선택적 AUX 하나·출력 1~2개의 장치/보컬 Scene**이다. 앱별 소스,
 외부 VST3 상태, 임의 라우팅 그래프 또는 실행 중 Scene 전환을 구현했다고 의미하지 않는다.
 음성은 저장하지 않는다. Scene에는 개인 endpoint ID가 있으므로 공유하지 않는 것이 좋고,
 문서의 `*.mixlive-scene.json` 확장자는 `.gitignore`로 제외한다.

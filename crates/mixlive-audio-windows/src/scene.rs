@@ -1,5 +1,5 @@
 //! Explicit device/vocal scene persistence on the control thread, never in an audio callback.
-//! This saves the existing one-microphone route, not an unimplemented app/VST3 routing graph.
+//! One microphone plus optional AUX capture; not an unimplemented app/VST3 routing graph.
 
 use crate::config::RouteOptions;
 use serde::{Deserialize, Serialize};
@@ -17,7 +17,7 @@ pub struct DeviceScene {
 impl DeviceScene {
     pub fn new(route: RouteOptions) -> Result<Self> {
         route.validate()?;
-        Ok(Self { schema: 1, route })
+        Ok(Self { schema: 2, route })
     }
 
     /// Reject unsupported files and invalid settings. No default device substitution or migration.
@@ -28,7 +28,7 @@ impl DeviceScene {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != 1 { return Err("unsupported MixLive device scene schema".into()); }
+        if self.schema != 2 { return Err("unsupported MixLive device scene schema".into()); }
         self.route.validate()?;
         Ok(())
     }
@@ -77,6 +77,12 @@ mod tests {
             options.vocal = preset;
             if index == 0 { options.send = None; }
             if index == 1 { options.send = Some(options.output.clone()); }
+            if index >= 2 {
+                options.aux_input = Some(if index == 2 { options.input.clone() } else { "test-aux".into() });
+                options.aux_channels = vec![4, 3];
+                options.aux_gain_db = -9.0;
+                options.aux_to = crate::config::AuxDestination::Both;
+            }
             let scene = DeviceScene::new(options.clone()).unwrap();
             let path = directory.path().join(format!("{index}.mixlive-scene.json"));
             scene.save_new(&path).unwrap();
@@ -109,7 +115,7 @@ mod tests {
         let path = directory.path().join("invalid.mixlive-scene.json");
         let original = serde_json::to_value(DeviceScene::new(route()).unwrap()).unwrap();
         let mut cases = Vec::new();
-        for (key, value) in [("schema", json!(2)), ("unknown", json!(true))] {
+        for (key, value) in [("schema", json!(1)), ("unknown", json!(true))] {
             let mut document = original.clone();
             document[key] = value;
             cases.push(document);
@@ -122,6 +128,8 @@ mod tests {
             ("input_gain_db", json!(100)), ("output_gain_db", json!(1)),
             ("vocal_strength", json!(2)), ("vocal", json!("magic")),
             ("vocal_threshold_db", json!(-100)), ("deess_threshold_db", json!(1)),
+            ("aux_input", json!(" ")), ("aux_channels", json!([0])),
+            ("aux_gain_db", json!(1)), ("aux_to", json!("magic")),
             ("unknown", json!(true)),
         ] {
             let mut document = original.clone();

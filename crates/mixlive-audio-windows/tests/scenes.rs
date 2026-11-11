@@ -15,12 +15,17 @@ fn save_and_show_work_without_audio_hardware_and_do_not_overwrite() {
         "--input", "not-a-real-microphone", "--output", "not-a-real-playback-device",
         "--vocal", "bright", "--input-gain-db", "3", "--output-gain-db", "-12",
         "--send", "not-a-real-cable", "--send-gain-db", "-6",
+        "--aux-input", "not-a-real-mr-capture", "--aux-channels", "2,1", "--aux-gain-db", "-9",
     ]).output().unwrap();
     assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stderr));
     let scene = DeviceScene::read(&path).unwrap();
     assert_eq!(scene.route.vocal, Preset::Bright);
     assert_eq!(scene.route.input_gain_db, 3.0);
     assert_eq!(scene.route.send_gain_db, -6.0);
+    assert_eq!(scene.route.aux_input.as_deref(), Some("not-a-real-mr-capture"));
+    assert_eq!(scene.route.aux_channels, [2, 1]);
+    assert_eq!(scene.route.aux_gain_db, -9.0);
+    assert_eq!(scene.route.aux_to, mixlive_audio_windows::config::AuxDestination::Send);
     let original = std::fs::read(&path).unwrap();
     let shown = command().args(["scene", "show"]).arg(&path).output().unwrap();
     assert!(shown.status.success(), "{}", String::from_utf8_lossy(&shown.stderr));
