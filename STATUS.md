@@ -37,12 +37,12 @@ Windows MSVC 대상 앱 all-targets Clippy(`-D warnings`) 통과.
 새 검사는 기존 Scene의 전체 설정 보존, 보컬 값 검증, 중복 DLL 슬롯의 독립 class/state,
 순서 변경/삭제, 체인 추가 실패의 원자성, 새 Scene·편집 Scene의 저장/재열기를 확인한다.
 
-[Audio #20](https://github.com/andongmin94/mix-live/actions/runs/43392027053)에서 Windows tests
+[Audio #21](https://github.com/andongmin94/mix-live/actions/runs/43394034507)에서 Windows tests
 83개(workspace 74 + native fixture 9), 전체 Clippy, release 실행 파일 3개 빌드,
-새 Scene 미선택 오류/취소/정상 종료가 통과했다. 보컬 편집 GUI 검사는 버튼의 외곽 전체가
-viewport 안에 있어야 한다는 조건에서 중단됐다. GPUI의 focus reveal 영역은 1px 테두리를
-제외하므로, native Invoke가 쓰는 실제 클릭 중심의 표시 여부로 조건을 수정해 재검증한다.
-체인 순서·원본 보존·실제 새 파일 저장 검증은 유지하며 최종 결과는 Actions 완료 후 기록한다.
+새 Scene 미선택 오류/취소/정상 종료가 통과했다. 보컬 편집의 값 변경·포커스 스크롤·취소·
+재열기와 native 저장 대화상자 열기도 통과했다. 저장 검사가 파일명 컨트롤 아래의 Edit을
+가정해 중단되어, 관측한 `FileNameControlHost` 자체의 ValuePattern으로 수정해 재검증한다.
+실제 새 파일 저장·체인 순서·원본 보존 검증은 유지하며 최종 결과는 Actions 완료 후 기록한다.
 
 ## 남은 작업과 제한
 

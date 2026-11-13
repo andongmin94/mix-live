@@ -266,12 +266,15 @@ jobs:
               Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $limit)
             if ($null -eq $filenameHost) { throw 'The native Scene save dialog did not expose its file-name control' }
-            $editCondition = [System.Windows.Automation.PropertyCondition]::new(
-              [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-            $filenameEdits = $filenameHost.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
-            if ($filenameEdits.Count -ne 1) { throw 'The native save dialog did not expose one file-name editor' }
-            $filenameValue = [System.Windows.Automation.ValuePattern]$filenameEdits[0].GetCurrentPattern(
-              [System.Windows.Automation.ValuePattern]::Pattern)
+            $filenamePatterns = @($filenameHost.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName })
+            Write-Output ("Native FileNameControlHost: type={0}; class={1}; enabled={2}; patterns={3}" -f
+              $filenameHost.Current.ControlType.ProgrammaticName, $filenameHost.Current.ClassName,
+              $filenameHost.Current.IsEnabled, ($filenamePatterns -join ', '))
+            $filenamePattern = $null
+            if (!$filenameHost.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$filenamePattern)) {
+              throw 'The native FileNameControlHost does not support ValuePattern'
+            }
+            $filenameValue = [System.Windows.Automation.ValuePattern]$filenamePattern
             $filenameValue.SetValue($savedPath)
             if ($filenameValue.Current.Value -cne $savedPath) { throw 'The native save dialog did not accept the chosen path' }
             $confirmCondition = [System.Windows.Automation.AndCondition]::new(
