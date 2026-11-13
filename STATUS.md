@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-13
-단계: **GPUI 보컬 설정·VST3 체인 편집 구현, Windows 통합 검증 대기**
+단계: **GPUI 보컬 설정·VST3 체인 편집 및 Windows 통합 검증 완료**
 
 ## 현재 구현
 
@@ -37,13 +37,20 @@ Windows MSVC 대상 앱 all-targets Clippy(`-D warnings`) 통과.
 새 검사는 기존 Scene의 전체 설정 보존, 보컬 값 검증, 중복 DLL 슬롯의 독립 class/state,
 순서 변경/삭제, 체인 추가 실패의 원자성, 새 Scene·편집 Scene의 저장/재열기를 확인한다.
 
-[Audio #24](https://github.com/andongmin94/mix-live/actions/runs/43399638819)에서 Windows tests
-83개(workspace 74 + native fixture 9), 전체 Clippy, release 실행 파일 3개 빌드,
-새 Scene 미선택 오류/취소/정상 종료가 통과했다. 보컬 편집의 값 변경·포커스 스크롤·취소·
-재열기, native 저장 대화상자 활성화, 실제 키보드 입력과 정확한 경로 readback도 통과했다.
-runner의 managed UIA에는 파일명 입력란과 Save 버튼이 노출되지 않는다. 같은 표준 키보드
-경로에서 저장 단축키까지 실행하도록 검사를 수정해 재검증한다.
-실제 새 파일 저장·체인 순서·원본 보존 검증은 유지하며 최종 결과는 Actions 완료 후 기록한다.
+검증 기준 코드: `1fa0ce6ff04877d47461176d4a4c2dae62776f47`.
+[Audio #25](https://github.com/andongmin94/mix-live/actions/runs/43401580298) 전체 성공:
+Windows tests **83개**(workspace 74 + native fixture 9), 전체 Clippy(`-D warnings`),
+`mixlive.exe`/`mixlive-audio.exe`/`mixlive-plugins.exe` release 빌드와 CLI help 통과.
+
+실제 GUI에서 새 Scene 필수 장치 오류·취소, 저장된 Scene의 trim/blend 변경·VST3 재정렬·
+포커스 스크롤·취소·재열기·새 파일 저장·정상 종료를 확인했다. 저장 JSON의 변경 값,
+나머지 route 전체, 슬롯별 path/class/state와 순서, 원본 파일 SHA 보존까지 비교했다.
+runner의 managed UIA가 native 파일명/Save를 노출하지 않아, 해당 대화상자만 실제 foreground
+키보드와 정확한 경로 복사 readback으로 검사한다. 합성 ID/미설치 DLL을 쓰며 오디오는 시작하지 않는다.
+
+[Windows 개발용 ZIP](https://github.com/andongmin94/mix-live/actions/runs/43401580298/artifacts/14026500557)
+(CI 7일 보관)에 실행 파일 3개·의존성 잠금 파일·README·라이선스 고지를 포함한다.
+다운로드 ZIP의 게시 SHA256 일치·전체 CRC와 실행 파일 3개의 x64 PE 형식을 확인했다.
 
 ## 남은 작업과 제한
 
