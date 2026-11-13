@@ -304,22 +304,8 @@ jobs:
             } while ([DateTime]::UtcNow -lt $limit)
             if ($observedPath -cne $savedPath) { throw "Native filename readback mismatch: expected=$savedPath; actual=$observedPath" }
             Write-Output "Native save filename readback matched: hwnd=$dialogHandle; path=$observedPath"
-            $confirmCondition = [System.Windows.Automation.AndCondition]::new(
-              [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'),
-              [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button))
-            $confirm = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $confirmCondition)
-            if ($null -eq $confirm -or !$confirm.Current.IsEnabled) {
-              $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-              $buttons = $dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
-              foreach ($candidate in $buttons) {
-                Write-Output ("Native save dialog button: id={0}; name={1}; enabled={2}" -f
-                  $candidate.Current.AutomationId, $candidate.Current.Name, $candidate.Current.IsEnabled)
-              }
-              throw 'The native save dialog did not expose an enabled Save button'
-            }
-            ([System.Windows.Automation.InvokePattern]$confirm.GetCurrentPattern(
-              [System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+            # The native Save control is also absent from the runner's managed UIA tree.
+            [System.Windows.Forms.SendKeys]::SendWait('%s')
             $null = Wait-UiName $env:MIXLIVE_UI_EDIT -Enabled
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
             if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
