@@ -9,6 +9,10 @@ mod draft;
 mod form;
 #[cfg(windows)]
 mod session;
+#[cfg(any(windows, test))]
+mod sound;
+#[cfg(windows)]
+mod sound_editor;
 #[cfg(windows)]
 mod ui;
 

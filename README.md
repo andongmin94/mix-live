@@ -36,7 +36,7 @@ cargo build --release -p mixlive-app -p mixlive-audio-windows -p mixlive-vst3 --
 
 ### 네이티브 Scene 화면
 
-`mixlive.exe`에서 **새 Scene → 장치 선택 → 새 파일로 저장 → 오디오 시작** 순서로 시작할 수 있다.
+`mixlive.exe`에서 **새 Scene → 장치·보컬·VST3 선택 → 새 파일로 저장 → 오디오 시작** 순서로 시작할 수 있다.
 마이크와 주 출력은 직접 선택하며, AUX/MR 녹음 장치와 추가 송출 재생 장치는 선택 사항이다.
 목록은 실제 WASAPI endpoint 이름·ID·기본 채널/샘플레이트/형식을 표시한다. 같은 이름이어도
 ID로 구분하며, 사용할 수 없는 설정은 이유를 표시한다. 장치를 연결한 뒤에는 새 Scene을 다시
@@ -48,7 +48,8 @@ ID로 구분하며, 사용할 수 없는 설정은 이유를 표시한다. 장�
 AUX를 추가 송출로 보내려면 해당 출력 장치도 선택해야 한다.
 
 내장 보정 `off/natural/warm/bright`를 고를 수 있으며, 새 Scene의 초기값은 출력 −18 dB,
-AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. VST3는 포함하지 않는다.
+AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. 입력 trim, 보정 비율,
+컴프레서/디에서 threshold와 VST3 순서를 저장 전에 화면에서 바꿀 수 있다.
 저장은 기존 schema 3의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
 이전 Scene 선택을 유지한다. 장치와 현재 설정은 실제 시작 때 다시 검사한다.
 
@@ -56,6 +57,17 @@ AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. VST3�
 파일 경로를 `mixlive.exe singing.mixlive-scene.json`으로 전달해도 읽기만 하며 자동으로 시작하지 않는다.
 시작할 때 기존 장치/채널 검증과 VST3 로딩을 수행한다. Scene의 실제 DLL과 장치가 필요하며,
 누락되면 오류를 표시하고 시작하지 않는다. 다른 장치나 원음 경로로 바꾸지 않는다.
+
+정지한 Scene의 **보컬 설정** 버튼에서도 같은 설정 화면을 연다. 기존 장치·채널·AUX 목적지·
+출력 음량·queue 설정을 그대로 유지하면서 보컬 설정과 VST3 체인을 편집해 새 Scene으로 저장한다.
+편집 취소는 현재 Scene과 파일을 바꾸지 않는다. 저장한 설정은 다음 명시적 시작부터 적용된다.
+
+VST3는 **파일 추가** 또는 Windows bundle용 **폴더 추가**로 선택하고, 슬롯별 위로/아래로/삭제로
+순서를 정한다. **체인 파일 추가**는 기존 체인 JSON을 현재 목록 뒤에 붙이며 class와 저장 상태도
+가져온다. 같은 플러그인을 여러 번 추가할 수 있고, 순서를 바꿔도 각 슬롯의 class/state가 함께
+이동한다. 기존 상대 경로는 가져온 파일 기준으로 해석한다. 슬롯에는 경로·class·저장 상태 크기를
+표시하며 파일 선택/편집/저장 과정에서는 DLL을 열지 않는다. 새로 추가한 파일은 저장 상태 없이
+시작하고, native 호환성·설치 여부는 오디오 시작 때 확인한다.
 
 실행 중에는 다음을 화면에서 조절한다.
 
@@ -69,8 +81,8 @@ AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. VST3�
 GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 crash/hang은 여전히 격리되지 않는다.
 명시적으로 정지하거나 오류가 나기 전까지 실행하며 CLI의 실행 시간 제한은 적용하지 않는다.
 
-화면에서 기존 Scene의 보컬 세부 설정/체인을 편집하거나 원본 plugin editor를 여는 기능,
-전체 실행 상태 저장은 아직 없다. VST3 체인은 아래 CLI에서 만든 Scene으로 불러온다.
+화면에서 기존 Scene의 장치·라우팅 시작 설정을 편집하거나 원본 plugin editor를 여는 기능,
+전체 실행 상태 저장은 아직 없다. 보컬·VST3 설정 편집은 정지 상태에서만 제공한다.
 음소거·음량·경로 변경은 이번 실행에만 적용되며 다시 시작하면 파일의 설정을 사용한다.
 표시된 endpoint 채널은 WASAPI 채널이고, 신고된 queue/plugin 지연은 실측 왕복 지연이 아니다.
 
@@ -243,8 +255,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run -p mixlive-core --example discord_singing --locked
 ```
 
-Windows CI의 기존 native fixture 검사도 따른다. 추가된 화면 검사는 빈 네이티브 창의
-열기/닫기만 확인하며 실제 오디오 장치를 열거나 상용 VST3 GUI를 조작하지 않는다.
+Windows CI의 기존 native fixture 검사도 따른다. 화면 검사는 UIAutomation으로 실제 창과
+컨트롤을 조작한다. 임시 Scene의 장치 ID와 플러그인 경로는 합성 값이며 오디오 시작을 누르지 않는다.
+실제 오디오 장치를 열거나 상용 VST3 GUI를 조작하는 검사가 아니다.
 통과한 검사와 실제 장비·GUI·청취 수용을 구분한다. sample peak/GR은 LUFS/true peak가 아니다.
 
 [DESIGN.md](DESIGN.md) · [STATUS.md](STATUS.md) · [AGENTS.md](AGENTS.md) · [NOTICE.md](NOTICE.md)

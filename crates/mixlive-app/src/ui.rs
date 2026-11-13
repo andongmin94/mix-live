@@ -8,11 +8,12 @@ use std::{
 
 use gpui::{
     App, AppContext as _, Context, Div, ElementId, Entity, InteractiveElement, IntoElement,
-    ParentElement, PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, relative, rgb,
-    size,
+    ParentElement, PathPromptOptions, Render, ScrollHandle, SharedString, Styled, Subscription,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, relative, rgb, size,
 };
-use gpui_design::{Button, Root, Slider, SliderEvent, SliderState, StyledExt as _, Switch};
+use gpui_design::{
+    Button, Root, ScrollArea, Slider, SliderEvent, SliderState, StyledExt as _, Switch,
+};
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
 use mixlive_audio_windows::windows::device_catalog;
 
@@ -68,6 +69,7 @@ pub struct MixLive {
     subscriptions: Vec<Subscription>,
     form: Option<Entity<SceneForm>>,
     form_subscription: Option<Subscription>,
+    workspace_scroll: ScrollHandle,
     last_refresh: Instant,
 }
 
@@ -123,6 +125,7 @@ impl MixLive {
             subscriptions: Vec::new(),
             form: None,
             form_subscription: None,
+            workspace_scroll: ScrollHandle::new(),
             last_refresh: Instant::now(),
         }
     }
@@ -163,6 +166,7 @@ impl MixLive {
                             if let Some(path) = paths.into_iter().next() {
                                 let _ = this.session.open(path);
                                 this.selected_name = scene_name(&this.session);
+                                this.workspace_scroll.set_offset(Default::default());
                             }
                         }
                         Ok(Ok(None)) => {}
@@ -174,6 +178,37 @@ impl MixLive {
             });
         })
         .detach();
+    }
+
+    fn install_form(&mut self, form: Entity<SceneForm>, window: &Window, cx: &mut Context<Self>) {
+        self.form_subscription =
+            Some(
+                cx.subscribe_in(&form, window, |this, form, event, window, cx| match event {
+                    FormEvent::Save => this.save_scene(window, cx),
+                    FormEvent::Cancel if !this.picking && !form.read(cx).is_busy(cx) => {
+                        this.form = None;
+                        this.form_subscription = None;
+                        this.workspace_scroll.set_offset(Default::default());
+                        cx.notify();
+                    }
+                    FormEvent::Cancel => {}
+                }),
+            );
+        self.form = Some(form);
+        self.workspace_scroll.set_offset(Default::default());
+        cx.notify();
+    }
+
+    fn edit_sound(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.picking || self.session.running() || self.form.is_some() {
+            return;
+        }
+        let Some(scene) = self.session.scene() else {
+            return;
+        };
+        let form = cx.new(|cx| SceneForm::edit(scene, window, cx));
+        self.session.error = None;
+        self.install_form(form, window, cx);
     }
 
     fn save_scene(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -224,6 +259,7 @@ impl MixLive {
                                 this.selected_name = scene_name(&this.session);
                                 this.form = None;
                                 this.form_subscription = None;
+                                this.workspace_scroll.set_offset(Default::default());
                                 None
                             }
                             Err(error) => Some(format!("새 파일로 저장하지 못했습니다: {error}")),
@@ -281,18 +317,7 @@ impl MixLive {
                             Ok(catalog) => {
                                 this.session.error = None;
                                 let form = cx.new(|cx| SceneForm::new(catalog, window, cx));
-                                this.form_subscription = Some(cx.subscribe_in(&form, window, |this, _, event, window, cx| {
-                                    match event {
-                                        FormEvent::Save => this.save_scene(window, cx),
-                                        FormEvent::Cancel if !this.picking => {
-                                            this.form = None;
-                                            this.form_subscription = None;
-                                            cx.notify();
-                                        }
-                                        FormEvent::Cancel => {}
-                                    }
-                                }));
-                                this.form = Some(form);
+                                this.install_form(form, window, cx);
                             }
                             Err(error) => {
                                 this.session.message = "장치 목록을 읽지 못했습니다. 연결을 확인하고 새 Scene을 다시 누르세요.".into();
@@ -453,7 +478,7 @@ impl MixLive {
             Some(Operation::Start) => ("시작 중", MUTED),
             Some(Operation::Stop | Operation::Close) => ("정지 중", MUTED),
             None if running => ("오디오 실행 중", ACCENT),
-            None if self.form.is_some() => ("새 Scene 설정", MUTED),
+            None if self.form.is_some() => ("Scene 설정", MUTED),
             None if self.session.error.is_some() => ("확인 필요", DANGER),
             None if self.session.scene().is_some() => ("시작 준비", MUTED),
             None => ("정지", MUTED),
@@ -569,7 +594,7 @@ impl MixLive {
             )
     }
 
-    fn scene_summary(&self) -> gpui::AnyElement {
+    fn scene_summary(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let Some(scene) = self.session.scene() else {
             let (title, description) = if self.busy.is_some() {
                 (
@@ -689,12 +714,23 @@ impl MixLive {
                     ),
             );
         }
-        sound = sound.child(
-            div()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .child("AUX / MR은 보컬 체인을 거치지 않습니다."),
-        );
+        sound = sound
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("AUX / MR은 보컬 체인을 거치지 않습니다."),
+            )
+            .child(
+                button("edit-sound", "보컬 설정", false)
+                    .disabled(
+                        self.session.running()
+                            || self.busy.is_some()
+                            || self.picking
+                            || self.form.is_some(),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.edit_sound(window, cx))),
+            );
 
         let mut destinations = panel()
             .flex_1()
@@ -1051,16 +1087,12 @@ impl MixLive {
 
 impl Render for MixLive {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut body = div()
-            .id("workspace")
+        let mut body = ScrollArea::new("workspace", &self.workspace_scroll)
+            .accessibility_label("Scene 작업 영역")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .px_7()
-            .py_6()
-            .flex()
-            .flex_col()
-            .gap_6();
+            .content_styles(|style| style.flex().flex_col().gap_6().px_7().py_6())
+            .scrollbar_styles(|styles| styles.thumb(|thumb| thumb.bg(rgb(MUTED)).radius(px(3.))));
         if let Some(error) = &self.session.error
             && self.form.is_none()
         {
@@ -1080,7 +1112,7 @@ impl Render for MixLive {
         if let Some(form) = &self.form {
             body = body.child(form.clone());
         } else {
-            body = body.child(self.scene_summary());
+            body = body.child(self.scene_summary(cx));
             if self.session.running() {
                 body = body.child(self.mixer(cx));
             }

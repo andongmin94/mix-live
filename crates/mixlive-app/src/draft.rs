@@ -5,7 +5,9 @@ use mixlive_audio_windows::{
     devices::{DeviceCatalog, DeviceConfig, DeviceInfo},
     scene::AudioScene,
 };
-use mixlive_effects::{Preset, VocalChain, VocalConfig};
+use mixlive_effects::VocalChain;
+
+use crate::sound::SoundDraft;
 
 pub struct SceneDraft {
     pub input: Option<String>,
@@ -17,7 +19,7 @@ pub struct SceneDraft {
     pub aux_input: Option<String>,
     pub aux_channels: String,
     pub aux_to: String,
-    pub vocal: String,
+    pub sound: SoundDraft,
 }
 
 impl SceneDraft {
@@ -64,11 +66,7 @@ impl SceneDraft {
         if self.aux_input.is_some() && aux_to.includes(1) && self.send.is_none() {
             return Err("AUX를 추가 송출로 보내려면 추가 송출 장치를 선택하세요. 주 출력만 사용하려면 AUX 목적지를 주 출력으로 바꾸세요.".into());
         }
-        let vocal = self
-            .vocal
-            .parse::<Preset>()
-            .map_err(|error| error.to_string())?;
-        let defaults = VocalConfig::default();
+        let vocal = self.sound.vocal_config()?;
         let route = RouteOptions {
             input: input.id.clone(),
             input_channel,
@@ -80,20 +78,20 @@ impl SceneDraft {
             output_channels,
             send: self.send.clone(),
             send_channels,
-            input_gain_db: defaults.input_gain_db,
+            input_gain_db: vocal.input_gain_db,
             output_gain_db: -18.0,
             send_gain_db: 0.0,
-            vocal,
-            vocal_strength: defaults.strength,
-            vocal_threshold_db: defaults.compressor_threshold_db,
-            deess_threshold_db: defaults.deess_threshold_db,
+            vocal: vocal.preset,
+            vocal_strength: vocal.strength,
+            vocal_threshold_db: vocal.compressor_threshold_db,
+            deess_threshold_db: vocal.deess_threshold_db,
             queue_ms: 30,
         };
         // Use the same coefficient/sample-rate validation as Prepared without opening devices.
         // Start rechecks the live endpoint configuration; the catalog is only a point-in-time view.
         VocalChain::new(input_config.sample_rate, route.vocal_config())
             .map_err(|error| error.to_string())?;
-        AudioScene::new(route, Vec::new()).map_err(|error| error.to_string())
+        AudioScene::new(route, self.sound.effects.clone()).map_err(|error| error.to_string())
     }
 }
 
@@ -169,7 +167,7 @@ mod tests {
             aux_input: None,
             aux_channels: "1,2".into(),
             aux_to: "send".into(),
-            vocal: "off".into(),
+            sound: SoundDraft::default(),
         }
     }
 
@@ -227,7 +225,7 @@ mod tests {
             sample_format: "f32".into(),
         });
         assert!(draft.build(&devices).is_ok());
-        draft.vocal = "natural".into();
+        draft.sound.preset = "natural".into();
         assert!(draft.build(&devices).unwrap_err().contains("32000"));
     }
 
@@ -280,13 +278,22 @@ mod tests {
         draft.aux_to = "both".into();
         assert!(draft.build(&catalog()).is_err());
         draft.aux_to = "output".into();
-        draft.vocal = "warm".into();
+        draft.sound.preset = "warm".into();
+        draft.sound.input_gain_db = "3.5".into();
+        draft.sound.strength = "0.375".into();
+        draft
+            .sound
+            .append_plugins(vec!["not-installed.vst3".into()])
+            .unwrap();
         let scene = draft.build(&catalog()).unwrap();
+        assert_eq!(scene.route.input_gain_db, 3.5);
+        assert_eq!(scene.route.vocal_strength, 0.375);
+        assert_eq!(scene.effects.len(), 1);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.mixlive-scene.json");
         scene.save_new(&path).unwrap();
         let restored = AudioScene::read(&path).unwrap();
         assert_eq!(restored.route, scene.route);
-        assert!(restored.effects.is_empty());
+        assert_eq!(restored.effects, scene.effects);
     }
 }

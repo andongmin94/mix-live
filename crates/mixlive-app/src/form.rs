@@ -1,5 +1,4 @@
-//! New Scene settings from an explicit snapshot of the WASAPI device list.
-//! This view never opens a stream, loads a plugin, or starts the saved Scene.
+//! New Scene creation and stopped Scene vocal editing. File operations never start audio.
 
 use gpui::{
     App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, Focusable as _,
@@ -11,12 +10,15 @@ use gpui_design::{
     SelectItem, SelectOption, SelectState, StyledExt as _,
 };
 use mixlive_audio_windows::{
+    config::RouteOptions,
     devices::{DeviceCatalog, DeviceInfo},
     scene::AudioScene,
 };
 
 use crate::{
     draft::SceneDraft,
+    sound::SoundDraft,
+    sound_editor::SoundEditor,
     ui::{
         ACCENT, BACKGROUND, BORDER, DANGER, MUTED, RAISED, SURFACE, TEXT, button, panel,
         section_title,
@@ -41,14 +43,23 @@ enum Endpoint {
     Aux,
 }
 
-pub struct SceneForm {
+struct DeviceSetup {
     catalog: DeviceCatalog,
     mic: EndpointField,
     output: EndpointField,
     send: EndpointField,
     aux: EndpointField,
     aux_to: Entity<SelectState>,
-    vocal: Entity<SelectState>,
+}
+
+enum Setup {
+    New(DeviceSetup),
+    Sound(RouteOptions),
+}
+
+pub struct SceneForm {
+    setup: Setup,
+    sound: Entity<SoundEditor>,
     busy: bool,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
@@ -75,19 +86,8 @@ impl SceneForm {
             state.set_disabled(true, window, cx);
             state
         });
-        let vocal = cx.new(|cx| {
-            SelectState::new(
-                [
-                    SelectItem::new("off", "Off · 내장 보정 끄기"),
-                    SelectItem::new("natural", "Natural · 자연스럽게"),
-                    SelectItem::new("warm", "Warm · 따뜻하게"),
-                    SelectItem::new("bright", "Bright · 밝게"),
-                ],
-                cx,
-            )
-            .default_value("off")
-        });
-        let mut subscriptions = Vec::new();
+        let sound = cx.new(|cx| SoundEditor::new(SoundDraft::default(), window, cx));
+        let mut subscriptions = vec![cx.observe(&sound, |_, _, cx| cx.notify())];
         for (endpoint, field) in [
             (Endpoint::Mic, &mic),
             (Endpoint::Output, &output),
@@ -100,11 +100,14 @@ impl SceneForm {
                 &field.select,
                 window,
                 move |this, _, event, window, cx| {
-                    let SelectEvent::Change(id) = event;
-                    if this.busy {
+                    if this.is_busy(cx) {
                         return;
                     }
-                    let (devices, field) = this.endpoint(endpoint);
+                    let Setup::New(setup) = &this.setup else {
+                        return;
+                    };
+                    let SelectEvent::Change(id) = event;
+                    let (devices, field) = setup.endpoint(endpoint);
                     if let Some(config) = devices
                         .iter()
                         .find(|device| device.id == id.as_ref())
@@ -124,7 +127,7 @@ impl SceneForm {
                         .channels
                         .update(cx, |input, cx| input.set_disabled(id.is_empty(), cx));
                     if matches!(endpoint, Endpoint::Aux) {
-                        this.aux_to.update(cx, |state, cx| {
+                        setup.aux_to.update(cx, |state, cx| {
                             state.set_disabled(id.is_empty(), window, cx)
                         });
                     }
@@ -133,23 +136,68 @@ impl SceneForm {
                 },
             ));
         }
-        for select in [&aux_to, &vocal] {
-            subscriptions.push(cx.observe(select, |_, _, cx| cx.notify()));
-        }
+        subscriptions.push(cx.observe(&aux_to, |_, _, cx| cx.notify()));
         Self {
-            catalog,
-            mic,
-            output,
-            send,
-            aux,
-            aux_to,
-            vocal,
+            setup: Setup::New(DeviceSetup {
+                catalog,
+                mic,
+                output,
+                send,
+                aux,
+                aux_to,
+            }),
+            sound,
             busy: false,
             error: None,
             _subscriptions: subscriptions,
         }
     }
 
+    /// Edit a saved startup chain without querying devices or native plugin modules.
+    pub fn edit(scene: &AudioScene, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let sound = cx.new(|cx| SoundEditor::new(SoundDraft::from_scene(scene), window, cx));
+        let subscription = cx.observe(&sound, |_, _, cx| cx.notify());
+        Self {
+            setup: Setup::Sound(scene.route.clone()),
+            sound,
+            busy: false,
+            error: None,
+            _subscriptions: vec![subscription],
+        }
+    }
+
+    pub fn is_busy(&self, cx: &App) -> bool {
+        self.busy || self.sound.read(cx).is_busy()
+    }
+
+    pub fn build_scene(&self, cx: &App) -> Result<AudioScene, String> {
+        if self.is_busy(cx) {
+            return Err("파일 선택을 마친 뒤 저장하세요.".into());
+        }
+        let sound = self.sound.read(cx).draft(cx);
+        match &self.setup {
+            Setup::New(setup) => setup.build_scene(sound, cx),
+            Setup::Sound(route) => sound.apply_to(route),
+        }
+    }
+
+    pub fn set_busy(&mut self, busy: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.busy = busy;
+        if let Setup::New(setup) = &self.setup {
+            setup.set_busy(busy, window, cx);
+        }
+        self.sound
+            .update(cx, |sound, cx| sound.set_busy(busy, window, cx));
+        cx.notify();
+    }
+
+    pub fn show_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        self.error = error;
+        cx.notify();
+    }
+}
+
+impl DeviceSetup {
     fn endpoint(&self, endpoint: Endpoint) -> (&[DeviceInfo], &EndpointField) {
         match endpoint {
             Endpoint::Mic => (&self.catalog.inputs, &self.mic),
@@ -159,7 +207,7 @@ impl SceneForm {
         }
     }
 
-    pub fn build_scene(&self, cx: &App) -> Result<AudioScene, String> {
+    fn build_scene(&self, sound: SoundDraft, cx: &App) -> Result<AudioScene, String> {
         SceneDraft {
             input: selected(&self.mic.select, cx),
             input_channel: self.mic.channels.read(cx).value().to_string(),
@@ -170,13 +218,12 @@ impl SceneForm {
             aux_input: selected(&self.aux.select, cx),
             aux_channels: self.aux.channels.read(cx).value().to_string(),
             aux_to: selected(&self.aux_to, cx).unwrap_or_default(),
-            vocal: selected(&self.vocal, cx).unwrap_or_default(),
+            sound,
         }
         .build(&self.catalog)
     }
 
-    pub fn set_busy(&mut self, busy: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.busy = busy;
+    fn set_busy(&self, busy: bool, window: &mut Window, cx: &mut App) {
         for field in [&self.mic, &self.output, &self.send, &self.aux] {
             field
                 .select
@@ -186,17 +233,66 @@ impl SceneForm {
                 .channels
                 .update(cx, |input, cx| input.set_disabled(disabled, cx));
         }
-        let aux_disabled = busy || selected(&self.aux.select, cx).is_none();
+        let disabled = busy || selected(&self.aux.select, cx).is_none();
         self.aux_to
-            .update(cx, |state, cx| state.set_disabled(aux_disabled, window, cx));
-        self.vocal
-            .update(cx, |state, cx| state.set_disabled(busy, window, cx));
-        cx.notify();
+            .update(cx, |state, cx| state.set_disabled(disabled, window, cx));
     }
 
-    pub fn show_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
-        self.error = error;
-        cx.notify();
+    fn render(&self, window: &Window, cx: &App) -> Div {
+        let mut sources = panel()
+            .flex_1()
+            .min_w_0()
+            .gap_5()
+            .child(section_title("01", "소스 선택"))
+            .child(self.device_field(Endpoint::Mic, "new-mic", "내 목소리 · 필수", window, cx))
+            .child(self.device_field(Endpoint::Aux, "new-aux", "AUX / MR · 선택", window, cx));
+        if selected(&self.aux.select, cx).is_some() {
+            sources = sources.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("AUX를 보낼 곳"),
+                    )
+                    .child(select_control(
+                        "new-aux-to",
+                        "AUX를 보낼 곳",
+                        &self.aux_to,
+                        None,
+                        window,
+                        cx,
+                    )),
+            );
+        }
+        sources = sources.child(
+            div()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child("AUX는 녹음 장치의 소리를 받습니다. 보컬 보정은 거치지 않습니다."),
+        );
+        let destinations = panel()
+            .flex_1()
+            .min_w_0()
+            .gap_5()
+            .child(section_title("02", "목적지 선택"))
+            .child(self.device_field(Endpoint::Output, "new-output", "주 출력 · 필수", window, cx))
+            .child(self.device_field(Endpoint::Send, "new-send", "추가 송출 · 선택", window, cx))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("헤드폰이나 설치된 가상 케이블의 재생 장치를 선택하세요."),
+            );
+        div()
+            .flex()
+            .items_start()
+            .gap_5()
+            .child(sources)
+            .child(destinations)
     }
 
     fn device_field(
@@ -274,7 +370,7 @@ impl SceneForm {
                                 .w(px(76.))
                                 .child("사용 채널"),
                         )
-                        .child(channel_input(id, &field.channels, window, cx))
+                        .child(number_input(id, &field.channels, window, cx))
                         .child(div().text_xs().text_color(rgb(MUTED)).child(
                             if matches!(endpoint, Endpoint::Mic) {
                                 format!("1~{} 중 하나", config.channels)
@@ -290,84 +386,112 @@ impl SceneForm {
 
 impl Render for SceneForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut sources = panel()
-            .flex_1()
-            .min_w_0()
+        let busy = self.is_busy(cx);
+        let (title, description) = match &self.setup {
+            Setup::New(_) => (
+                "새 Scene 만들기",
+                "장치와 보컬 설정을 새 파일로 저장하세요. 오디오는 시작 버튼으로 켭니다.",
+            ),
+            Setup::Sound(_) => (
+                "보컬 설정 편집",
+                "저장된 시작 설정을 편집합니다. 장치·라우팅 설정을 유지해 새 Scene으로 저장합니다.",
+            ),
+        };
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
             .gap_5()
-            .child(section_title("01", "소스 선택"))
-            .child(self.device_field(Endpoint::Mic, "new-mic", "내 목소리 · 필수", window, cx))
-            .child(self.device_field(Endpoint::Aux, "new-aux", "AUX / MR · 선택", window, cx));
-        if selected(&self.aux.select, cx).is_some() {
-            sources = sources.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("AUX를 보낼 곳"),
-                    )
-                    .child(select_control(
-                        "new-aux-to",
-                        "AUX를 보낼 곳",
-                        &self.aux_to,
-                        None,
-                        window,
-                        cx,
-                    )),
-            );
-        }
-        sources = sources.child(
-            div()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .child("AUX는 녹음 장치의 소리를 받습니다. 보컬 보정은 거치지 않습니다."),
-        );
-        let destinations = panel()
-            .flex_1()
-            .min_w_0()
-            .gap_5()
-            .child(section_title("02", "목적지 선택"))
-            .child(self.device_field(Endpoint::Output, "new-output", "주 출력 · 필수", window, cx))
-            .child(self.device_field(Endpoint::Send, "new-send", "추가 송출 · 선택", window, cx))
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .child("헤드폰이나 설치된 가상 케이블의 재생 장치를 선택하세요."),
-            );
-        div().flex().flex_col().flex_shrink_0().gap_5()
-            .child(div().flex().items_center().justify_between().gap_4()
-                .child(div().flex_1().min_w_0().flex().flex_col().gap_1()
-                    .child(div().text_2xl().font_semibold().child("새 Scene 만들기"))
-                    .child(div().text_sm().text_color(rgb(MUTED))
-                        .child("장치와 시작 설정을 새 파일로 저장하세요. 오디오는 시작 버튼으로 켭니다.")))
-                .child(div().flex().flex_shrink_0().gap_2()
-                    .child(button("cancel-new-scene", "취소", false).accessibility_label("새 Scene 취소").disabled(self.busy)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.busy { cx.emit(FormEvent::Cancel); }
-                        })))
-                    .child(button("save-new-scene", "새 파일로 저장", true).accessibility_label("새 Scene 파일로 저장").disabled(self.busy)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if !this.busy { cx.emit(FormEvent::Save); }
-                        })))))
-            .children(self.error.as_ref().map(|error| panel().id("new-scene-error")
-                .role(Role::Alert).aria_label(error.clone()).gap_2().border_color(rgb(DANGER))
-                .child(div().font_semibold().text_color(rgb(DANGER)).child("설정을 확인해 주세요"))
-                .child(div().text_sm().child(error.clone()))))
-            .child(div().flex().items_start().gap_5().child(sources).child(destinations))
-            .child(panel().gap_3()
-                .child(section_title("03", "내장 보컬 보정"))
-                .child(div().max_w(px(440.)).child(select_control("new-vocal", "내장 보컬 보정", &self.vocal, None, window, cx)))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_2xl().font_semibold().child(title))
+                            .child(div().text_sm().text_color(rgb(MUTED)).child(description)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_shrink_0()
+                            .gap_2()
+                            .child(
+                                button("cancel-new-scene", "취소", false)
+                                    .accessibility_label("새 Scene 취소")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.is_busy(cx) {
+                                            cx.emit(FormEvent::Cancel);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                button("save-new-scene", "새 파일로 저장", true)
+                                    .accessibility_label("새 Scene 파일로 저장")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.is_busy(cx) {
+                                            cx.emit(FormEvent::Save);
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+            .children(self.error.as_ref().map(|error| {
+                panel()
+                    .id("new-scene-error")
+                    .role(Role::Alert)
+                    .aria_label(error.clone())
+                    .gap_2()
+                    .border_color(rgb(DANGER))
+                    .child(
+                        div()
+                            .font_semibold()
+                            .text_color(rgb(DANGER))
+                            .child("설정을 확인해 주세요"),
+                    )
+                    .child(div().text_sm().child(error.clone()))
+            }));
+        if let Setup::New(setup) = &self.setup {
+            content = content.child(setup.render(window, cx))
                 .child(div().text_xs().text_color(rgb(MUTED))
-                    .child("시작 음량 −18 dB · AUX −12 dB · 보정 비율 100%. 실행 중 출력·경로 음량을 조절할 수 있습니다."))
-                .child(div().text_xs().text_color(rgb(MUTED))
-                    .child("새 Scene에는 VST3가 없습니다. 기존 체인은 Scene 열기로 불러오세요.")))
-            .child(div().text_xs().text_color(rgb(MUTED))
-                .child("채널은 이 WASAPI 장치가 노출한 번호입니다. ASIO·물리 단자·하드웨어 루프백 번호와의 대응은 장치에서 확인하세요."))
+                    .child("시작 음량 −18 dB · AUX −12 dB. 채널은 이 WASAPI 장치가 노출한 번호입니다. ASIO·물리 단자·하드웨어 루프백 번호와의 대응은 장치에서 확인하세요."));
+        }
+        content.child(self.sound.clone())
     }
+}
+
+pub(crate) fn text_input(
+    label: &str,
+    value: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<InputState> {
+    cx.new(|cx| {
+        let mut state = InputState::new(window, cx).default_value(value.to_owned());
+        state.set_editor_style(InputEditorStyle {
+            foreground: rgb(TEXT).into(),
+            muted_foreground: rgb(MUTED).into(),
+            background: rgb(BACKGROUND).into(),
+            border: rgb(BORDER).into(),
+            selection: rgb(RAISED).into(),
+            caret: rgb(ACCENT).into(),
+            ..Default::default()
+        });
+        state.set_accessibility(
+            InputAccessibility::new(Some(Role::TextInput))
+                .with_label(Some(label.to_owned().into())),
+        );
+        state
+    })
 }
 
 fn endpoint_field(
@@ -393,27 +517,12 @@ fn endpoint_field(
             state
         }
     });
-    let channels = cx.new(|cx| {
-        let mut state = InputState::new(window, cx).default_value(value);
-        state.set_editor_style(InputEditorStyle {
-            foreground: rgb(TEXT).into(),
-            muted_foreground: rgb(MUTED).into(),
-            background: rgb(BACKGROUND).into(),
-            border: rgb(BORDER).into(),
-            selection: rgb(RAISED).into(),
-            caret: rgb(ACCENT).into(),
-            ..Default::default()
-        });
-        state.set_accessibility(
-            InputAccessibility::new(Some(Role::TextInput)).with_label(Some(label.into())),
-        );
-        state.set_disabled(true, cx);
-        state
-    });
+    let channels = text_input(label, value, window, cx);
+    channels.update(cx, |state, cx| state.set_disabled(true, cx));
     EndpointField { select, channels }
 }
 
-fn selected(state: &Entity<SelectState>, cx: &App) -> Option<String> {
+pub(crate) fn selected(state: &Entity<SelectState>, cx: &App) -> Option<String> {
     state
         .read(cx)
         .selected_item()
@@ -421,7 +530,7 @@ fn selected(state: &Entity<SelectState>, cx: &App) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn channel_input(
+pub(crate) fn number_input(
     id: &'static str,
     state: &Entity<InputState>,
     window: &Window,
@@ -443,7 +552,7 @@ fn channel_input(
         .child(Input::new(state))
 }
 
-fn select_control(
+pub(crate) fn select_control(
     id: &'static str,
     label: &'static str,
     state: &Entity<SelectState>,

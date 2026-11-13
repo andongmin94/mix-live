@@ -68,9 +68,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-plugins.exe edit --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check native New Scene validation without opening audio or plugins
+      - name: Check native Scene creation and sound editing without opening audio or plugins
         shell: powershell
-        timeout-minutes: 2
+        timeout-minutes: 3
         env:
           # Preserve Unicode labels when the generated script is read by Windows PowerShell 5.1.
           MIXLIVE_UI_NEW: '새 Scene'
@@ -80,6 +80,11 @@ jobs:
           MIXLIVE_UI_MIC: '내 목소리 · 필수'
           MIXLIVE_UI_OUTPUT: '주 출력 · 필수'
           MIXLIVE_UI_REQUIRED: '내 목소리 입력 장치를 선택하세요.'
+          MIXLIVE_UI_EDIT: '보컬 설정'
+          MIXLIVE_UI_TRIM: '마이크 입력 trim'
+          MIXLIVE_UI_BLEND: '보컬 보정 비율'
+          MIXLIVE_UI_MOVE_SECOND: 'VST3 2 위로'
+          MIXLIVE_UI_WORKSPACE: 'Scene 작업 영역'
         run: |
           Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
           function Find-UiName([string]$name) {
@@ -97,6 +102,42 @@ jobs:
               Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $limit)
             throw "MixLive did not expose the expected control: $name"
+          }
+          function Invoke-UiName([string]$name) {
+            $element = Wait-UiName $name -Enabled
+            $element.SetFocus()
+            # GPUI Design buttons request native autoscroll on focus. Wait for the revealed frame.
+            $limit = [DateTime]::UtcNow.AddSeconds(10)
+            do {
+              $element = Wait-UiName $name -Enabled
+              $area = (Wait-UiName $env:MIXLIVE_UI_WORKSPACE).Current.BoundingRectangle
+              $bounds = $element.Current.BoundingRectangle
+              if ($element.Current.HasKeyboardFocus -and $bounds.Width -gt 0 -and $bounds.Height -gt 0 -and
+                  $bounds.Top -ge $area.Top -and $bounds.Bottom -le $area.Bottom -and
+                  $bounds.Left -ge $area.Left -and $bounds.Right -le $area.Right) {
+                ([System.Windows.Automation.InvokePattern]$element.GetCurrentPattern(
+                  [System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+                return
+              }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $limit)
+            throw "MixLive did not focus and reveal the control: $name"
+          }
+          function Read-UiValue([string]$name) {
+            $element = Wait-UiName $name -Enabled
+            ([System.Windows.Automation.ValuePattern]$element.GetCurrentPattern(
+              [System.Windows.Automation.ValuePattern]::Pattern)).Current.Value
+          }
+          function Set-UiValue([string]$name, [string]$value) {
+            $element = Wait-UiName $name -Enabled
+            ([System.Windows.Automation.ValuePattern]$element.GetCurrentPattern(
+              [System.Windows.Automation.ValuePattern]::Pattern)).SetValue($value)
+            $limit = [DateTime]::UtcNow.AddSeconds(10)
+            do {
+              if ((Read-UiValue $name) -ceq $value) { return }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $limit)
+            throw "MixLive did not apply the edited value: $name"
           }
           $app = Start-Process ./target/release/mixlive.exe -PassThru
           try {
@@ -142,6 +183,139 @@ jobs:
             Write-Output 'Native New Scene form, required-device validation, cancel and normal exit passed.'
           } finally {
             if (!$app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+
+          # Synthetic IDs and absent DLLs prove that opening/editing/saving a Scene is file-only.
+          $sceneDirectory = Join-Path $env:RUNNER_TEMP ('mixlive-scene-ui-' + [Guid]::NewGuid().ToString('N'))
+          $null = New-Item -ItemType Directory -Path $sceneDirectory
+          $originalPath = Join-Path $sceneDirectory 'Original scene.mixlive-scene.json'
+          $savedPath = Join-Path $sceneDirectory 'Edited scene.mixlive-scene.json'
+          $pluginPath = Join-Path $sceneDirectory 'not-installed.vst3'
+          $scene = [ordered]@{
+            schema = 3
+            route = [ordered]@{
+              input = 'ci-absent-mic'; input_channel = 2
+              aux_input = 'ci-absent-aux'; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
+              output = 'ci-absent-output'; output_channels = @(4, 3)
+              send = 'ci-absent-send'; send_channels = @(1)
+              input_gain_db = 1.25; output_gain_db = -23; send_gain_db = -6
+              vocal = 'warm'; vocal_strength = 0.75; vocal_threshold_db = -20; deess_threshold_db = -28
+              queue_ms = 20
+            }
+            effects = @(
+              [ordered]@{ plugin = $pluginPath; class_id = '0123456789ABCDEF0123456789ABCDEF'; state = @(1, 2) },
+              [ordered]@{ plugin = $pluginPath; class_id = 'FEDCBA9876543210FEDCBA9876543210'; state = @(3, 4) }
+            )
+          }
+          [IO.File]::WriteAllText($originalPath, ($scene | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
+          $originalHash = (Get-FileHash -LiteralPath $originalPath -Algorithm SHA256).Hash
+          $app = Start-Process ./target/release/mixlive.exe -ArgumentList ('"{0}"' -f $originalPath) -PassThru
+          try {
+            $deadline = [DateTime]::UtcNow.AddSeconds(20)
+            do {
+              Start-Sleep -Milliseconds 250
+              $app.Refresh()
+            } while (!$app.HasExited -and $app.MainWindowHandle -eq 0 -and [DateTime]::UtcNow -lt $deadline)
+            if ($app.HasExited) { throw "MixLive exited before opening the synthetic Scene: $($app.ExitCode)" }
+            if ($app.MainWindowHandle -eq 0) { throw 'MixLive did not open its Scene window' }
+            $window = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindowHandle)
+            $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
+            Invoke-UiName $env:MIXLIVE_UI_EDIT
+            $null = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
+            if ((Wait-UiName $env:MIXLIVE_UI_START).Current.IsEnabled) { throw 'Audio start must be disabled while editing' }
+            if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '1.25') { throw 'Saved mic trim was not loaded into the editor' }
+            Set-UiValue $env:MIXLIVE_UI_TRIM '3.5'
+            Invoke-UiName $env:MIXLIVE_UI_MOVE_SECOND
+            Invoke-UiName $env:MIXLIVE_UI_CANCEL
+            $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
+            if ((Get-FileHash -LiteralPath $originalPath -Algorithm SHA256).Hash -ne $originalHash) {
+              throw 'Cancelling sound edits changed the original Scene file'
+            }
+
+            Invoke-UiName $env:MIXLIVE_UI_EDIT
+            $null = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
+            if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '1.25') { throw 'Cancelled edits changed the selected Scene' }
+            Set-UiValue $env:MIXLIVE_UI_TRIM '3.5'
+            Set-UiValue $env:MIXLIVE_UI_BLEND '0.5'
+            Invoke-UiName $env:MIXLIVE_UI_MOVE_SECOND
+            Invoke-UiName $env:MIXLIVE_UI_SAVE
+
+            # GPUI uses the in-process IFileSaveDialog. Locate its native structure, not coordinates.
+            $dialogCondition = [System.Windows.Automation.AndCondition]::new(
+              [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $app.Id),
+              [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty, '#32770'))
+            $filenameCondition = [System.Windows.Automation.PropertyCondition]::new(
+              [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'FileNameControlHost')
+            $limit = [DateTime]::UtcNow.AddSeconds(10)
+            $filenameHost = $null
+            do {
+              $dialogs = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+                [System.Windows.Automation.TreeScope]::Descendants, $dialogCondition)
+              if ($dialogs.Count -eq 1) {
+                $dialog = $dialogs[0]
+                $filenameHost = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $filenameCondition)
+                if ($null -ne $filenameHost) { break }
+              }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $limit)
+            if ($null -eq $filenameHost) { throw 'The native Scene save dialog did not expose its file-name control' }
+            $editCondition = [System.Windows.Automation.PropertyCondition]::new(
+              [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
+            $filenameEdits = $filenameHost.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
+            if ($filenameEdits.Count -ne 1) { throw 'The native save dialog did not expose one file-name editor' }
+            $filenameValue = [System.Windows.Automation.ValuePattern]$filenameEdits[0].GetCurrentPattern(
+              [System.Windows.Automation.ValuePattern]::Pattern)
+            $filenameValue.SetValue($savedPath)
+            if ($filenameValue.Current.Value -cne $savedPath) { throw 'The native save dialog did not accept the chosen path' }
+            $confirmCondition = [System.Windows.Automation.AndCondition]::new(
+              [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'),
+              [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button))
+            $confirm = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $confirmCondition)
+            if ($null -eq $confirm -or !$confirm.Current.IsEnabled) { throw 'The native save dialog did not expose an enabled Save button' }
+            ([System.Windows.Automation.InvokePattern]$confirm.GetCurrentPattern(
+              [System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
+            $null = Wait-UiName $env:MIXLIVE_UI_EDIT -Enabled
+            $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
+            if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
+            $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json
+            if ($saved.schema -ne 3 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
+              throw 'The saved Scene did not contain the edited vocal values'
+            }
+            foreach ($field in $scene.route.Keys) {
+              if ($field -in @('input_gain_db', 'vocal_strength')) { continue }
+              $expected = $scene.route[$field]
+              $actual = $saved.route.$field
+              if ($expected -is [array]) {
+                if (@($actual).Count -ne $expected.Count -or ($actual -join ',') -cne ($expected -join ',')) {
+                  throw "Sound editing changed the route array: $field"
+                }
+              } elseif ($actual -cne $expected) { throw "Sound editing changed the route field: $field" }
+            }
+            if ($saved.effects.Count -ne 2) { throw 'Sound editing changed the number of VST3 slots' }
+            for ($slot = 0; $slot -lt 2; $slot++) {
+              $expected = $scene.effects[1 - $slot]
+              $actual = $saved.effects[$slot]
+              if ([IO.Path]::GetFullPath($actual.plugin) -ne [IO.Path]::GetFullPath($expected.plugin) -or
+                  $actual.class_id -cne $expected.class_id -or ($actual.state -join ',') -cne ($expected.state -join ',')) {
+                throw "Reordering VST3 slots lost the matching path/class/state at slot $slot"
+              }
+            }
+            if ((Get-FileHash -LiteralPath $originalPath -Algorithm SHA256).Hash -ne $originalHash) {
+              throw 'Saving sound edits replaced the original Scene file'
+            }
+            Invoke-UiName $env:MIXLIVE_UI_EDIT
+            if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '3.5' -or (Read-UiValue $env:MIXLIVE_UI_BLEND) -cne '0.5') {
+              throw 'Saving did not select the newly saved Scene'
+            }
+            Invoke-UiName $env:MIXLIVE_UI_CANCEL
+            $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
+            if (!$app.CloseMainWindow()) { throw 'MixLive did not accept window close after Scene editing' }
+            if (!$app.WaitForExit(10000)) { throw 'MixLive did not exit after Scene editing' }
+            if ($app.ExitCode -ne 0) { throw "MixLive exited with code $($app.ExitCode)" }
+            Write-Output 'Native sound editing, cancel, new-file save, route preservation and ordered VST3 states passed.'
+          } finally {
+            if (!$app.HasExited) { Stop-Process -Id $app.Id -Force }
+            Remove-Item -LiteralPath $sceneDirectory -Recurse -Force
           }
       - name: Keep development binaries, notices and resolved dependencies
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
