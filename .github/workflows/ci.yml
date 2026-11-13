@@ -112,16 +112,23 @@ jobs:
               $element = Wait-UiName $name -Enabled
               $area = (Wait-UiName $env:MIXLIVE_UI_WORKSPACE).Current.BoundingRectangle
               $bounds = $element.Current.BoundingRectangle
-              if ($element.Current.HasKeyboardFocus -and $bounds.Width -gt 0 -and $bounds.Height -gt 0 -and
-                  $bounds.Top -ge $area.Top -and $bounds.Bottom -le $area.Bottom -and
-                  $bounds.Left -ge $area.Left -and $bounds.Right -le $area.Right) {
+              $focused = $element.Current.HasKeyboardFocus
+              $centerX = $bounds.Left + $bounds.Width / 2
+              $centerY = $bounds.Top + $bounds.Height / 2
+              # GPUI activates at the AX bounds center. Button focus reveal excludes its 1px border.
+              if ($focused -and $bounds.Width -gt 0 -and $bounds.Height -gt 0 -and
+                  $centerY -gt $area.Top -and $centerY -lt $area.Bottom -and
+                  $centerX -gt $area.Left -and $centerX -lt $area.Right) {
+                Write-Output ("UIA Invoke {0}: focused={1}; bounds={2}; workspace={3}; center=({4},{5})" -f
+                  $name, $focused, $bounds, $area, $centerX, $centerY)
                 ([System.Windows.Automation.InvokePattern]$element.GetCurrentPattern(
                   [System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
                 return
               }
               Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $limit)
-            throw "MixLive did not focus and reveal the control: $name"
+            throw ("MixLive did not focus and reveal the activation point: {0}; focused={1}; bounds={2}; workspace={3}; center=({4},{5})" -f
+              $name, $focused, $bounds, $area, $centerX, $centerY)
           }
           function Read-UiValue([string]$name) {
             $element = Wait-UiName $name -Enabled
