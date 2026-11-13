@@ -37,11 +37,12 @@ Windows MSVC 대상 앱 all-targets Clippy(`-D warnings`) 통과.
 새 검사는 기존 Scene의 전체 설정 보존, 보컬 값 검증, 중복 DLL 슬롯의 독립 class/state,
 순서 변경/삭제, 체인 추가 실패의 원자성, 새 Scene·편집 Scene의 저장/재열기를 확인한다.
 
-[Audio #21](https://github.com/andongmin94/mix-live/actions/runs/43394034507)에서 Windows tests
+[Audio #22](https://github.com/andongmin94/mix-live/actions/runs/43395559256)에서 Windows tests
 83개(workspace 74 + native fixture 9), 전체 Clippy, release 실행 파일 3개 빌드,
 새 Scene 미선택 오류/취소/정상 종료가 통과했다. 보컬 편집의 값 변경·포커스 스크롤·취소·
-재열기와 native 저장 대화상자 열기도 통과했다. 저장 검사가 파일명 컨트롤 아래의 Edit을
-가정해 중단되어, 관측한 `FileNameControlHost` 자체의 ValuePattern으로 수정해 재검증한다.
+재열기와 native 저장 대화상자 열기도 통과했다. runner의 `FileNameControlHost`는 값을 쓸 수
+없는 Pane이었다. 앱이 SetFileName으로 넣은 기본 이름을 실제 값으로 가진 writable Edit가
+준비될 때까지 대화상자 전체에서 기다리는 방식으로 저장 검사를 수정해 재검증한다.
 실제 새 파일 저장·체인 순서·원본 보존 검증은 유지하며 최종 결과는 Actions 완료 후 기록한다.
 
 ## 남은 작업과 제한

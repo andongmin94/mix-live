@@ -85,6 +85,7 @@ jobs:
           MIXLIVE_UI_BLEND: '보컬 보정 비율'
           MIXLIVE_UI_MOVE_SECOND: 'VST3 2 위로'
           MIXLIVE_UI_WORKSPACE: 'Scene 작업 영역'
+          MIXLIVE_UI_SUGGESTED_FILENAME: '새 Scene.mixlive-scene.json'
         run: |
           Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
           function Find-UiName([string]$name) {
@@ -251,37 +252,78 @@ jobs:
             $dialogCondition = [System.Windows.Automation.AndCondition]::new(
               [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $app.Id),
               [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty, '#32770'))
-            $filenameCondition = [System.Windows.Automation.PropertyCondition]::new(
-              [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'FileNameControlHost')
+            $editCondition = [System.Windows.Automation.PropertyCondition]::new(
+              [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
             $limit = [DateTime]::UtcNow.AddSeconds(10)
-            $filenameHost = $null
             do {
+              $dialog = $null
+              $filenameEdits = @()
               $dialogs = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
                 [System.Windows.Automation.TreeScope]::Descendants, $dialogCondition)
               if ($dialogs.Count -eq 1) {
                 $dialog = $dialogs[0]
-                $filenameHost = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $filenameCondition)
-                if ($null -ne $filenameHost) { break }
+                $edits = $dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
+                foreach ($candidate in $edits) {
+                  $candidatePattern = $null
+                  if ($candidate.Current.IsEnabled -and $candidate.TryGetCurrentPattern(
+                      [System.Windows.Automation.ValuePattern]::Pattern, [ref]$candidatePattern)) {
+                    $candidateValue = ([System.Windows.Automation.ValuePattern]$candidatePattern).Current
+                    if (!$candidateValue.IsReadOnly -and $candidateValue.Value -ceq $env:MIXLIVE_UI_SUGGESTED_FILENAME) {
+                      $filenameEdits += $candidate
+                    }
+                  }
+                }
+                if ($filenameEdits.Count -eq 1) { break }
               }
               Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $limit)
-            if ($null -eq $filenameHost) { throw 'The native Scene save dialog did not expose its file-name control' }
-            $filenamePatterns = @($filenameHost.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName })
-            Write-Output ("Native FileNameControlHost: type={0}; class={1}; enabled={2}; patterns={3}" -f
-              $filenameHost.Current.ControlType.ProgrammaticName, $filenameHost.Current.ClassName,
-              $filenameHost.Current.IsEnabled, ($filenamePatterns -join ', '))
-            $filenamePattern = $null
-            if (!$filenameHost.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$filenamePattern)) {
-              throw 'The native FileNameControlHost does not support ValuePattern'
+            if ($filenameEdits.Count -ne 1) {
+              Write-Output ("Native save dialogs={0}; matching filename editors={1}" -f $dialogs.Count, $filenameEdits.Count)
+              $candidateCondition = [System.Windows.Automation.OrCondition]::new(
+                $editCondition, [System.Windows.Automation.PropertyCondition]::new(
+                  [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ComboBox))
+              foreach ($candidateDialog in $dialogs) {
+                $candidates = $candidateDialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, $candidateCondition)
+                Write-Output ("Native save dialog {0}: Edit/ComboBox candidates={1}" -f $candidateDialog.Current.Name, $candidates.Count)
+                foreach ($candidate in $candidates) {
+                  $candidatePatterns = @($candidate.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName })
+                  $candidatePattern = $null
+                  $candidateText = '<no ValuePattern>'
+                  $candidateReadOnly = '<no ValuePattern>'
+                  if ($candidate.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$candidatePattern)) {
+                    $candidateValue = ([System.Windows.Automation.ValuePattern]$candidatePattern).Current
+                    $candidateText = $candidateValue.Value
+                    $candidateReadOnly = $candidateValue.IsReadOnly
+                  }
+                  Write-Output ("Native filename candidate: id={0}; name={1}; type={2}; class={3}; enabled={4}; patterns={5}; readonly={6}; value={7}" -f
+                    $candidate.Current.AutomationId, $candidate.Current.Name, $candidate.Current.ControlType.ProgrammaticName,
+                    $candidate.Current.ClassName, $candidate.Current.IsEnabled, ($candidatePatterns -join ', '), $candidateReadOnly, $candidateText)
+                }
+              }
+              throw 'The native save dialog did not expose exactly one writable filename editor with the suggested name'
             }
-            $filenameValue = [System.Windows.Automation.ValuePattern]$filenamePattern
+            $filenameEdit = $filenameEdits[0]
+            $filenameValue = [System.Windows.Automation.ValuePattern]$filenameEdit.GetCurrentPattern(
+              [System.Windows.Automation.ValuePattern]::Pattern)
+            Write-Output ("Native filename editor selected: id={0}; name={1}; type={2}; class={3}; enabled={4}; readonly={5}; value={6}" -f
+              $filenameEdit.Current.AutomationId, $filenameEdit.Current.Name, $filenameEdit.Current.ControlType.ProgrammaticName,
+              $filenameEdit.Current.ClassName, $filenameEdit.Current.IsEnabled, $filenameValue.Current.IsReadOnly, $filenameValue.Current.Value)
             $filenameValue.SetValue($savedPath)
             if ($filenameValue.Current.Value -cne $savedPath) { throw 'The native save dialog did not accept the chosen path' }
             $confirmCondition = [System.Windows.Automation.AndCondition]::new(
               [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'),
               [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button))
             $confirm = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $confirmCondition)
-            if ($null -eq $confirm -or !$confirm.Current.IsEnabled) { throw 'The native save dialog did not expose an enabled Save button' }
+            if ($null -eq $confirm -or !$confirm.Current.IsEnabled) {
+              $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+              $buttons = $dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)
+              foreach ($candidate in $buttons) {
+                Write-Output ("Native save dialog button: id={0}; name={1}; enabled={2}" -f
+                  $candidate.Current.AutomationId, $candidate.Current.Name, $candidate.Current.IsEnabled)
+              }
+              throw 'The native save dialog did not expose an enabled Save button'
+            }
             ([System.Windows.Automation.InvokePattern]$confirm.GetCurrentPattern(
               [System.Windows.Automation.InvokePattern]::Pattern)).Invoke()
             $null = Wait-UiName $env:MIXLIVE_UI_EDIT -Enabled
