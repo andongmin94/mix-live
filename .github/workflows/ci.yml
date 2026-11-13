@@ -85,9 +85,22 @@ jobs:
           MIXLIVE_UI_BLEND: '보컬 보정 비율'
           MIXLIVE_UI_MOVE_SECOND: 'VST3 2 위로'
           MIXLIVE_UI_WORKSPACE: 'Scene 작업 영역'
-          MIXLIVE_UI_SUGGESTED_FILENAME: '새 Scene.mixlive-scene.json'
         run: |
-          Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+          Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
+          if ([Threading.Thread]::CurrentThread.ApartmentState -ne [Threading.ApartmentState]::STA) {
+            throw 'Native save keyboard verification requires the Windows PowerShell STA thread'
+          }
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class NativeDialogWindow {
+              [DllImport("user32.dll")]
+              [return: MarshalAs(UnmanagedType.Bool)]
+              public static extern bool SetForegroundWindow(IntPtr window);
+              [DllImport("user32.dll")]
+              public static extern IntPtr GetForegroundWindow();
+          }
+          '@
           function Find-UiName([string]$name) {
             $condition = [System.Windows.Automation.PropertyCondition]::new(
               [System.Windows.Automation.AutomationElement]::NameProperty, $name)
@@ -248,68 +261,49 @@ jobs:
             Invoke-UiName $env:MIXLIVE_UI_MOVE_SECOND
             Invoke-UiName $env:MIXLIVE_UI_SAVE
 
-            # GPUI uses the in-process IFileSaveDialog. Locate its native structure, not coordinates.
+            # GPUI uses the in-process IFileSaveDialog. Target the observed dialog HWND.
             $dialogCondition = [System.Windows.Automation.AndCondition]::new(
               [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $app.Id),
               [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty, '#32770'))
-            $editCondition = [System.Windows.Automation.PropertyCondition]::new(
-              [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
             $limit = [DateTime]::UtcNow.AddSeconds(10)
             do {
-              $dialog = $null
-              $filenameEdits = @()
               $dialogs = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
                 [System.Windows.Automation.TreeScope]::Descendants, $dialogCondition)
-              if ($dialogs.Count -eq 1) {
-                $dialog = $dialogs[0]
-                $edits = $dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCondition)
-                foreach ($candidate in $edits) {
-                  $candidatePattern = $null
-                  if ($candidate.Current.IsEnabled -and $candidate.TryGetCurrentPattern(
-                      [System.Windows.Automation.ValuePattern]::Pattern, [ref]$candidatePattern)) {
-                    $candidateValue = ([System.Windows.Automation.ValuePattern]$candidatePattern).Current
-                    if (!$candidateValue.IsReadOnly -and $candidateValue.Value -ceq $env:MIXLIVE_UI_SUGGESTED_FILENAME) {
-                      $filenameEdits += $candidate
-                    }
-                  }
-                }
-                if ($filenameEdits.Count -eq 1) { break }
-              }
+              if ($dialogs.Count -eq 1) { break }
               Start-Sleep -Milliseconds 250
             } while ([DateTime]::UtcNow -lt $limit)
-            if ($filenameEdits.Count -ne 1) {
-              Write-Output ("Native save dialogs={0}; matching filename editors={1}" -f $dialogs.Count, $filenameEdits.Count)
-              $candidateCondition = [System.Windows.Automation.OrCondition]::new(
-                $editCondition, [System.Windows.Automation.PropertyCondition]::new(
-                  [System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ComboBox))
-              foreach ($candidateDialog in $dialogs) {
-                $candidates = $candidateDialog.FindAll([System.Windows.Automation.TreeScope]::Descendants, $candidateCondition)
-                Write-Output ("Native save dialog {0}: Edit/ComboBox candidates={1}" -f $candidateDialog.Current.Name, $candidates.Count)
-                foreach ($candidate in $candidates) {
-                  $candidatePatterns = @($candidate.GetSupportedPatterns() | ForEach-Object { $_.ProgrammaticName })
-                  $candidatePattern = $null
-                  $candidateText = '<no ValuePattern>'
-                  $candidateReadOnly = '<no ValuePattern>'
-                  if ($candidate.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$candidatePattern)) {
-                    $candidateValue = ([System.Windows.Automation.ValuePattern]$candidatePattern).Current
-                    $candidateText = $candidateValue.Value
-                    $candidateReadOnly = $candidateValue.IsReadOnly
-                  }
-                  Write-Output ("Native filename candidate: id={0}; name={1}; type={2}; class={3}; enabled={4}; patterns={5}; readonly={6}; value={7}" -f
-                    $candidate.Current.AutomationId, $candidate.Current.Name, $candidate.Current.ControlType.ProgrammaticName,
-                    $candidate.Current.ClassName, $candidate.Current.IsEnabled, ($candidatePatterns -join ', '), $candidateReadOnly, $candidateText)
-                }
-              }
-              throw 'The native save dialog did not expose exactly one writable filename editor with the suggested name'
+            if ($dialogs.Count -ne 1) { throw "Expected one native Scene save dialog; observed $($dialogs.Count)" }
+            $dialog = $dialogs[0]
+            $dialogHandle = [IntPtr]$dialog.Current.NativeWindowHandle
+            $activated = [NativeDialogWindow]::SetForegroundWindow($dialogHandle)
+            $limit = [DateTime]::UtcNow.AddSeconds(10)
+            do {
+              $foreground = [NativeDialogWindow]::GetForegroundWindow()
+              if ($foreground -eq $dialogHandle) { break }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $limit)
+            if ($foreground -ne $dialogHandle) {
+              throw "Native save dialog did not become foreground: expected=$dialogHandle; actual=$foreground; activation=$activated"
             }
-            $filenameEdit = $filenameEdits[0]
-            $filenameValue = [System.Windows.Automation.ValuePattern]$filenameEdit.GetCurrentPattern(
-              [System.Windows.Automation.ValuePattern]::Pattern)
-            Write-Output ("Native filename editor selected: id={0}; name={1}; type={2}; class={3}; enabled={4}; readonly={5}; value={6}" -f
-              $filenameEdit.Current.AutomationId, $filenameEdit.Current.Name, $filenameEdit.Current.ControlType.ProgrammaticName,
-              $filenameEdit.Current.ClassName, $filenameEdit.Current.IsEnabled, $filenameValue.Current.IsReadOnly, $filenameValue.Current.Value)
-            $filenameValue.SetValue($savedPath)
-            if ($filenameValue.Current.Value -cne $savedPath) { throw 'The native save dialog did not accept the chosen path' }
+            # The English runner's standard Save As uses Alt+N for File name.
+            # Copy readback acknowledges actual input processing across processes before Save.
+            [System.Windows.Forms.Clipboard]::Clear()
+            $escapedPath = [regex]::Replace($savedPath, '[+^%~(){}\[\]]',
+              [System.Text.RegularExpressions.MatchEvaluator]{ param($match) '{' + $match.Value + '}' })
+            [System.Windows.Forms.SendKeys]::SendWait('%n^a' + $escapedPath + '^a^c')
+            $limit = [DateTime]::UtcNow.AddSeconds(10)
+            $observedPath = ''
+            do {
+              $foreground = [NativeDialogWindow]::GetForegroundWindow()
+              if ($foreground -ne $dialogHandle) { throw "Native save dialog lost foreground: expected=$dialogHandle; actual=$foreground" }
+              if ([System.Windows.Forms.Clipboard]::ContainsText([System.Windows.Forms.TextDataFormat]::UnicodeText)) {
+                $observedPath = [System.Windows.Forms.Clipboard]::GetText([System.Windows.Forms.TextDataFormat]::UnicodeText)
+              }
+              if ($observedPath -ceq $savedPath) { break }
+              Start-Sleep -Milliseconds 250
+            } while ([DateTime]::UtcNow -lt $limit)
+            if ($observedPath -cne $savedPath) { throw "Native filename readback mismatch: expected=$savedPath; actual=$observedPath" }
+            Write-Output "Native save filename readback matched: hwnd=$dialogHandle; path=$observedPath"
             $confirmCondition = [System.Windows.Automation.AndCondition]::new(
               [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'),
               [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button))

@@ -255,8 +255,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo run -p mixlive-core --example discord_singing --locked
 ```
 
-Windows CI의 기존 native fixture 검사도 따른다. 화면 검사는 UIAutomation으로 실제 창과
-컨트롤을 조작한다. 임시 Scene의 장치 ID와 플러그인 경로는 합성 값이며 오디오 시작을 누르지 않는다.
+Windows CI의 기존 native fixture 검사도 따른다. 화면 검사는 UIAutomation과 Windows 키보드
+입력으로 실제 창과 컨트롤을 조작한다. 임시 Scene의 장치 ID와 플러그인 경로는 합성 값이며
+오디오 시작을 누르지 않는다.
 실제 오디오 장치를 열거나 상용 VST3 GUI를 조작하는 검사가 아니다.
 통과한 검사와 실제 장비·GUI·청취 수용을 구분한다. sample peak/GR은 LUFS/true peak가 아니다.
 
