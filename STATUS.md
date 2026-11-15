@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-15
-단계: **GPUI 기존 Scene 장치·출력 편집 구현 · Windows 통합 검증 대기**
+단계: **GPUI 기존 Scene 장치·출력 편집 및 Windows 통합 검증 완료**
 
 ## 현재 구현
 
@@ -37,10 +37,20 @@
 추가했다. 장치 catalog는 합성이며 장치나 DLL을 열지 않는다.
 Windows MSVC 대상 앱 all-targets Clippy(`--locked`, `-D warnings`)도 통과했다.
 
-기존 단일 Windows CI에 실제 GUI의 장치 편집 검사를 추가했다. 합성 저장 ID 네 개와 채널,
-시작값을 보존하는지, 누락 장치 저장을 거절하는지, 변경 후 취소·재열기가 원래 값을 유지하는지
-확인한다. 기존 보컬 편집·재정렬·native 새 파일 저장·정상 종료 검사는 유지했다.
-이번 코드의 Windows workspace/native fixture/Clippy/release/GUI 실행 결과는 대기 중이다.
+검증 기준 코드: `af551409f292059c8ad87450ef7c83694f26db50`.
+[Audio #26](https://github.com/andongmin94/mix-live/actions/runs/43690650750) 전체 성공:
+Windows tests **87개**(workspace 78 + native fixture 9), 전체 Clippy(`-D warnings`),
+`mixlive.exe`/`mixlive-audio.exe`/`mixlive-plugins.exe` release 빌드와 CLI help 통과.
+
+실제 GUI에서 합성 저장 ID 네 개와 채널·시작값 유지, 누락 장치 저장 거절(파일 대화상자 없음),
+음량/queue 변경 후 취소·재열기와 원본 파일 SHA 보존을 확인했다. 기존 새 Scene 필수 장치 오류,
+보컬 편집·VST3 재정렬·포커스 스크롤·native 새 파일 저장·정상 종료도 통과했다.
+native 파일 저장은 기존 foreground 키보드·정확한 경로 복사 readback 검사를 유지했다.
+장치 목록만 조회하고 오디오/상용 plugin을 열지 않는다. 장치 교체 후 저장 성공은 모델 검사다.
+
+[Windows 개발용 ZIP](https://github.com/andongmin94/mix-live/actions/runs/43690650750/artifacts/14152935772)
+(CI 7일 보관)에 실행 파일 3개·의존성 잠금 파일·README·라이선스 고지를 포함한다.
+다운로드 ZIP의 게시 SHA256 일치·전체 CRC와 실행 파일 3개의 x64 PE 형식을 확인했다.
 
 ## 남은 작업과 제한
 
