@@ -68,7 +68,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-plugins.exe edit --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Check native Scene creation and sound editing without opening audio or plugins
+      - name: Check native Scene creation, device and sound editing without opening audio or plugins
         shell: powershell
         timeout-minutes: 3
         env:
@@ -79,7 +79,20 @@ jobs:
           MIXLIVE_UI_CANCEL: '새 Scene 취소'
           MIXLIVE_UI_MIC: '내 목소리 · 필수'
           MIXLIVE_UI_OUTPUT: '주 출력 · 필수'
+          MIXLIVE_UI_AUX: 'AUX / MR · 선택'
+          MIXLIVE_UI_SEND: '추가 송출 · 선택'
           MIXLIVE_UI_REQUIRED: '내 목소리 입력 장치를 선택하세요.'
+          MIXLIVE_UI_DEVICES: '장치·출력 설정'
+          MIXLIVE_UI_MISSING_PREFIX: '현재 없는 장치 · '
+          MIXLIVE_UI_MISSING: '내 목소리 입력 장치가 조회한 목록에 없습니다. 장치 설정을 다시 열어 장치를 확인하세요.'
+          MIXLIVE_UI_MIC_CHANNEL: '마이크 채널'
+          MIXLIVE_UI_AUX_CHANNELS: 'AUX 채널'
+          MIXLIVE_UI_OUTPUT_CHANNELS: '주 출력 채널'
+          MIXLIVE_UI_SEND_CHANNELS: '추가 송출 채널'
+          MIXLIVE_UI_OUTPUT_GAIN: '전체 시작 음량'
+          MIXLIVE_UI_SEND_GAIN: '추가 송출 시작 음량'
+          MIXLIVE_UI_AUX_GAIN: 'AUX 입력 음량'
+          MIXLIVE_UI_QUEUE: '장치별 queue 목표'
           MIXLIVE_UI_EDIT: '보컬 설정'
           MIXLIVE_UI_TRIM: '마이크 입력 trim'
           MIXLIVE_UI_BLEND: '보컬 보정 비율'
@@ -144,8 +157,8 @@ jobs:
             throw ("MixLive did not focus and reveal the activation point: {0}; focused={1}; bounds={2}; workspace={3}; center=({4},{5})" -f
               $name, $focused, $bounds, $area, $centerX, $centerY)
           }
-          function Read-UiValue([string]$name) {
-            $element = Wait-UiName $name -Enabled
+          function Read-UiValue([string]$name, [switch]$AllowDisabled) {
+            $element = Wait-UiName $name -Enabled:(!$AllowDisabled)
             ([System.Windows.Automation.ValuePattern]$element.GetCurrentPattern(
               [System.Windows.Automation.ValuePattern]::Pattern)).Current.Value
           }
@@ -206,7 +219,7 @@ jobs:
             if (!$app.HasExited) { Stop-Process -Id $app.Id -Force }
           }
 
-          # Synthetic IDs and absent DLLs prove that opening/editing/saving a Scene is file-only.
+          # Synthetic IDs verify missing-device edits; vocal editing and saving remain file-only.
           $sceneDirectory = Join-Path $env:RUNNER_TEMP ('mixlive-scene-ui-' + [Guid]::NewGuid().ToString('N'))
           $null = New-Item -ItemType Directory -Path $sceneDirectory
           $originalPath = Join-Path $sceneDirectory 'Original scene.mixlive-scene.json'
@@ -241,6 +254,67 @@ jobs:
             if ($app.MainWindowHandle -eq 0) { throw 'MixLive did not open its Scene window' }
             $window = [System.Windows.Automation.AutomationElement]::FromHandle($app.MainWindowHandle)
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
+
+            $bindings = @(
+              @($env:MIXLIVE_UI_MIC, 'ci-absent-mic', $env:MIXLIVE_UI_MIC_CHANNEL, '2'),
+              @($env:MIXLIVE_UI_AUX, 'ci-absent-aux', $env:MIXLIVE_UI_AUX_CHANNELS, '4,3'),
+              @($env:MIXLIVE_UI_OUTPUT, 'ci-absent-output', $env:MIXLIVE_UI_OUTPUT_CHANNELS, '4,3'),
+              @($env:MIXLIVE_UI_SEND, 'ci-absent-send', $env:MIXLIVE_UI_SEND_CHANNELS, '1')
+            )
+            $startupValues = @(
+              @($env:MIXLIVE_UI_OUTPUT_GAIN, '-23'),
+              @($env:MIXLIVE_UI_SEND_GAIN, '-6'),
+              @($env:MIXLIVE_UI_AUX_GAIN, '-9'),
+              @($env:MIXLIVE_UI_QUEUE, '20')
+            )
+            # Reopening after cancelling must load the original values, including optional IDs.
+            for ($attempt = 0; $attempt -lt 2; $attempt++) {
+              Invoke-UiName $env:MIXLIVE_UI_DEVICES
+              $null = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
+              if ((Wait-UiName $env:MIXLIVE_UI_START).Current.IsEnabled) { throw 'Audio start must be disabled during device editing' }
+              foreach ($binding in $bindings) {
+                $select = Wait-UiName $binding[0] -Enabled
+                if ($select.Current.ControlType -ne [System.Windows.Automation.ControlType]::ComboBox) {
+                  throw "A saved device control is not a native-accessible select: $($binding[0])"
+                }
+                if ((Read-UiValue $binding[0]) -cne ($env:MIXLIVE_UI_MISSING_PREFIX + $binding[1])) {
+                  throw "Device editing lost or replaced a missing saved endpoint: $($binding[1])"
+                }
+                $channels = Wait-UiName $binding[2]
+                if ($channels.Current.IsEnabled) { throw "Unavailable endpoint channels must remain read-only: $($binding[2])" }
+                if ((Read-UiValue $binding[2] -AllowDisabled) -cne $binding[3]) {
+                  throw "Device editing changed saved channels: $($binding[2])"
+                }
+              }
+              foreach ($entry in $startupValues) {
+                if ((Read-UiValue $entry[0]) -cne $entry[1]) {
+                  throw "Device editing changed a saved startup value: $($entry[0])"
+                }
+              }
+              if ($attempt -eq 0) {
+                Invoke-UiName $env:MIXLIVE_UI_SAVE
+                $null = Wait-UiName $env:MIXLIVE_UI_MISSING
+                $null = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
+                $invalidSaveDialog = [System.Windows.Automation.AndCondition]::new(
+                  [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty, $app.Id),
+                  [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty, '#32770'))
+                if ([System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+                    [System.Windows.Automation.TreeScope]::Descendants, $invalidSaveDialog).Count -ne 0) {
+                  throw 'Invalid device settings opened a native save dialog'
+                }
+                Set-UiValue $env:MIXLIVE_UI_OUTPUT_GAIN '-31'
+                Set-UiValue $env:MIXLIVE_UI_SEND_GAIN '-14'
+                Set-UiValue $env:MIXLIVE_UI_AUX_GAIN '-15'
+                Set-UiValue $env:MIXLIVE_UI_QUEUE '40'
+              }
+              Invoke-UiName $env:MIXLIVE_UI_CANCEL
+              $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
+              if ((Get-FileHash -LiteralPath $originalPath -Algorithm SHA256).Hash -ne $originalHash) {
+                throw 'Cancelling device edits changed the original Scene file'
+              }
+            }
+            Write-Output 'Native device editing preserved missing IDs, channels and startup values; invalid save and cancel passed.'
+
             Invoke-UiName $env:MIXLIVE_UI_EDIT
             $null = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
             if ((Wait-UiName $env:MIXLIVE_UI_START).Current.IsEnabled) { throw 'Audio start must be disabled while editing' }

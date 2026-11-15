@@ -1,4 +1,4 @@
-//! Convert the new-Scene form into the existing schema. This layer has no device I/O.
+//! Editable startup devices and sound in the existing schema. This layer has no device I/O.
 
 use mixlive_audio_windows::{
     config::{AuxDestination, InputMap, OutputMap, RouteOptions},
@@ -14,15 +14,74 @@ pub struct SceneDraft {
     pub input_channel: String,
     pub output: Option<String>,
     pub output_channels: String,
+    pub output_gain_db: String,
     pub send: Option<String>,
     pub send_channels: String,
+    pub send_gain_db: String,
     pub aux_input: Option<String>,
     pub aux_channels: String,
+    pub aux_gain_db: String,
     pub aux_to: String,
+    pub queue_ms: String,
     pub sound: SoundDraft,
 }
 
+impl Default for SceneDraft {
+    fn default() -> Self {
+        Self {
+            input: None,
+            input_channel: "1".into(),
+            output: None,
+            output_channels: "1,2".into(),
+            output_gain_db: "-18".into(),
+            send: None,
+            send_channels: "1,2".into(),
+            send_gain_db: "0".into(),
+            aux_input: None,
+            aux_channels: "1,2".into(),
+            aux_gain_db: "-12".into(),
+            aux_to: "send".into(),
+            queue_ms: "30".into(),
+            sound: SoundDraft::default(),
+        }
+    }
+}
+
 impl SceneDraft {
+    /// Keep every saved setting, including channels and levels of disabled optional endpoints.
+    /// Missing or unsupported IDs remain explicit; build never substitutes a different device.
+    pub fn from_scene(scene: &AudioScene) -> Self {
+        let route = &scene.route;
+        let channel_text = |channels: &[u16]| {
+            channels
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        Self {
+            input: Some(route.input.clone()),
+            input_channel: route.input_channel.to_string(),
+            output: Some(route.output.clone()),
+            output_channels: channel_text(&route.output_channels),
+            output_gain_db: route.output_gain_db.to_string(),
+            send: route.send.clone(),
+            send_channels: channel_text(&route.send_channels),
+            send_gain_db: route.send_gain_db.to_string(),
+            aux_input: route.aux_input.clone(),
+            aux_channels: channel_text(&route.aux_channels),
+            aux_gain_db: route.aux_gain_db.to_string(),
+            aux_to: match route.aux_to {
+                AuxDestination::Output => "output",
+                AuxDestination::Send => "send",
+                AuxDestination::Both => "both",
+            }
+            .into(),
+            queue_ms: route.queue_ms.to_string(),
+            sound: SoundDraft::from_scene(scene),
+        }
+    }
+
     pub fn build(&self, catalog: &DeviceCatalog) -> Result<AudioScene, String> {
         let input = selected(&self.input, &catalog.inputs, "내 목소리 입력")?;
         let output = selected(&self.output, &catalog.outputs, "주 출력")?;
@@ -41,22 +100,16 @@ impl SceneDraft {
         }
         let output_channels = channels(&self.output_channels)?;
         OutputMap::new(&output_channels, output_config.channels)?;
-        let send_channels = if self.send.is_some() {
+        let send_channels = channels(&self.send_channels)?;
+        if self.send.is_some() {
             let send = selected(&self.send, &catalog.outputs, "추가 송출")?;
-            let channels = channels(&self.send_channels)?;
-            OutputMap::new(&channels, configuration(send)?.channels)?;
-            channels
-        } else {
-            vec![1, 2]
-        };
-        let aux_channels = if self.aux_input.is_some() {
+            OutputMap::new(&send_channels, configuration(send)?.channels)?;
+        }
+        let aux_channels = channels(&self.aux_channels)?;
+        if self.aux_input.is_some() {
             let aux = selected(&self.aux_input, &catalog.inputs, "AUX / MR 입력")?;
-            let channels = channels(&self.aux_channels)?;
-            InputMap::new(&channels, configuration(aux)?.channels)?;
-            channels
-        } else {
-            vec![1, 2]
-        };
+            InputMap::new(&aux_channels, configuration(aux)?.channels)?;
+        }
         let aux_to = match self.aux_to.as_str() {
             "output" => AuxDestination::Output,
             "send" => AuxDestination::Send,
@@ -67,26 +120,29 @@ impl SceneDraft {
             return Err("AUX를 추가 송출로 보내려면 추가 송출 장치를 선택하세요. 주 출력만 사용하려면 AUX 목적지를 주 출력으로 바꾸세요.".into());
         }
         let vocal = self.sound.vocal_config()?;
-        let route = RouteOptions {
-            input: input.id.clone(),
-            input_channel,
-            aux_input: self.aux_input.clone(),
-            aux_channels,
-            aux_gain_db: -12.0,
-            aux_to,
-            output: output.id.clone(),
-            output_channels,
-            send: self.send.clone(),
-            send_channels,
-            input_gain_db: vocal.input_gain_db,
-            output_gain_db: -18.0,
-            send_gain_db: 0.0,
-            vocal: vocal.preset,
-            vocal_strength: vocal.strength,
-            vocal_threshold_db: vocal.compressor_threshold_db,
-            deess_threshold_db: vocal.deess_threshold_db,
-            queue_ms: 30,
-        };
+        let route =
+            RouteOptions {
+                input: input.id.clone(),
+                input_channel,
+                aux_input: self.aux_input.clone(),
+                aux_channels,
+                aux_gain_db: number(&self.aux_gain_db, "AUX 음량")?,
+                aux_to,
+                output: output.id.clone(),
+                output_channels,
+                send: self.send.clone(),
+                send_channels,
+                input_gain_db: vocal.input_gain_db,
+                output_gain_db: number(&self.output_gain_db, "전체 출력 음량")?,
+                send_gain_db: number(&self.send_gain_db, "추가 송출 감쇠")?,
+                vocal: vocal.preset,
+                vocal_strength: vocal.strength,
+                vocal_threshold_db: vocal.compressor_threshold_db,
+                deess_threshold_db: vocal.deess_threshold_db,
+                queue_ms: self.queue_ms.trim().parse().map_err(|_| {
+                    "Queue 목표에는 10~100 범위의 정수(ms)를 입력하세요.".to_owned()
+                })?,
+            };
         // Use the same coefficient/sample-rate validation as Prepared without opening devices.
         // Start rechecks the live endpoint configuration; the catalog is only a point-in-time view.
         VocalChain::new(input_config.sample_rate, route.vocal_config())
@@ -108,7 +164,7 @@ fn selected<'a>(
         .find(|device| device.id == id)
         .ok_or_else(|| {
             format!(
-                "{label} 장치가 조회한 목록에 없습니다. 새 Scene을 다시 열어 장치를 확인하세요."
+                "{label} 장치가 조회한 목록에 없습니다. 장치 설정을 다시 열어 장치를 확인하세요."
             )
         })
 }
@@ -131,11 +187,21 @@ fn channels(text: &str) -> Result<Vec<u16>, String> {
         .collect()
 }
 
+fn number(value: &str, label: &str) -> Result<f32, String> {
+    value
+        .trim()
+        .parse()
+        .map_err(|_| format!("{label}에는 숫자를 입력하세요."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
-    use mixlive_audio_windows::config::{Cli, Command};
+    use mixlive_audio_windows::{
+        config::{Cli, Command},
+        plugin::EffectSpec,
+    };
 
     fn device(id: &str, channels: u16) -> DeviceInfo {
         DeviceInfo {
@@ -159,20 +225,77 @@ mod tests {
     fn draft() -> SceneDraft {
         SceneDraft {
             input: Some("input-a".into()),
-            input_channel: "1".into(),
             output: Some("output-a".into()),
-            output_channels: "1,2".into(),
-            send: None,
-            send_channels: "1,2".into(),
-            aux_input: None,
-            aux_channels: "1,2".into(),
-            aux_to: "send".into(),
-            sound: SoundDraft::default(),
+            ..SceneDraft::default()
         }
+    }
+
+    fn saved_scene() -> AudioScene {
+        let cli = Cli::parse_from([
+            "mixlive-audio",
+            "check",
+            "--input",
+            "input-a",
+            "--input-channel",
+            "2",
+            "--aux-input",
+            "input-a",
+            "--aux-channels",
+            "4,3",
+            "--aux-gain-db",
+            "-9.75",
+            "--aux-to",
+            "both",
+            "--output",
+            "output-a",
+            "--output-channels",
+            "4,3",
+            "--send",
+            "output-b",
+            "--send-channels",
+            "1",
+            "--send-gain-db",
+            "-6.5",
+            "--output-gain-db",
+            "-23.25",
+            "--queue-ms",
+            "47",
+            "--vocal",
+            "warm",
+            "--input-gain-db",
+            "2.375",
+            "--vocal-strength",
+            "0.625",
+            "--vocal-threshold-db",
+            "-23.75",
+            "--deess-threshold-db",
+            "-29.125",
+        ]);
+        let Command::Check(route) = cli.command else {
+            panic!("expected check")
+        };
+        AudioScene::new(
+            route,
+            vec![
+                EffectSpec {
+                    plugin: "not-installed.vst3".into(),
+                    class_id: Some("0123456789ABCDEF0123456789ABCDEF".into()),
+                    state: Some(vec![1, 2]),
+                },
+                EffectSpec {
+                    plugin: "not-installed.vst3".into(),
+                    class_id: Some("FEDCBA9876543210FEDCBA9876543210".into()),
+                    state: Some(vec![3, 4]),
+                },
+            ],
+        )
+        .unwrap()
     }
 
     #[test]
     fn new_scene_uses_exact_ids_and_existing_cli_defaults() {
+        assert!(SceneDraft::default().input.is_none());
+        assert!(SceneDraft::default().output.is_none());
         let scene = draft().build(&catalog()).unwrap();
         let cli = Cli::parse_from([
             "mixlive-audio",
@@ -196,6 +319,146 @@ mod tests {
         assert_eq!(scene.route.input, "input-b");
         assert_eq!(scene.route.output, "output-b");
         assert_eq!(scene.route.output_channels, [1]);
+    }
+
+    #[test]
+    fn loaded_scene_preserves_all_fields_including_disabled_optional_settings() {
+        for optional in [true, false] {
+            let mut original = saved_scene();
+            if !optional {
+                original.route.send = None;
+                original.route.aux_input = None;
+                // Inactive mappings retain their shape without using another endpoint's range.
+                original.route.send_channels = vec![21, 20];
+                original.route.aux_channels = vec![18];
+            }
+            let restored = SceneDraft::from_scene(&original).build(&catalog()).unwrap();
+            assert_eq!(restored.route, original.route);
+            assert_eq!(restored.effects, original.effects);
+        }
+    }
+
+    #[test]
+    fn device_and_startup_level_edits_preserve_sound_and_slots_when_saved() {
+        let original = saved_scene();
+        let mut draft = SceneDraft::from_scene(&original);
+        draft.input = Some("input-b".into());
+        draft.input_channel = "1".into();
+        draft.output = Some("output-b".into());
+        draft.output_channels = "1".into();
+        draft.send = Some("output-a".into());
+        draft.send_channels = "3,4".into();
+        draft.aux_input = Some("input-a".into());
+        draft.aux_channels = "2,1".into();
+        draft.aux_to = "output".into();
+        draft.output_gain_db = " -24.5 ".into();
+        draft.send_gain_db = "-4.25".into();
+        draft.aux_gain_db = "-18.75".into();
+        draft.queue_ms = " 35 ".into();
+        let changed = draft.build(&catalog()).unwrap();
+        let mut expected = original.route.clone();
+        expected.input = "input-b".into();
+        expected.input_channel = 1;
+        expected.output = "output-b".into();
+        expected.output_channels = vec![1];
+        expected.send = Some("output-a".into());
+        expected.send_channels = vec![3, 4];
+        expected.aux_input = Some("input-a".into());
+        expected.aux_channels = vec![2, 1];
+        expected.aux_to = AuxDestination::Output;
+        expected.output_gain_db = -24.5;
+        expected.send_gain_db = -4.25;
+        expected.aux_gain_db = -18.75;
+        expected.queue_ms = 35;
+        assert_eq!(changed.route, expected);
+        assert_eq!(changed.effects, original.effects);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("edited.mixlive-scene.json");
+        changed.save_new(&path).unwrap();
+        let reopened = AudioScene::read(&path).unwrap();
+        assert_eq!(reopened.route, expected);
+        assert_eq!(reopened.effects, original.effects);
+    }
+
+    #[test]
+    fn unavailable_saved_optional_devices_remain_explicit_until_changed() {
+        let mut original = saved_scene();
+        original.route.send = Some("missing-send".into());
+        let mut draft = SceneDraft::from_scene(&original);
+        assert!(
+            draft
+                .build(&catalog())
+                .unwrap_err()
+                .contains("추가 송출 장치가 조회한 목록에 없습니다")
+        );
+        assert_eq!(draft.send, original.route.send);
+        draft.send = Some("input-b".into());
+        assert!(
+            draft
+                .build(&catalog())
+                .unwrap_err()
+                .contains("추가 송출 장치가 조회한 목록에 없습니다")
+        );
+        draft.send = Some("output-b".into());
+        let mut devices = catalog();
+        devices.outputs[1].config = Err("unavailable playback configuration".into());
+        assert!(
+            draft
+                .build(&devices)
+                .unwrap_err()
+                .contains("unavailable playback configuration")
+        );
+        draft.send = None;
+        draft.aux_to = "output".into();
+        draft.aux_input = Some("missing-aux".into());
+        assert!(
+            draft
+                .build(&devices)
+                .unwrap_err()
+                .contains("AUX / MR 입력 장치가 조회한 목록에 없습니다")
+        );
+        assert_eq!(draft.aux_input.as_deref(), Some("missing-aux"));
+        draft.aux_input = None;
+        let disabled = draft.build(&devices).unwrap();
+        assert!(disabled.route.send.is_none());
+        assert!(disabled.route.aux_input.is_none());
+        assert_eq!(disabled.effects, original.effects);
+    }
+
+    #[test]
+    fn startup_levels_queue_and_inactive_channel_shapes_are_validated() {
+        for invalid in ["", "bad", "NaN", "inf", "-inf", "0.1", "-96.1"] {
+            let mut edited = draft();
+            edited.output_gain_db = invalid.into();
+            assert!(edited.build(&catalog()).is_err());
+            edited = draft();
+            edited.send_gain_db = invalid.into();
+            assert!(edited.build(&catalog()).is_err());
+            edited = draft();
+            edited.aux_gain_db = invalid.into();
+            assert!(edited.build(&catalog()).is_err());
+        }
+        for invalid in ["", "bad", "-1", "9", "101", "30.5"] {
+            let mut edited = draft();
+            edited.queue_ms = invalid.into();
+            assert!(edited.build(&catalog()).is_err());
+        }
+        for invalid in ["0", "1,1", "1,2,3", "", "1,"] {
+            let mut edited = draft();
+            edited.send_channels = invalid.into();
+            assert!(edited.build(&catalog()).is_err());
+            edited = draft();
+            edited.aux_channels = invalid.into();
+            assert!(edited.build(&catalog()).is_err());
+        }
+        let mut edited = draft();
+        edited.output_gain_db = "-96".into();
+        edited.send_gain_db = "0".into();
+        edited.aux_gain_db = "-96".into();
+        edited.queue_ms = "10".into();
+        assert!(edited.build(&catalog()).is_ok());
+        edited.queue_ms = "100".into();
+        assert!(edited.build(&catalog()).is_ok());
     }
 
     #[test]

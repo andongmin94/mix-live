@@ -54,6 +54,7 @@ struct Fader {
 #[derive(Clone, Copy)]
 enum Operation {
     Devices,
+    EditDevices,
     Start,
     Stop,
     Close,
@@ -282,12 +283,16 @@ impl MixLive {
         if self.busy.is_some() {
             return;
         }
-        if matches!(operation, Operation::Start | Operation::Devices)
-            && (self.picking || self.form.is_some() || self.session.running())
+        if matches!(
+            operation,
+            Operation::Start | Operation::Devices | Operation::EditDevices
+        ) && (self.picking || self.form.is_some() || self.session.running())
         {
             return;
         }
-        if matches!(operation, Operation::Start) && self.session.scene().is_none() {
+        if matches!(operation, Operation::Start | Operation::EditDevices)
+            && self.session.scene().is_none()
+        {
             return;
         }
         self.busy = Some(operation);
@@ -298,7 +303,9 @@ impl MixLive {
         cx.spawn_in(window, async move |owner, cx| {
             // These synchronous native calls MUST be outside App/entity update.
             let catalog = match operation {
-                Operation::Devices => Some(device_catalog().map_err(|error| error.to_string())),
+                Operation::Devices | Operation::EditDevices => {
+                    Some(device_catalog().map_err(|error| error.to_string()))
+                }
                 Operation::Start => {
                     let _ = session.start();
                     None
@@ -316,11 +323,20 @@ impl MixLive {
                         match catalog {
                             Ok(catalog) => {
                                 this.session.error = None;
-                                let form = cx.new(|cx| SceneForm::new(catalog, window, cx));
+                                let form = cx.new(|cx| {
+                                    if matches!(operation, Operation::EditDevices) {
+                                        SceneForm::edit_devices(
+                                            this.session.scene().expect("selected Scene to edit"),
+                                            catalog, window, cx,
+                                        )
+                                    } else {
+                                        SceneForm::new(catalog, window, cx)
+                                    }
+                                });
                                 this.install_form(form, window, cx);
                             }
                             Err(error) => {
-                                this.session.message = "장치 목록을 읽지 못했습니다. 연결을 확인하고 새 Scene을 다시 누르세요.".into();
+                                this.session.message = "장치 목록을 읽지 못했습니다. 연결을 확인하고 장치 설정을 다시 여세요.".into();
                                 this.session.error = Some(error);
                             }
                         }
@@ -474,7 +490,7 @@ impl MixLive {
     fn header(&self, cx: &Context<Self>) -> Div {
         let running = self.session.running();
         let (status, color) = match self.busy {
-            Some(Operation::Devices) => ("장치 조회 중", MUTED),
+            Some(Operation::Devices | Operation::EditDevices) => ("장치 조회 중", MUTED),
             Some(Operation::Start) => ("시작 중", MUTED),
             Some(Operation::Stop | Operation::Close) => ("정지 중", MUTED),
             None if running => ("오디오 실행 중", ACCENT),
@@ -756,6 +772,18 @@ impl MixLive {
                     .child("추가 송출 미선택"),
             );
         }
+        destinations = destinations.child(
+            button("edit-devices", "장치·출력 설정", false)
+                .disabled(
+                    self.session.running()
+                        || self.busy.is_some()
+                        || self.picking
+                        || self.form.is_some(),
+                )
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.perform(Operation::EditDevices, window, cx)
+                })),
+        );
 
         div()
             .flex_shrink_0()

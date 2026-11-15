@@ -1,4 +1,4 @@
-//! New Scene creation and stopped Scene vocal editing. File operations never start audio.
+//! New Scene creation and stopped Scene editing. File operations never start audio.
 
 use gpui::{
     App, AppContext as _, Context, Div, ElementId, Entity, EventEmitter, Focusable as _,
@@ -50,10 +50,17 @@ struct DeviceSetup {
     send: EndpointField,
     aux: EndpointField,
     aux_to: Entity<SelectState>,
+    output_gain: Entity<InputState>,
+    send_gain: Entity<InputState>,
+    aux_gain: Entity<InputState>,
+    queue_ms: Entity<InputState>,
 }
 
 enum Setup {
-    New(DeviceSetup),
+    Devices {
+        fields: Box<DeviceSetup>,
+        editing: bool,
+    },
     Sound(RouteOptions),
 }
 
@@ -69,12 +76,63 @@ impl EventEmitter<FormEvent> for SceneForm {}
 
 impl SceneForm {
     pub fn new(catalog: DeviceCatalog, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mic = endpoint_field(&catalog.inputs, false, "마이크 채널", "1", window, cx);
-        let output = endpoint_field(&catalog.outputs, false, "주 출력 채널", "1,2", window, cx);
-        let send = endpoint_field(&catalog.outputs, true, "추가 송출 채널", "1,2", window, cx);
-        let aux = endpoint_field(&catalog.inputs, true, "AUX 채널", "1,2", window, cx);
+        Self::with_devices(catalog, SceneDraft::default(), false, window, cx)
+    }
+
+    pub fn edit_devices(
+        scene: &AudioScene,
+        catalog: DeviceCatalog,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_devices(catalog, SceneDraft::from_scene(scene), true, window, cx)
+    }
+
+    fn with_devices(
+        catalog: DeviceCatalog,
+        draft: SceneDraft,
+        editing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mic = endpoint_field(
+            &catalog.inputs,
+            false,
+            "마이크 채널",
+            draft.input.as_deref(),
+            &draft.input_channel,
+            window,
+            cx,
+        );
+        let output = endpoint_field(
+            &catalog.outputs,
+            false,
+            "주 출력 채널",
+            draft.output.as_deref(),
+            &draft.output_channels,
+            window,
+            cx,
+        );
+        let send = endpoint_field(
+            &catalog.outputs,
+            true,
+            "추가 송출 채널",
+            draft.send.as_deref(),
+            &draft.send_channels,
+            window,
+            cx,
+        );
+        let aux = endpoint_field(
+            &catalog.inputs,
+            true,
+            "AUX 채널",
+            draft.aux_input.as_deref(),
+            &draft.aux_channels,
+            window,
+            cx,
+        );
         let aux_to = cx.new(|cx| {
-            let mut state = SelectState::new(
+            SelectState::new(
                 [
                     SelectItem::new("send", "추가 송출에만"),
                     SelectItem::new("output", "주 출력에만"),
@@ -82,11 +140,13 @@ impl SceneForm {
                 ],
                 cx,
             )
-            .default_value("send");
-            state.set_disabled(true, window, cx);
-            state
+            .default_value(&draft.aux_to)
         });
-        let sound = cx.new(|cx| SoundEditor::new(SoundDraft::default(), window, cx));
+        let output_gain = text_input("전체 시작 음량", &draft.output_gain_db, window, cx);
+        let send_gain = text_input("추가 송출 시작 음량", &draft.send_gain_db, window, cx);
+        let aux_gain = text_input("AUX 입력 음량", &draft.aux_gain_db, window, cx);
+        let queue_ms = text_input("장치별 queue 목표", &draft.queue_ms, window, cx);
+        let sound = cx.new(|cx| SoundEditor::new(draft.sound, window, cx));
         let mut subscriptions = vec![cx.observe(&sound, |_, _, cx| cx.notify())];
         for (endpoint, field) in [
             (Endpoint::Mic, &mic),
@@ -103,7 +163,7 @@ impl SceneForm {
                     if this.is_busy(cx) {
                         return;
                     }
-                    let Setup::New(setup) = &this.setup else {
+                    let Setup::Devices { fields: setup, .. } = &this.setup else {
                         return;
                     };
                     let SelectEvent::Change(id) = event;
@@ -123,29 +183,34 @@ impl SceneForm {
                             .channels
                             .update(cx, |input, cx| input.set_value(channels, window, cx));
                     }
-                    field
-                        .channels
-                        .update(cx, |input, cx| input.set_disabled(id.is_empty(), cx));
-                    if matches!(endpoint, Endpoint::Aux) {
-                        setup.aux_to.update(cx, |state, cx| {
-                            state.set_disabled(id.is_empty(), window, cx)
-                        });
-                    }
+                    setup.set_busy(false, window, cx);
                     this.error = None;
                     cx.notify();
                 },
             ));
         }
         subscriptions.push(cx.observe(&aux_to, |_, _, cx| cx.notify()));
+        for input in [&output_gain, &send_gain, &aux_gain, &queue_ms] {
+            subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
+        }
+        let fields = DeviceSetup {
+            catalog,
+            mic,
+            output,
+            send,
+            aux,
+            aux_to,
+            output_gain,
+            send_gain,
+            aux_gain,
+            queue_ms,
+        };
+        fields.set_busy(false, window, cx);
         Self {
-            setup: Setup::New(DeviceSetup {
-                catalog,
-                mic,
-                output,
-                send,
-                aux,
-                aux_to,
-            }),
+            setup: Setup::Devices {
+                fields: Box::new(fields),
+                editing,
+            },
             sound,
             busy: false,
             error: None,
@@ -176,15 +241,15 @@ impl SceneForm {
         }
         let sound = self.sound.read(cx).draft(cx);
         match &self.setup {
-            Setup::New(setup) => setup.build_scene(sound, cx),
+            Setup::Devices { fields, .. } => fields.build_scene(sound, cx),
             Setup::Sound(route) => sound.apply_to(route),
         }
     }
 
     pub fn set_busy(&mut self, busy: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.busy = busy;
-        if let Setup::New(setup) = &self.setup {
-            setup.set_busy(busy, window, cx);
+        if let Setup::Devices { fields, .. } = &self.setup {
+            fields.set_busy(busy, window, cx);
         }
         self.sound
             .update(cx, |sound, cx| sound.set_busy(busy, window, cx));
@@ -218,24 +283,46 @@ impl DeviceSetup {
             aux_input: selected(&self.aux.select, cx),
             aux_channels: self.aux.channels.read(cx).value().to_string(),
             aux_to: selected(&self.aux_to, cx).unwrap_or_default(),
+            output_gain_db: self.output_gain.read(cx).value().to_string(),
+            send_gain_db: self.send_gain.read(cx).value().to_string(),
+            aux_gain_db: self.aux_gain.read(cx).value().to_string(),
+            queue_ms: self.queue_ms.read(cx).value().to_string(),
             sound,
         }
         .build(&self.catalog)
     }
 
     fn set_busy(&self, busy: bool, window: &mut Window, cx: &mut App) {
-        for field in [&self.mic, &self.output, &self.send, &self.aux] {
+        for endpoint in [
+            Endpoint::Mic,
+            Endpoint::Output,
+            Endpoint::Send,
+            Endpoint::Aux,
+        ] {
+            let (devices, field) = self.endpoint(endpoint);
             field
                 .select
                 .update(cx, |state, cx| state.set_disabled(busy, window, cx));
-            let disabled = busy || selected(&field.select, cx).is_none();
+            let available = selected(&field.select, cx).is_some_and(|id| {
+                devices
+                    .iter()
+                    .any(|device| device.id == id && device.config.is_ok())
+            });
             field
                 .channels
-                .update(cx, |input, cx| input.set_disabled(disabled, cx));
+                .update(cx, |input, cx| input.set_disabled(busy || !available, cx));
         }
-        let disabled = busy || selected(&self.aux.select, cx).is_none();
+        let aux_disabled = busy || selected(&self.aux.select, cx).is_none();
         self.aux_to
-            .update(cx, |state, cx| state.set_disabled(disabled, window, cx));
+            .update(cx, |state, cx| state.set_disabled(aux_disabled, window, cx));
+        self.aux_gain
+            .update(cx, |input, cx| input.set_disabled(aux_disabled, cx));
+        let send_disabled = busy || selected(&self.send.select, cx).is_none();
+        self.send_gain
+            .update(cx, |input, cx| input.set_disabled(send_disabled, cx));
+        for input in [&self.output_gain, &self.queue_ms] {
+            input.update(cx, |input, cx| input.set_disabled(busy, cx));
+        }
     }
 
     fn render(&self, window: &Window, cx: &App) -> Div {
@@ -289,10 +376,42 @@ impl DeviceSetup {
             );
         div()
             .flex()
-            .items_start()
+            .flex_col()
             .gap_5()
-            .child(sources)
-            .child(destinations)
+            .child(div().flex().items_start().gap_5().child(sources).child(destinations))
+            .child(
+                panel()
+                    .gap_4()
+                    .child(section_title("03", "시작 음량과 queue"))
+                    .child(
+                        div().flex().flex_wrap().gap_5()
+                            .child(self.setting("initial-output-gain", "전체 시작 음량", &self.output_gain, "−96~0 dB · 두 출력에 공통 적용", window, cx))
+                            .child(self.setting("initial-send-gain", "추가 송출 시작 음량", &self.send_gain, "−96~0 dB · 추가 송출에 더해지는 감쇠", window, cx))
+                            .child(self.setting("initial-aux-gain", "AUX 입력 음량", &self.aux_gain, "−96~0 dB · AUX를 섞기 전 감쇠", window, cx))
+                            .child(self.setting("initial-queue", "장치별 queue 목표", &self.queue_ms, "10~100 ms · 하드웨어 버퍼나 실측 왕복 지연이 아닙니다", window, cx)),
+                    )
+                    .child(div().text_xs().text_color(rgb(MUTED))
+                        .child("저장된 시작 설정입니다. 실행 중 바꾼 음소거·음량·경로를 가져오지 않습니다.")),
+            )
+    }
+
+    fn setting(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        input: &Entity<InputState>,
+        description: &'static str,
+        window: &Window,
+        cx: &App,
+    ) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w(px(225.))
+            .child(div().text_sm().child(label))
+            .child(number_input(id, input, window, cx))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(description))
     }
 
     fn device_field(
@@ -304,8 +423,10 @@ impl DeviceSetup {
         cx: &App,
     ) -> Div {
         let (devices, field) = self.endpoint(endpoint);
-        let chosen = selected(&field.select, cx)
-            .and_then(|id| devices.iter().find(|device| device.id == id));
+        let chosen_id = selected(&field.select, cx);
+        let chosen = chosen_id
+            .as_ref()
+            .and_then(|id| devices.iter().find(|device| device.id == *id));
         let mut content = div()
             .flex()
             .flex_col()
@@ -325,9 +446,9 @@ impl DeviceSetup {
                 div()
                     .text_xs()
                     .text_color(rgb(DANGER))
-                    .child("표시할 장치가 없습니다. 연결 후 새 Scene을 다시 여세요."),
+                    .child("표시할 장치가 없습니다. 연결 후 장치 설정을 다시 여세요."),
             );
-        } else if devices.iter().all(|device| device.config.is_err()) {
+        } else if chosen.is_none() && devices.iter().all(|device| device.config.is_err()) {
             // SelectState cannot open a list with no enabled items. Keep the
             // actual failure reasons visible even when nothing is selectable.
             for device in devices {
@@ -341,22 +462,27 @@ impl DeviceSetup {
                 }
             }
         }
-        if let Some(device) = chosen {
-            let config = device
-                .config
-                .as_ref()
-                .expect("unsupported options are disabled");
+        if let Some(device_id) = chosen_id {
+            let config = chosen.and_then(|device| device.config.as_ref().ok());
+            let detail = match chosen {
+                Some(device) => match &device.config {
+                    Ok(config) => div().text_xs().text_color(rgb(MUTED)).child(format!(
+                        "{}채널 · {} Hz · {}",
+                        config.channels, config.sample_rate, config.sample_format
+                    )),
+                    Err(error) => div().text_xs().text_color(rgb(DANGER)).child(error.clone()),
+                },
+                None => div().text_xs().text_color(rgb(DANGER))
+                    .child("저장된 장치가 현재 목록에 없습니다. 장치를 연결해 설정을 다시 열거나 다른 장치를 선택하세요."),
+            };
             content = content
-                .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                    "{}채널 · {} Hz · {}",
-                    config.channels, config.sample_rate, config.sample_format
-                )))
+                .child(detail)
                 .child(
                     div()
                         .text_xs()
                         .text_color(rgb(MUTED))
                         .whitespace_normal()
-                        .child(format!("ID: {}", device.id)),
+                        .child(format!("ID: {device_id}")),
                 )
                 .child(
                     div()
@@ -371,13 +497,17 @@ impl DeviceSetup {
                                 .child("사용 채널"),
                         )
                         .child(number_input(id, &field.channels, window, cx))
-                        .child(div().text_xs().text_color(rgb(MUTED)).child(
-                            if matches!(endpoint, Endpoint::Mic) {
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(match config {
+                            Some(config) if matches!(endpoint, Endpoint::Mic) => {
                                 format!("1~{} 중 하나", config.channels)
-                            } else {
+                            }
+                            Some(config) => {
                                 format!("1~{} · 하나 또는 좌,우", config.channels)
-                            },
-                        )),
+                            }
+                            None => {
+                                "사용 가능한 장치를 선택하면 채널을 바꿀 수 있습니다.".to_owned()
+                            }
+                        })),
                 );
         }
         content
@@ -388,9 +518,13 @@ impl Render for SceneForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.is_busy(cx);
         let (title, description) = match &self.setup {
-            Setup::New(_) => (
+            Setup::Devices { editing: false, .. } => (
                 "새 Scene 만들기",
                 "장치와 보컬 설정을 새 파일로 저장하세요. 오디오는 시작 버튼으로 켭니다.",
+            ),
+            Setup::Devices { editing: true, .. } => (
+                "장치·출력 설정",
+                "저장된 장치·채널·시작 음량을 편집합니다. 현재 장치를 확인하고 새 Scene으로 저장합니다.",
             ),
             Setup::Sound(_) => (
                 "보컬 설정 편집",
@@ -460,10 +594,10 @@ impl Render for SceneForm {
                     )
                     .child(div().text_sm().child(error.clone()))
             }));
-        if let Setup::New(setup) = &self.setup {
-            content = content.child(setup.render(window, cx))
+        if let Setup::Devices { fields, .. } = &self.setup {
+            content = content.child(fields.render(window, cx))
                 .child(div().text_xs().text_color(rgb(MUTED))
-                    .child("시작 음량 −18 dB · AUX −12 dB. 채널은 이 WASAPI 장치가 노출한 번호입니다. ASIO·물리 단자·하드웨어 루프백 번호와의 대응은 장치에서 확인하세요."));
+                    .child("채널은 이 WASAPI 장치가 노출한 번호입니다. ASIO·물리 단자·하드웨어 루프백 번호와의 대응은 장치에서 확인하세요."));
         }
         content.child(self.sound.clone())
     }
@@ -498,7 +632,8 @@ fn endpoint_field(
     devices: &[DeviceInfo],
     optional: bool,
     label: &'static str,
-    value: &'static str,
+    saved_id: Option<&str>,
+    value: &str,
     window: &mut Window,
     cx: &mut Context<SceneForm>,
 ) -> EndpointField {
@@ -507,18 +642,34 @@ fn endpoint_field(
         items.push(SelectItem::new("", "사용 안 함"));
     }
     items.extend(devices.iter().map(|device| {
-        SelectItem::new(device.id.clone(), device.name.clone()).disabled(device.config.is_err())
+        let unavailable = device.config.is_err();
+        let label = if unavailable {
+            format!("사용할 수 없는 장치 · {}", device.name)
+        } else {
+            device.name.clone()
+        };
+        // Preserve an explicit saved binding even when it cannot currently run.
+        // The real catalog remains unchanged; build_scene rejects this selection.
+        SelectItem::new(device.id.clone(), label)
+            .disabled(unavailable && saved_id != Some(device.id.as_str()))
     }));
+    if let Some(id) = saved_id.filter(|id| !devices.iter().any(|device| device.id == *id)) {
+        items.push(SelectItem::new(
+            id.to_owned(),
+            format!("현재 없는 장치 · {id}"),
+        ));
+    }
     let select = cx.new(|cx| {
         let state = SelectState::new(items, cx);
-        if optional {
+        if let Some(id) = saved_id {
+            state.default_value(id)
+        } else if optional {
             state.default_value("")
         } else {
             state
         }
     });
     let channels = text_input(label, value, window, cx);
-    channels.update(cx, |state, cx| state.set_disabled(true, cx));
     EndpointField { select, channels }
 }
 
