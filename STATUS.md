@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실행 중 프리셋·공간계 시간 변경 구현 · Windows 통합 검증 준비**
+단계: **실행 중 프리셋·공간계 시간 변경 검증 완료 · main 병합**
 
 ## 현재 구현
 
@@ -114,14 +114,16 @@
 
 ## 검증
 
-- 이번 변경의 로컬 effects 28개 및 해당 crate Clippy, control snapshot과 capture 경로 19개 검사는
-  통과했다. preset/time 변경을 거치는 mic impulse와 AUX/app PDC 이력도 확인했다.
-  아래 Audio #54는 직전 음정 설정 변경의 완료 결과이며, 이번 Windows 통합 검사는 아직 실행 전이다.
-- [Audio #54](https://github.com/andongmin94/mix-live/actions/runs/45630152738) `5342a4c` 전체 성공:
-  Windows workspace 검사 134개와 실제 native VST3 fixture 검사 13개, 총 **147개 성공**.
+- [Audio #56](https://github.com/andongmin94/mix-live/actions/runs/45636823189) `a4df88b` 전체 성공:
+  Windows workspace 검사 145개와 실제 native VST3 fixture 검사 13개, 총 **158개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
-  PR #5의 병합 tree가 검증한 source tree와 동일함을 확인했다.
+  PR #6의 병합 tree가 검증한 source tree와 동일함을 확인했다.
+- 프리셋·공간계 시간 변경은 준비 이후 도착한 EQ target 재조정, 기존 16개 target/ramp와
+  활성 EQ·다이내믹스·FDN 이력 유지, pre-delay 0/80 ms·echo 10/1000 ms 및 중간 retarget,
+  반복 plan과 block 1/17/256 독립성을 확인했다. 지원하지 않는 sample rate·잘못된 값은 거절한다.
+  실제 mic impulse로 진행 중 pitch 이력과 별도 AUX/app PDC 이력 보존을 확인했고,
+  idle worker 적용·승인 후 게시·Scene 저장과 native VST3 인스턴스/파라미터 보존도 검사했다.
 - 음정 설정 변경의 목표 주파수·retune, 분석 이력 유지, block 1/17/137/256 독립성,
   켜기·끄기와 합성 VST 지연 0/71 samples에서 마이크·AUX/앱 송출 정렬을 확인했다.
   모니터 보상 제외, 이전 보정기 반환, 잘못된 설정·합산 지연 초과의 무변경 거절도 통과했다.
@@ -131,9 +133,9 @@
   파라미터의 인스턴스 동일성·순서 유지, 잘못된 경로/레이아웃/인덱스 거절, 전체 삭제 후
   오디오 처리·AUX/앱 격리·빈 체인 snapshot 및 편집한 순서/bypass의 snapshot을 확인했다.
   기존 state fixture의 파라미터 저장/복원과 라이브 EQ·limiter·Scene 13 검사도 통과했다.
-- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45630152738/artifacts/15032475037):
+- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45636823189/artifacts/15035221280):
   `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe`와 의존성/라이선스 고지.
-  실장비의 실행 중 음정/체인 UI 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
+  실장비의 실행 중 UI 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
 - [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) `08d0007` 성공:
   세 고정 INF/PnP ID, transport 격리, WDK/INF/unsigned catalog 및 미서명 거절·부재 검사 완료.
   드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는 미검증이다.
