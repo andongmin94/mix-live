@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-26
-단계: **실행 중 앱 소스 추가·삭제 구현 · Windows 통합 검증 전**
+단계: **실행 중 앱 소스 추가·삭제 검증 완료 · main 병합**
 
 ## 현재 구현
 
@@ -125,14 +125,17 @@
 
 ## 검증
 
-- 이번 앱 소스 편집 변경의 로컬 core 지연 이력 이동 검사 1개, Capture 검사 21개,
-  control 검사 11개가 성공했다. core strict Clippy도 통과했다. Windows 전용 worker/native/UI
-  검사와 전체 빌드는 아직 실행 전이며 아래 이전 CI 결과에 포함되지 않는다.
-- [Audio #56](https://github.com/andongmin94/mix-live/actions/runs/45636823189) `a4df88b` 전체 성공:
-  Windows workspace 검사 145개와 실제 native VST3 fixture 검사 13개, 총 **158개 성공**.
+- [Audio #59](https://github.com/andongmin94/mix-live/actions/runs/45645735079) `359cc26` 전체 성공:
+  Windows workspace 검사 151개와 실제 native VST3 fixture 검사 13개, 총 **164개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
-  PR #6의 병합 tree가 검증한 source tree와 동일함을 확인했다.
+  PR #7의 실제 병합 tree가 검증한 source tree와 동일함을 확인했다.
+- 앱 삭제 중 남은 앱과 AUX의 부분 trim/mute/send ramp·PDC 이력, 전체 삭제 후 새 앱의
+  초기 상태, 반복 편집 중 pitch·EQ/다이내믹스·리버브·에코의 기준 출력 일치를 확인했다.
+  기존 clock bridge의 샘플 출력과 control/peak 정체성, 승인 후 게시, 새 목록 저장,
+  8개 상한·잘못된 매핑/설정 거절과 게시 전 캡처 준비 실패의 기존 Health 보존을 검사했다.
+  native fixture는 유지 VST3 인스턴스·파라미터와 이후 pitch/PDC 재준비를 확인했다.
+  이 검사는 실제 process loopback 장치나 실행 중 GUI+실장비 전환 검증을 포함하지 않는다.
 - 프리셋·공간계 시간 변경은 준비 이후 도착한 EQ target 재조정, 기존 16개 target/ramp와
   활성 EQ·다이내믹스·FDN 이력 유지, pre-delay 0/80 ms·echo 10/1000 ms 및 중간 retarget,
   반복 plan과 block 1/17/256 독립성을 확인했다. 지원하지 않는 sample rate·잘못된 값은 거절한다.
@@ -147,7 +150,7 @@
   파라미터의 인스턴스 동일성·순서 유지, 잘못된 경로/레이아웃/인덱스 거절, 전체 삭제 후
   오디오 처리·AUX/앱 격리·빈 체인 snapshot 및 편집한 순서/bypass의 snapshot을 확인했다.
   기존 state fixture의 파라미터 저장/복원과 라이브 EQ·limiter·Scene 13 검사도 통과했다.
-- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45636823189/artifacts/15035221280):
+- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45645735079/artifacts/15036933588):
   `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe`와 의존성/라이선스 고지.
   실장비의 실행 중 UI 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
 - [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) `08d0007` 성공:
