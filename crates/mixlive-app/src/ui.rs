@@ -15,6 +15,7 @@ use gpui_deck::{
     Button, Root, ScrollArea, SelectItem, SelectState, Slider, SliderEvent, SliderState, SliderThumb, StyledExt as _, Switch,
 };
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
+use mixlive_audio_windows::config::PitchConfig;
 use mixlive_audio_windows::plugin::{ChainEdit, EffectSpec, LiveParameter};
 use mixlive_audio_windows::windows::device_catalog;
 use mixlive_effects::VocalParameter;
@@ -22,6 +23,7 @@ use mixlive_effects::VocalParameter;
 use crate::{
     form::{FormEvent, SceneForm, select_control, selected},
     parameter_editor::{ParameterEditor, ParameterEvent},
+    pitch_editor::{PitchEditor, PitchEvent},
     session::Session,
 };
 
@@ -102,6 +104,7 @@ enum Operation {
     Parameters { index: usize },
     SetParameter { index: usize, id: u32, normalized: f64 },
     EditChain(ChainEdit),
+    SetPitch(PitchConfig),
     Close,
 }
 
@@ -117,6 +120,8 @@ pub struct MixLive {
     form_subscription: Option<Subscription>,
     parameter_editor: Option<Entity<ParameterEditor>>,
     parameter_subscription: Option<Subscription>,
+    pitch_editor: Option<Entity<PitchEditor>>,
+    pitch_subscription: Option<Subscription>,
     installed_plugins: Option<InstalledPlugins>,
     scanning_plugins: bool,
     workspace_scroll: ScrollHandle,
@@ -202,6 +207,8 @@ impl MixLive {
             form_subscription: None,
             parameter_editor: None,
             parameter_subscription: None,
+            pitch_editor: None,
+            pitch_subscription: None,
             installed_plugins: None,
             scanning_plugins: false,
             workspace_scroll: ScrollHandle::new(),
@@ -230,6 +237,8 @@ impl MixLive {
                             if let Some(path) = paths.into_iter().next() {
                                 this.parameter_editor = None;
                                 this.parameter_subscription = None;
+                                this.pitch_editor = None;
+                                this.pitch_subscription = None;
                                 let _ = this.session.open(path);
                                 this.selected_name = scene_name(&this.session);
                                 this.workspace_scroll.set_offset(Default::default());
@@ -249,6 +258,8 @@ impl MixLive {
     fn install_form(&mut self, form: Entity<SceneForm>, window: &Window, cx: &mut Context<Self>) {
         self.parameter_editor = None;
         self.parameter_subscription = None;
+        self.pitch_editor = None;
+        self.pitch_subscription = None;
         self.form_subscription =
             Some(
                 cx.subscribe_in(&form, window, |this, form, event, window, cx| match event {
@@ -489,6 +500,35 @@ impl MixLive {
         if !already_open { self.workspace_scroll.set_offset(Default::default()); }
     }
 
+    fn install_pitch_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(config) = self.session.pitch_config() else { return; };
+        let editor = cx.new(|cx| PitchEditor::new(config, window, cx));
+        self.pitch_subscription = Some(cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
+            match event {
+                PitchEvent::Apply(config) => this.perform(Operation::SetPitch(*config), window, cx),
+                PitchEvent::Reset if this.busy.is_none() && !this.picking && this.session.running() => {
+                    this.install_pitch_editor(window, cx);
+                    cx.notify();
+                }
+                PitchEvent::Reset => {}
+                PitchEvent::Close if this.busy.is_none() => {
+                    this.pitch_editor = None;
+                    this.pitch_subscription = None;
+                    cx.notify();
+                }
+                PitchEvent::Close => {}
+            }
+        }));
+        self.pitch_editor = Some(editor);
+    }
+
+    fn open_pitch_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.picking || !self.session.running() { return; }
+        if self.pitch_editor.is_none() { self.install_pitch_editor(window, cx); }
+        self.workspace_scroll.set_offset(Default::default());
+        cx.notify();
+    }
+
     fn perform(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
@@ -505,7 +545,7 @@ impl MixLive {
         {
             return;
         }
-        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_));
+        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_));
         if live_operation && (!self.session.running() || self.picking) {
             return;
         }
@@ -518,6 +558,7 @@ impl MixLive {
             Operation::Parameters { .. } => "VST3 파라미터 조회 중",
             Operation::SetParameter { .. } => "VST3 파라미터 적용 중",
             Operation::EditChain(_) => "VST3 체인 변경 중",
+            Operation::SetPitch(_) => "음정 설정 적용 중",
         });
         if matches!(operation, Operation::EditChain(_)) {
             // Parameter events capture a slot index. A topology change invalidates that selection.
@@ -529,7 +570,12 @@ impl MixLive {
             self.subscriptions.clear();
             self.parameter_editor = None;
             self.parameter_subscription = None;
+            self.pitch_editor = None;
+            self.pitch_subscription = None;
         } else if let Some(editor) = &self.parameter_editor {
+            editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
+        }
+        if let Some(editor) = &self.pitch_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
         let mut session = std::mem::take(&mut self.session);
@@ -559,6 +605,10 @@ impl MixLive {
                 }
                 Operation::EditChain(edit) => {
                     let _ = session.edit_chain(edit.clone());
+                    None
+                }
+                Operation::SetPitch(config) => {
+                    let _ = session.set_pitch_config(*config);
                     None
                 }
                 Operation::StopAndSave(path) => {
@@ -601,6 +651,12 @@ impl MixLive {
                         this.install_parameters(index, parameters, window, cx);
                     } else if let Some(editor) = &this.parameter_editor {
                         editor.update(cx, |editor, cx| editor.set_busy(false, window, cx));
+                    }
+                    if let Some(editor) = &this.pitch_editor {
+                        editor.update(cx, |editor, cx| {
+                            if let Some(config) = this.session.pitch_config() { editor.set_current(config, cx); }
+                            editor.set_busy(false, window, cx);
+                        });
                     }
                     if !live_operation {
                         this.install_faders(cx);
@@ -1279,6 +1335,7 @@ impl MixLive {
         let controls = self.session.controls().expect("running session");
         let levels = self.session.levels.as_ref();
         let scene = self.session.scene().expect("running Scene");
+        let pitch_config = self.session.pitch_config().expect("running pitch configuration");
         let mut source_mutes = div().flex().items_center().gap_5().child(
             div()
                 .flex()
@@ -1307,7 +1364,7 @@ impl MixLive {
                 .child(div().font_semibold().child("소스별 보내기"))
                 .child(source_mutes)
                 .child(peak_meter("마이크 입력 · trim 전", levels.map(|l| l.mic_input)))
-                .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child(format!("마이크 원신호 음정 · A4 = 440 Hz · {} {} · {}", mixlive_audio_windows::config::PitchScale::NAMES[usize::from(scene.route.pitch_key)], scene.route.pitch_scale.name(), if scene.route.pitch_correction > 0.0 { "보정 사용" } else { "검출 전용" })))
+                .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child(format!("마이크 원신호 음정 · A4 = 440 Hz · {} {} · {}", mixlive_audio_windows::config::PitchScale::NAMES[usize::from(pitch_config.key)], pitch_config.scale.name(), if pitch_config.strength > 0.0 { "보정 사용" } else { "검출 전용" })))
                     .child(match levels.and_then(|l| l.pitch) {
                         Some(pitch) => div().flex().items_center().gap_3()
                             .child(div().font_semibold().text_color(rgb(ACCENT)).child(pitch.note_name()))
@@ -1316,7 +1373,10 @@ impl MixLive {
                         None => div().text_sm().text_color(rgb(MUTED)).child("명확한 음정 없음"),
                     })
                     .children(levels.and_then(|l| l.pitch).map(|pitch| div().text_sm().child(format!("스케일 목표 {} · 편차 {:+.1} cent", pitch.target_note_name(), pitch.target_cents))))
-                    .children((scene.route.pitch_correction > 0.0).then(|| div().text_xs().text_color(rgb(MUTED)).child(format!("보정 설정 {:.0}% · retune {:.1} ms · 원신호 기준 계측, 보정 후 주파수 측정 아님", scene.route.pitch_correction * 100.0, scene.route.pitch_retune_ms)))))
+                    .children((pitch_config.strength > 0.0).then(|| div().text_xs().text_color(rgb(MUTED)).child(format!("보정 설정 {:.0}% · retune {:.1} ms · 원신호 기준 계측, 보정 후 주파수 측정 아님", pitch_config.strength * 100.0, pitch_config.retune_ms))))
+                    .child(button("edit-live-pitch", "실행 중 음정 설정", false)
+                        .disabled(self.busy.is_some() || self.picking)
+                        .on_click(cx.listener(|this, _, window, cx| this.open_pitch_editor(window, cx)))))
                 .child(peak_meter("내장 보정 후 · VST3 전", levels.map(|l| l.vocal.output_peak)))
                 .child(peak_meter("보컬 체인 후 · mute 전", levels.map(|l| l.voice)))
                 .children(controls.has_aux().then(|| {
@@ -1574,6 +1634,11 @@ impl Render for MixLive {
         if let Some(form) = &self.form {
             body = body.child(form.clone());
         } else {
+            if self.session.running()
+                && let Some(editor) = &self.pitch_editor
+            {
+                body = body.child(editor.clone());
+            }
             if self.session.running()
                 && let Some(editor) = &self.parameter_editor
             {

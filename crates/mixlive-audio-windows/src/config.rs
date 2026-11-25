@@ -96,8 +96,8 @@ impl PitchScale {
     }
 }
 
-/// Fixed per-session pitch settings. Zero strength leaves the original audio path
-/// unchanged, including its algorithmic latency.
+/// One coherent pitch configuration. Zero strength disables correction and its
+/// algorithmic delay; an active session applies the whole configuration together.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PitchConfig {
     pub key: u8,

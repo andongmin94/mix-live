@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실행 중 VST3 슬롯 추가·삭제·순서 변경 검증 완료 · main 병합**
+단계: **실행 중 음정 설정 변경 구현 · Windows 통합 검증 준비**
 
 ## 현재 구현
 
@@ -30,6 +30,13 @@
   retune smoothing을 설정한다. 같은 Estimator와 RustFFT 기반 sqrt-Hann 4-overlap phase vocoder를
   사용하고 1:1 샘플 수를 유지한다. 강도 0이면 추가 지연 없이 비활성, 활성 시 분석창만큼 고정 지연
   (48 kHz에서 2048 samples)을 추가하며 무성음은 정렬된 dry다. 실제 음질과 CPU는 미검증이다.
+- GPUI의 실행 중 음정 설정 패널에서 조성·스케일·강도·retune을 하나의 명시적 적용으로
+  변경한다. 활성 상태끼리의 변경은 같은 FFT·위상·overlap·delay 이력을 유지한다.
+  켜기·끄기는 제어 스레드에서 준비한 보정기/PDC를 기존 단일 요청·반환 큐로 교체하고
+  이전 저장소를 제어 스레드에서 해제한다. 잘못된 설정·합산 2초 지연 초과는 기존 설정을 유지한다.
+  원신호 observer는 매 조회 때 승인된 조성/스케일을 사용하며 이전 target 계측을 비운다.
+  이후 VST3 편집도 현재 pitch 지연을 사용한다. 지연 설명과 명시적 Scene 저장에는 현재
+  실행 설정을 반영한다. 켜기 초기 무음·끄기 지연 변화는 있으며 무중단 교차 전환은 아니다.
 - 정지 상태의 장치·출력 설정은 기존 장치/앱·채널·보컬·플러그인 설정과 모든 앱의 mixer 값을
   보존한다. 누락/지원 불가 장치와 앱을 명시하며 저장/시작을 거절하고 임의로 대체하지 않는다.
   보컬 설정은 장치 조회 없이 preset·trim·strength·threshold·VST3 순서와 상태를 편집한다.
@@ -98,12 +105,14 @@
 
 ## 검증
 
+- 이번 음정 설정 변경의 로컬 DSP retarget/블록 독립성, 활성 전환/PDC 정렬, observer 기준 변경
+  검사는 통과했다. Windows workspace/native VST3/Clippy/release/GPUI 통합 검사는 아직 실행 전이다.
 - [Audio #51](https://github.com/andongmin94/mix-live/actions/runs/45623727270) `f6b5b79` 전체 성공:
   Windows workspace 검사 131개와 실제 native VST3 fixture 검사 13개, 총 **144개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
   PR #4의 병합 tree가 검증한 source tree와 동일함을 확인했다.
-- 이번 변경에서 같은 지연의 PDC 이력 유지, 마지막 지연 제거, 잘못된 준비의 무변경 거절,
+- 직전 변경에서 같은 지연의 PDC 이력 유지, 마지막 지연 제거, 잘못된 준비의 무변경 거절,
   bypass 목록 재배치를 검사했다. native fixture에서는 입력 없는 첫 슬롯 추가, 서로 다른
   파라미터의 인스턴스 동일성·순서 유지, 잘못된 경로/레이아웃/인덱스 거절, 전체 삭제 후
   오디오 처리·AUX/앱 격리·빈 체인 snapshot 및 편집한 순서/bypass의 snapshot을 확인했다.
@@ -124,7 +133,7 @@
 - 탭 선택·ASIO·실행 중
   소스 삽입/삭제·고급 formant 보존과 음정 보정 품질 수용은 미완료다(실험적 자동 보정은 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
-  실행 중 음정 설정/프리셋/pre-delay/에코 시간 변경은 미구현이다. 리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
+  실행 중 프리셋/pre-delay/에코 시간 변경은 미구현이다. 음정 설정/리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.
 - 원래 앱 재생 경로·장치 기본값은 변경하지 않는다. 자동 mix-minus 추정/외부 피드백 검출/

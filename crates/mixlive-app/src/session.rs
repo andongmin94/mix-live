@@ -2,6 +2,7 @@
 //! Scene reads/writes do not resolve endpoints or load plugins. Existing files are never replaced.
 
 use mixlive_audio_windows::{
+    config::PitchConfig,
     control::{LiveCommand, LiveControls},
     plugin::{ChainEdit, EffectSpec, LiveParameter, PluginArgs},
     scene::AudioScene,
@@ -68,6 +69,11 @@ impl Session {
 
     pub fn controls(&self) -> Option<&LiveControls> {
         self.active.as_ref().map(|active| active.controls.as_ref())
+    }
+
+    pub fn pitch_config(&self) -> Option<PitchConfig> {
+        self.active.as_ref().map(Active::pitch_config)
+            .or_else(|| self.scene().map(|scene| scene.route.pitch_config()))
     }
 
     fn fail<T>(&mut self, message: &str, error: impl ToString) -> Result<T, String> {
@@ -199,6 +205,30 @@ impl Session {
                 Ok(())
             }
             Err(error) => self.fail("VST3 체인 변경을 완료하지 못했습니다.", error),
+        }
+    }
+
+    /// Apply one coherent pitch configuration outside mutable GPUI updates.
+    pub fn set_pitch_config(&mut self, config: PitchConfig) -> Result<(), String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 실행 중에만 음정 설정을 적용할 수 있습니다.", "audio is not running");
+        };
+        let previous = active.pitch_config();
+        let result = active.set_pitch_config(config);
+        self.timing = active.timing.clone();
+        if active.pitch_config() != previous {
+            // A cached reading includes the old scale target. Refresh it before showing
+            // readings under the newly acknowledged settings, even after a later error.
+            if let Some(levels) = &mut self.levels { levels.pitch = None; }
+            self.report.clear();
+        }
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.message = "음정 설정 적용 · 정지 후 새 Scene 저장으로 현재 설정을 보존할 수 있습니다.".into();
+                Ok(())
+            }
+            Err(error) => self.fail("음정 설정을 적용하지 못했습니다.", error),
         }
     }
 
@@ -378,6 +408,11 @@ mod tests {
         assert!(session.controls().is_none());
         assert_eq!(session.path(), Some(path.as_path()));
         assert_eq!(session.scene().unwrap().effects.len(), 1);
+        let pitch = session.scene().unwrap().route.pitch_config();
+        assert_eq!(session.pitch_config(), Some(pitch));
+        assert!(session.set_pitch_config(PitchConfig { strength: 0.75, ..pitch }).is_err());
+        assert_eq!(session.pitch_config(), Some(pitch));
+        assert_eq!(session.scene().unwrap().route.pitch_config(), pitch);
         assert_eq!(session.effects(), session.scene().unwrap().effects.as_slice());
         assert!(session.edit_chain(ChainEdit::Remove { index: 0 }).is_err());
         assert_eq!(session.effects().len(), 1);
@@ -388,6 +423,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(session.open(directory.path().join("absent.json")).is_err());
         assert!(session.scene().is_none());
+        assert!(session.pitch_config().is_none());
         assert!(session.path().is_none());
         assert!(session.error.is_some());
     }
@@ -397,6 +433,8 @@ mod tests {
         let mut session = Session::default();
         assert!(session.start().is_err());
         assert!(!session.running());
+        assert!(session.pitch_config().is_none());
+        assert!(session.set_pitch_config(PitchConfig::default()).is_err());
         assert!(
             session
                 .apply(LiveCommand::Mute {

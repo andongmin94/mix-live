@@ -1,6 +1,6 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
 use super::{ChainEdit, ChainFile, EffectSpec, LiveParameter, ResolvedPlugins};
-use crate::{bridge::{Fault, Health}, capture::{Capture, PreparedVoiceDelay, VoiceDelayLayout, CAPTURE_BLOCK}, config::MAX_APPS, control::{GainRamp, LiveControls}};
+use crate::{bridge::{Fault, Health}, capture::{Capture, PreparedPitchChange, PreparedVoiceDelay, VoiceDelayLayout, CAPTURE_BLOCK}, config::{PitchConfig, PitchScale, MAX_APPS}, control::{GainRamp, LiveControls}};
 use mixlive_vst3::editor::flush_editor_changes;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::{path::Path, sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
@@ -199,9 +199,28 @@ impl ChainChange {
     }
 }
 
+// Both explicit edits use the same serialized block-boundary handoff. The pitch
+// plan is boxed on the control thread because it may own all of a corrector's FFT
+// storage; the same box brings the retired corrector back for control-thread drop.
+enum ProcessingChange {
+    Chain(ChainChange),
+    Pitch { pitch: Box<PreparedPitchChange>, delays: Option<PreparedVoiceDelay> },
+}
+impl ProcessingChange {
+    fn apply(&mut self, capture: &mut Capture, processors: &mut Vec<Option<Processor>>) {
+        match self {
+            Self::Chain(change) => change.apply(capture, processors),
+            Self::Pitch { pitch, delays } => {
+                capture.apply_pitch_change(pitch);
+                if let Some(delays) = delays { capture.swap_voice_delay(delays); }
+            }
+        }
+    }
+}
+
 struct ChainControl {
-    requests: Producer<ChainChange>,
-    retired: Consumer<ChainChange>,
+    requests: Producer<ProcessingChange>,
+    retired: Consumer<ProcessingChange>,
     layout: VoiceDelayLayout,
     rate: u32,
     capacity: usize,
@@ -216,9 +235,9 @@ struct ProcessingState {
     capture: Capture,
     processors: Vec<Option<Processor>>,
     input: Consumer<CaptureFrame>,
-    requests: Consumer<ChainChange>,
-    retired: Producer<ChainChange>,
-    unreturned: Option<ChainChange>,
+    requests: Consumer<ProcessingChange>,
+    retired: Producer<ProcessingChange>,
+    unreturned: Option<ProcessingChange>,
 }
 
 /// Loaded/polled/dropped on the main thread. Join ONE processing thread before native teardown.
@@ -230,6 +249,7 @@ pub(crate) struct PluginWorker {
     stopped: bool,
     health: Arc<Health>,
     chain: Option<ChainControl>,
+    pitch_config: PitchConfig,
     pub description: String,
 }
 
@@ -332,9 +352,11 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
     let (requests, changes) = RingBuffer::new(1);
     let (retired, acknowledgments) = RingBuffer::new(1);
     let layout = capture.delay_layout();
+    let pitch_config = capture.pitch_config();
+    let pitch_latency = capture.pitch_latency();
     let mut owner = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots: Vec::new(),
         stopped: false, health: health.clone(), chain: Some(ChainControl { requests, retired: acknowledgments,
-            layout, rate, capacity, latency: 0, pitch_latency: 0, compensation: 0 }), description: String::new() };
+            layout, rate, capacity, latency: 0, pitch_latency, compensation: 0 }), pitch_config, description: String::new() };
     let mut processors = Vec::new();
     let mut total_latency = 0_u64;
     for (index, (plugin, bypassed)) in plugins.into_iter().enumerate() {
@@ -344,9 +366,8 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
         processors.push(Some(processor));
     }
     let chain = owner.chain.as_mut().expect("prepared chain control");
-    let mut delays = chain.layout.prepare(total_latency, rate)?;
+    let mut delays = chain.layout.prepare(total_latency + pitch_latency as u64, rate)?;
     chain.latency = total_latency;
-    chain.pitch_latency = delays.latency() - total_latency as usize;
     chain.compensation = delays.compensation();
     capture.swap_voice_delay(&mut delays);
     drop(delays);
@@ -419,10 +440,14 @@ fn reject_added(added: Option<Slot>, error: String) -> String {
 impl PluginWorker {
     fn refresh_description(&mut self) {
         let Some(chain) = &self.chain else { return; };
-        self.description = self.slots.iter().enumerate().map(|(index, slot)| {
+        self.description = format!("Pitch: {} {}; correction {:.0}%; retune {:.1} ms; nominal pitch delay {} samples ({:.2} ms).\n",
+            PitchScale::NAMES[usize::from(self.pitch_config.key)], self.pitch_config.scale.name(),
+            self.pitch_config.strength * 100.0, self.pitch_config.retune_ms, chain.pitch_latency,
+            chain.pitch_latency as f64 * 1000.0 / f64::from(chain.rate));
+        self.description.extend(self.slots.iter().enumerate().map(|(index, slot)| {
             format!("VST3 slot {}: {} [{}]; reported latency {} samples.\n", index + 1, slot.name,
                 slot.spec.class_id.as_deref().expect("loaded class ID"), slot.latency)
-        }).collect();
+        }));
         self.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOutgoing AUX/app send compensation: {} samples ({:.2} ms); monitor adds no compensation. Includes {} samples of built-in pitch latency plus reported VST3 latency, not device or clock alignment.\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. Chain edits and outgoing compensation change at one block boundary; new plugin/delay histories start empty and removed tails end. Explicit slot bypass blends with latency-aligned dry audio; effects still process. No automatic dry fallback or crash isolation. Restart requests stop the route.",
             self.slots.len(), chain.latency, chain.latency as f64 * 1000.0 / f64::from(chain.rate),
             chain.compensation, chain.compensation as f64 * 1000.0 / f64::from(chain.rate), chain.pitch_latency,
@@ -437,6 +462,33 @@ impl PluginWorker {
 
     pub fn effect_flags(&self) -> Vec<Arc<AtomicBool>> {
         self.slots.iter().map(|slot| slot.bypassed.clone()).collect()
+    }
+
+    pub fn pitch_config(&self) -> PitchConfig { self.pitch_config }
+
+    /// All pitch settings form one committed configuration. Off/on changes prepare
+    /// and retire FFT storage with the matching PDC bank; enabled edits keep history.
+    pub fn set_pitch_config(&mut self, config: PitchConfig) -> Result<(), String> {
+        if self.health.failed() || self.stopped { return Err("audio path has stopped; cannot edit pitch settings".into()); }
+        let chain = self.chain.as_ref().ok_or("no running audio processor")?;
+        if self.thread.is_none() { return Err("no running audio processor".into()); }
+        if config == self.pitch_config { return Ok(()); }
+        let pitch = PreparedPitchChange::new(chain.rate, self.pitch_config, config)?;
+        let pitch_latency = pitch.latency(chain.pitch_latency);
+        let delays = if pitch_latency != chain.pitch_latency {
+            Some(chain.layout.prepare(chain.latency + pitch_latency as u64, chain.rate)?)
+        } else { None };
+        let compensation = delays.as_ref().map_or(chain.compensation, PreparedVoiceDelay::compensation);
+        let retired = self.exchange_change(ProcessingChange::Pitch { pitch: Box::new(pitch), delays })?;
+        // The old corrector and delay bank, if any, are owned by this acknowledgment.
+        drop(retired);
+        self.pitch_config = config;
+        let chain = self.chain.as_mut().expect("prepared chain control");
+        chain.pitch_latency = pitch_latency;
+        chain.compensation = compensation;
+        self.refresh_description();
+        if let Some(error) = self.health.error() { return Err(error.into()); }
+        Ok(())
     }
 
     /// Loading thread only. A rejected preparation leaves the active chain intact.
@@ -471,7 +523,7 @@ impl PluginWorker {
             + added.as_ref().map_or(0, |slot| u64::from(slot.latency));
         // A reorder or a zero-latency add/remove keeps the existing PDC history.
         let delays = if latency == chain.latency { None } else {
-            match chain.layout.prepare(latency, chain.rate) {
+            match chain.layout.prepare(latency + chain.pitch_latency as u64, chain.rate) {
                 Ok(delays) => Some(delays),
                 Err(error) => {
                     drop(added_processor);
@@ -484,7 +536,7 @@ impl PluginWorker {
         if let Some(processor) = added_processor { processors.push(Some(processor)); }
         let retained = order.into_iter().enumerate().map(|(to, from)| (from, to)).collect();
         let change = ChainChange { processors, retained, delays };
-        let retired = match self.exchange_chain(change) {
+        let retired = match self.exchange_change(ProcessingChange::Chain(change)) {
             Ok(retired) => retired,
             Err(error) => return Err(reject_added(added, error)),
         };
@@ -509,23 +561,23 @@ impl PluginWorker {
         Ok(())
     }
 
-    fn exchange_chain(&mut self, change: ChainChange) -> Result<ChainChange, String> {
-        if self.health.failed() { return Err("audio path failed before the chain change".into()); }
+    fn exchange_change(&mut self, change: ProcessingChange) -> Result<ProcessingChange, String> {
+        if self.health.failed() { return Err("audio path failed before the processing change".into()); }
         if self.chain.as_mut().expect("prepared chain control").requests.push(change).is_err() {
-            return Err("a VST3 chain change is already pending".into());
+            return Err("an audio processing change is already pending".into());
         }
         loop {
             if let Ok(retired) = self.chain.as_mut().expect("prepared chain control").retired.pop() { return Ok(retired); }
             if self.health.failed() || self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
                 if !self.health.failed() { self.health.fail(Fault::Routing); }
                 if let Some(retired) = self.join_processing() { return Ok(retired); }
-                return Err(self.health.error().unwrap_or("audio processor stopped before the chain change").into());
+                return Err(self.health.error().unwrap_or("audio processor stopped before the processing change").into());
             }
             thread::sleep(Duration::from_millis(1));
         }
     }
 
-    fn join_processing(&mut self) -> Option<ChainChange> {
+    fn join_processing(&mut self) -> Option<ProcessingChange> {
         self.stop.store(true, Ordering::Relaxed);
         let joined = self.thread.take().map(JoinHandle::join);
         let acknowledged = self.chain.as_mut().and_then(|chain| chain.retired.pop().ok());

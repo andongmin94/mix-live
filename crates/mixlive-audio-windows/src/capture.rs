@@ -11,7 +11,6 @@ pub const CAPTURE_BLOCK: usize = 256;
 #[derive(Clone)]
 pub(crate) struct VoiceDelayLayout {
     compensated: Vec<bool>,
-    pitch_latency: usize,
 }
 
 #[cfg(any(windows, test))]
@@ -23,19 +22,48 @@ pub(crate) struct PreparedVoiceDelay {
 
 #[cfg(any(windows, test))]
 impl PreparedVoiceDelay {
+    #[cfg(test)]
     pub(crate) fn latency(&self) -> usize { self.latency }
     pub(crate) fn compensation(&self) -> usize { self.compensation }
 }
 
 #[cfg(any(windows, test))]
 impl VoiceDelayLayout {
-    pub(crate) fn prepare(&self, vst3_latency: u64, rate: u32) -> Result<PreparedVoiceDelay, String> {
-        let latency = vst3_latency.checked_add(self.pitch_latency as u64)
-            .filter(|&latency| latency <= u64::from(rate) * 2)
-            .ok_or("voice chain latency exceeds the supported 2-second outgoing compensation")? as usize;
+    pub(crate) fn prepare(&self, total_voice_latency: u64, rate: u32) -> Result<PreparedVoiceDelay, String> {
+        if total_voice_latency > u64::from(rate) * 2 {
+            return Err("voice chain latency exceeds the supported 2-second outgoing compensation".into());
+        }
+        let latency = total_voice_latency as usize;
         let frames: Vec<_> = self.compensated.iter().map(|&enabled| if enabled { latency } else { 0 }).collect();
         let compensation = if self.compensated.contains(&true) { latency } else { 0 };
         Ok(PreparedVoiceDelay { delays: SendDelays::new(&frames), latency, compensation })
+    }
+}
+
+/// Prepare only an off/on transition's DSP storage on the control thread.
+/// Settings within the same enabled state keep the existing processing history.
+#[cfg(any(windows, test))]
+pub(crate) struct PreparedPitchChange {
+    config: PitchConfig,
+    replacement: Option<Option<PitchCorrector>>,
+}
+
+#[cfg(any(windows, test))]
+impl PreparedPitchChange {
+    pub(crate) fn new(rate: u32, current: PitchConfig, next: PitchConfig) -> Result<Self, String> {
+        next.validate()?;
+        if !(8000..=192_000).contains(&rate) { return Err("unsupported pitch correction sample rate".into()); }
+        let replacement = if (current.strength == 0.0) != (next.strength == 0.0) {
+            Some(PitchCorrector::new(rate, next)?)
+        } else { None };
+        Ok(Self { config: next, replacement })
+    }
+
+    /// Resulting pitch delay before application; after application the plan owns
+    /// any retired corrector and must be returned to the control thread.
+    pub(crate) fn latency(&self, current_latency: usize) -> usize {
+        self.replacement.as_ref().map_or(current_latency,
+            |pitch| pitch.as_ref().map_or(0, PitchCorrector::latency))
     }
 }
 
@@ -66,6 +94,7 @@ pub struct Capture {
     compensation: usize,
     vocal: VocalChain,
     pitch: Option<PitchCorrector>,
+    pitch_config: PitchConfig,
     corrected_mic: [f32; CAPTURE_BLOCK],
     voice_left: [f32; CAPTURE_BLOCK],
     voice_right: [f32; CAPTURE_BLOCK],
@@ -131,7 +160,7 @@ impl Capture {
             if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
         let source_mutes = controls.source_targets().map(|gain| GainRamp::new(sample_rate, gain));
         let source_trims = controls.trim_targets().map(|gain| GainRamp::new(sample_rate, gain));
-        Ok(Self { engine, voice_latency: 0, compensation: 0, vocal, pitch: None, corrected_mic: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
+        Ok(Self { engine, voice_latency: 0, compensation: 0, vocal, pitch: None, pitch_config: PitchConfig::default(), corrected_mic: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
             aux_enabled: controls.has_aux(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
             app_count: controls.app_count(), app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
             controls, source_slots, mix_slots, source_mutes, source_trims, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
@@ -143,7 +172,22 @@ impl Capture {
     /// Prepare the opt-in pitch stage before opening the microphone stream.
     pub fn prepare_pitch(&mut self, rate: u32, config: PitchConfig) -> Result<usize, String> {
         self.pitch = PitchCorrector::new(rate, config)?;
+        self.pitch_config = config;
         Ok(self.pitch_latency())
+    }
+
+    pub(crate) fn pitch_config(&self) -> PitchConfig { self.pitch_config }
+
+    /// Apply together with the prepared total voice delay at a block boundary.
+    /// A removed corrector remains owned by the plan for control-thread retirement.
+    #[cfg(any(windows, test))]
+    pub(crate) fn apply_pitch_change(&mut self, prepared: &mut PreparedPitchChange) {
+        if let Some(replacement) = &mut prepared.replacement {
+            std::mem::swap(&mut self.pitch, replacement);
+        } else if let Some(pitch) = &mut self.pitch {
+            pitch.set_config(prepared.config);
+        }
+        self.pitch_config = prepared.config;
     }
 
     pub fn pitch_latency(&self) -> usize {
@@ -156,7 +200,7 @@ impl Capture {
         let compensated = (0..self.route_count).map(|index| {
             self.source_slots[index / mix_count] != 0 && self.mix_slots[index % mix_count] != 0
         }).collect();
-        VoiceDelayLayout { compensated, pitch_latency: self.pitch_latency() }
+        VoiceDelayLayout { compensated }
     }
 
     /// Swap together with the VST3 chain at a block boundary. The caller takes the
@@ -172,7 +216,9 @@ impl Capture {
     /// Test setup uses the same control preparation and worker swap as a live edit.
     #[cfg(test)]
     pub(crate) fn prepare_voice_delay(&mut self, vst3_latency: u64, rate: u32) -> Result<usize, String> {
-        let mut prepared = self.delay_layout().prepare(vst3_latency, rate)?;
+        let total_latency = vst3_latency.checked_add(self.pitch_latency() as u64)
+            .ok_or("voice chain latency exceeds the supported 2-second outgoing compensation")?;
+        let mut prepared = self.delay_layout().prepare(total_latency, rate)?;
         let compensation = prepared.compensation();
         self.swap_voice_delay(&mut prepared);
         Ok(compensation)

@@ -505,7 +505,7 @@ impl Render for SoundEditor {
                     .child(field("pitch-correction", "음정 보정 강도", "0~1 · 0은 지연 없는 끄기", &self.pitch_correction, window, cx))
                     .child(field("pitch-retune-ms", "음정 보정 속도", "5~200 ms · 목표값 smoothing", &self.pitch_retune, window, cx)))
                 .child(div().text_xs().text_color(rgb(MUTED))
-                    .child("A4=440 Hz. 선택한 스케일의 가장 가까운 음으로 보정합니다. 0에서는 원본 경로 유지, 0보다 크면 약 40~80 ms 알고리즘 지연이 추가됩니다. 음질·formant·실제 장비 CPU는 미검증이며 모든 설정은 정지 상태에서 변경합니다.")))
+                    .child("A4=440 Hz. 선택한 스케일의 가장 가까운 음으로 보정합니다. 0에서는 원본 경로 유지, 0보다 크면 약 40~80 ms 알고리즘 지연이 추가됩니다. 이 화면은 시작 설정이며, 실행 중에는 음정 설정 패널에서 조성·스케일·강도·속도를 적용할 수 있습니다. 음질·formant·실제 장비 CPU는 미검증입니다.")))
             .child(panel().gap_4()
                 .child(section_title("EQ", "보컬 EQ 세부 설정"))
                 .child(div().flex().flex_wrap().gap_5()

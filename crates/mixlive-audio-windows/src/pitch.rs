@@ -113,21 +113,18 @@ pub(crate) struct PitchMonitor {
     reader: Consumer<f32>,
     signal: Vec<f64>,
     detector: Estimator,
-    key: u8,
-    scale: PitchScale,
 }
 
 #[cfg(any(windows, test))]
-pub(crate) fn channel(rate: u32, key: u8, scale: PitchScale) -> Result<(PitchTap, PitchMonitor), String> {
+pub(crate) fn channel(rate: u32) -> Result<(PitchTap, PitchMonitor), String> {
     if !(8000..=192_000).contains(&rate) { return Err("unsupported pitch monitor sample rate".into()); }
-    if key > 11 { return Err("invalid pitch reference key".into()); }
     let rate = rate as usize;
     // 40–80 ms, at the actual microphone sample rate; not an audio delay.
     let size = analysis_size(rate);
     let capacity = size * (rate * 2 / size);
     let (writer, reader) = RingBuffer::new(capacity);
     Ok((PitchTap { writer, window: vec![0.0; size], filled: 0 },
-        PitchMonitor { reader, signal: vec![0.0; size], detector: Estimator::new(rate, size), key, scale }))
+        PitchMonitor { reader, signal: vec![0.0; size], detector: Estimator::new(rate, size) }))
 }
 
 #[cfg(any(windows, test))]
@@ -156,7 +153,8 @@ impl PitchTap {
 impl PitchMonitor {
     /// Consume only complete windows; analyze the newest available one, not every queued frame.
     /// No new observation or no sufficiently clear pitch means None, never a held old note.
-    pub(crate) fn take(&mut self) -> Option<PitchReading> {
+    /// Read the validated reference from the acknowledged runtime config on each query.
+    pub(crate) fn take(&mut self, key: u8, scale: PitchScale) -> Option<PitchReading> {
         let windows = self.reader.slots() / self.signal.len();
         if windows == 0 { return None; }
         for _ in 0..windows {
@@ -165,7 +163,7 @@ impl PitchMonitor {
         let (frequency_hz, clarity) = self.detector.estimate(&self.signal)?;
         let note = 69.0 + 12.0 * (frequency_hz / 440.0).log2();
         let nearest = note.round();
-        let target_midi_note = self.scale.nearest_note(self.key, note);
+        let target_midi_note = scale.nearest_note(key, note);
         Some(PitchReading { frequency_hz, midi_note: nearest as u8,
             cents: (note - nearest) * 100.0, clarity, target_midi_note,
             target_cents: (note - f64::from(target_midi_note)) * 100.0 })
@@ -183,12 +181,12 @@ mod tests {
     #[test]
     fn estimates_note_and_cents_at_supported_sample_rates() {
         for rate in [8000, 44100, 48000, 96000, 192000] {
-            let (mut tap, mut monitor) = channel(rate, 0, PitchScale::Chromatic).unwrap();
+            let (mut tap, mut monitor) = channel(rate).unwrap();
             let size = tap.window.len();
             for (hz, note, name) in [(75.0, 38, "D2"), (110.0, 45, "A2"), (220.0, 57, "A3"), (445.0, 69, "A4"), (1190.0, 86, "D6")] {
                 let signal = tone(rate, size, hz);
                 for part in signal.chunks(137) { tap.push(part); }
-                let reading = monitor.take().unwrap_or_else(|| panic!("missing clear {hz} Hz tone at {rate} Hz"));
+                let reading = monitor.take(0, PitchScale::Chromatic).unwrap_or_else(|| panic!("missing clear {hz} Hz tone at {rate} Hz"));
                 assert_eq!(reading.midi_note, note);
                 assert_eq!(reading.note_name(), name);
                 assert!((reading.frequency_hz / hz - 1.0).abs() < 0.005, "{rate}: {reading:?}");
@@ -197,34 +195,34 @@ mod tests {
                 assert!(reading.clarity >= MIN_CLARITY);
                 assert_eq!(reading.target_midi_note, reading.midi_note);
                 assert_eq!(reading.target_cents, reading.cents);
-                assert!(monitor.take().is_none());
+                assert!(monitor.take(0, PitchScale::Chromatic).is_none());
             }
         }
     }
 
     #[test]
     fn complete_windows_only_and_silence_dc_or_invalid_input_do_not_hold_previous_note() {
-        let (mut tap, mut monitor) = channel(48000, 0, PitchScale::Chromatic).unwrap();
+        let (mut tap, mut monitor) = channel(48000).unwrap();
         let size = tap.window.len();
         let signal = tone(48000, size, 440.0);
         tap.push(&signal[..size - 1]);
-        assert!(monitor.take().is_none());
+        assert!(monitor.take(0, PitchScale::Chromatic).is_none());
         tap.push(&signal[size - 1..]);
-        assert_eq!(monitor.take().unwrap().note_name(), "A4");
+        assert_eq!(monitor.take(0, PitchScale::Chromatic).unwrap().note_name(), "A4");
         for value in [0.0, 0.2, f32::NAN] {
             tap.push(&vec![value; size]);
-            assert!(monitor.take().is_none());
+            assert!(monitor.take(0, PitchScale::Chromatic).is_none());
         }
     }
 
     #[test]
     fn normalized_detector_rejects_out_of_range_tones_and_tracks_harmonic_fundamental() {
         for rate in [8000, 48000, 192000] {
-            let (mut tap, mut monitor) = channel(rate, 0, PitchScale::Chromatic).unwrap();
+            let (mut tap, mut monitor) = channel(rate).unwrap();
             let size = tap.window.len();
             for hz in [55.0, 1600.0] {
                 tap.push(&tone(rate, size, hz));
-                assert!(monitor.take().is_none(), "out of range {hz} Hz at {rate} Hz");
+                assert!(monitor.take(0, PitchScale::Chromatic).is_none(), "out of range {hz} Hz at {rate} Hz");
             }
             let mut input = tone(rate, size, 110.0);
             let harmonics = tone(rate, size, 220.0);
@@ -232,18 +230,18 @@ mod tests {
                 *sample += 0.7 * harmonic;
             }
             tap.push(&input);
-            assert!((monitor.take().unwrap().frequency_hz - 110.0).abs() < 0.6);
+            assert!((monitor.take(0, PitchScale::Chromatic).unwrap().frequency_hz - 110.0).abs() < 0.6);
         }
     }
 
     #[test]
     fn reference_scales_select_nearest_allowed_note_without_modifying_observation() {
-        let (mut tap, mut monitor) = channel(48000, 0, PitchScale::Major).unwrap();
+        let (mut tap, mut monitor) = channel(48000).unwrap();
         let size = tap.window.len();
         // C#4 slightly sharp is between C4 and D4; reference must be D4.
         let hz = 440.0 * 2.0_f64.powf((61.1 - 69.0) / 12.0);
         tap.push(&tone(48000, size, hz));
-        let reading = monitor.take().unwrap();
+        let reading = monitor.take(0, PitchScale::Major).unwrap();
         assert_eq!(reading.note_name(), "C#4");
         assert_eq!(reading.target_note_name(), "D4");
         assert!((reading.cents - 10.0).abs() < 1.0);
@@ -252,24 +250,32 @@ mod tests {
         assert_eq!(PitchScale::Minor.nearest_note(0, 63.1), 63);
         assert_eq!(PitchScale::Major.nearest_note(2, 61.0), 61);
         assert_eq!(PitchScale::Chromatic.nearest_note(11, 61.4), 61);
-        assert!(channel(48000, 12, PitchScale::Major).is_err());
+        // The same observer uses the newly acknowledged key/scale on its next reading.
+        for (key, scale) in [(2, PitchScale::Major), (0, PitchScale::Chromatic)] {
+            tap.push(&tone(48000, size, hz));
+            let changed = monitor.take(key, scale).unwrap();
+            assert_eq!(changed.frequency_hz, reading.frequency_hz);
+            assert_eq!(changed.cents, reading.cents);
+            assert_eq!(changed.target_note_name(), "C#4");
+            assert_eq!(changed.target_cents, changed.cents);
+        }
     }
 
     #[test]
     fn slow_observer_drops_whole_windows_and_resumes_with_current_signal() {
-        let (mut tap, mut monitor) = channel(8000, 0, PitchScale::Chromatic).unwrap();
+        let (mut tap, mut monitor) = channel(8000).unwrap();
         let size = tap.window.len();
         let first = tone(8000, size, 220.0);
         let next = tone(8000, size, 440.0);
         tap.push(&first);
         tap.push(&next);
-        assert_eq!(monitor.take().unwrap().note_name(), "A4");
+        assert_eq!(monitor.take(0, PitchScale::Chromatic).unwrap().note_name(), "A4");
         let capacity = tap.writer.slots();
         for _ in 0..(capacity / size + 3) { tap.push(&first); }
         assert_eq!(tap.writer.slots(), 0);
-        assert_eq!(monitor.take().unwrap().note_name(), "A3");
-        assert!(monitor.take().is_none());
+        assert_eq!(monitor.take(0, PitchScale::Chromatic).unwrap().note_name(), "A3");
+        assert!(monitor.take(0, PitchScale::Chromatic).is_none());
         tap.push(&next);
-        assert_eq!(monitor.take().unwrap().note_name(), "A4");
+        assert_eq!(monitor.take(0, PitchScale::Chromatic).unwrap().note_name(), "A4");
     }
 }

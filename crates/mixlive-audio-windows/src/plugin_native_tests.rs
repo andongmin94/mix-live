@@ -30,6 +30,61 @@ fn capture_queue_rejects_overflow_and_invalid_input_without_waiting() {
     assert!(health.failed());
 }
 
+#[test]
+fn live_pitch_updates_commit_on_idle_boundaries_and_reject_invalid_preparation() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, VocalConfig::default()).unwrap());
+    let (writer, _reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
+    let enabled = PitchConfig { key: 7, scale: PitchScale::Minor, strength: 0.8, retune_ms: 67.0 };
+    capture.prepare_pitch(48000, enabled).unwrap();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, true, health.clone()).unwrap();
+    assert_eq!(worker.pitch_config(), enabled);
+    assert_eq!(worker.chain.as_ref().unwrap().pitch_latency, 2048);
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
+
+    let disabled = PitchConfig { strength: 0.0, ..enabled };
+    worker.set_pitch_config(disabled).unwrap();
+    assert_eq!(worker.pitch_config(), disabled);
+    assert_eq!(worker.chain.as_ref().unwrap().pitch_latency, 0);
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 0);
+    let reference = PitchConfig { key: 2, scale: PitchScale::Major, retune_ms: 140.0, ..disabled };
+    worker.set_pitch_config(reference).unwrap();
+    assert_eq!(worker.pitch_config(), reference);
+    assert_eq!(worker.chain.as_ref().unwrap().pitch_latency, 0);
+
+    // Test the runtime admission calculation with a synthetic reported latency;
+    // no plugin or audio input is used, and no hardware latency is inferred.
+    worker.chain.as_mut().unwrap().latency = 95_000;
+    assert!(worker.set_pitch_config(enabled).unwrap_err().contains("2-second"));
+    assert_eq!(worker.pitch_config(), reference);
+    assert_eq!(worker.chain.as_ref().unwrap().pitch_latency, 0);
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 0);
+    worker.chain.as_mut().unwrap().latency = 0;
+
+    worker.set_pitch_config(enabled).unwrap();
+    let changed = PitchConfig { strength: 0.35, ..reference };
+    worker.set_pitch_config(changed).unwrap();
+    assert_eq!(worker.pitch_config(), changed);
+    assert_eq!(worker.chain.as_ref().unwrap().pitch_latency, 2048);
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
+    assert!(worker.description.contains("Pitch: D major; correction 35%; retune 140.0 ms"));
+    for invalid in [PitchConfig { key: 12, ..changed }, PitchConfig { strength: f32::NAN, ..changed },
+        PitchConfig { retune_ms: 201.0, ..changed }] {
+        assert!(worker.set_pitch_config(invalid).is_err());
+        assert_eq!(worker.pitch_config(), changed);
+        assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
+        assert!(!health.failed());
+    }
+    worker.set_pitch_config(reference).unwrap();
+    assert_eq!(worker.pitch_config(), reference);
+    assert_eq!(worker.chain.as_ref().unwrap().pitch_latency, 0);
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 0);
+    assert_eq!(health.captured_frames.load(Ordering::Relaxed), 0);
+    worker.finish(None).unwrap();
+}
+
 fn assert_edited_chain_output(input: &mut QueuedInput, worker: &mut PluginWorker,
     reader: &mut crate::bridge::OutputReader, health: &Health, voice: f32) {
     let before = health.captured_frames.load(Ordering::Relaxed);
@@ -97,6 +152,25 @@ fn native_live_chain_edits_preserve_instances_outputs_and_the_empty_worker() {
     assert!(controls.effect_bypassed(0).is_err());
     assert!(worker.description.contains("Serial chain: 0 effects"));
     assert_edited_chain_output(&mut input, &mut worker, &mut reader, &health, 0.4);
+    // VST3 edits after a live enable/disable keep the currently committed pitch
+    // compensation, not the startup configuration. The fixture reports zero latency;
+    // while idle, synthetic cached latency makes Remove exercise PDC preparation.
+    // Actual 0/71-sample audio alignment is covered by the portable capture test.
+    let pitch = PitchConfig { strength: 0.7, ..PitchConfig::default() };
+    worker.set_pitch_config(pitch).unwrap();
+    worker.edit_chain(ChainEdit::Add(spec.clone())).unwrap();
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
+    worker.slots[0].latency = 71;
+    worker.chain.as_mut().unwrap().latency = 71;
+    worker.edit_chain(ChainEdit::Remove { index: 0 }).unwrap();
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
+    worker.set_pitch_config(PitchConfig::default()).unwrap();
+    worker.edit_chain(ChainEdit::Add(spec)).unwrap();
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 0);
+    worker.slots[0].latency = 71;
+    worker.chain.as_mut().unwrap().latency = 71;
+    worker.edit_chain(ChainEdit::Remove { index: 0 }).unwrap();
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 0);
     assert!(worker.snapshot().unwrap().effects.is_empty());
     assert!(!health.failed());
 }
@@ -305,7 +379,7 @@ fn native_editors_reopen_on_the_same_slots_and_detach_independently() {
         Slot::new(plugin, Arc::new(AtomicBool::new(gain > 0.5)), 0)
     }).collect();
     let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
-        stopped: false, health: health.clone(), chain: None, description: String::new() };
+        stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), description: String::new() };
     // Upstream's documented Editor Attached instrumentation (read-only parameter 1000).
     let attached = |worker: &PluginWorker, index: usize| {
         worker.slots[index].plugin.lock().unwrap().get_parameter(1000).unwrap()
@@ -371,7 +445,7 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
             slots.push(Slot::new(plugin, Arc::new(AtomicBool::new(gain > 0.5)), 0));
         }
         let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
-            stopped: false, health: health.clone(), chain: None, description: String::new() };
+            stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), description: String::new() };
         // A last generic-panel edit with no subsequent audio block must survive its snapshot.
         for (index, gain) in [0.23, 0.61].into_iter().enumerate() {
             let parameters = worker.set_effect_parameter(index, 0, gain).unwrap();

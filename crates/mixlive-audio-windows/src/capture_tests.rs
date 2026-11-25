@@ -682,7 +682,7 @@ fn live_echo_reaches_voice_chain_only_and_mute_covers_its_tail() {
 }
 
 #[test]
-fn pitch_delay_and_reported_vst3_delay_align_outgoing_aux_and_apps_once() {
+fn live_pitch_toggles_and_settings_keep_vst3_delay_and_outgoing_alignment() {
     const PLUGIN_DELAY: usize = 71;
     for plugin_delay in [0, PLUGIN_DELAY] {
         let health = Arc::new(Health::default());
@@ -693,46 +693,79 @@ fn pitch_delay_and_reported_vst3_delay_align_outgoing_aux_and_apps_once() {
         let (writer, _reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
         let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
             vec![(writer, vec![0, 2])], health.clone(), controls).unwrap();
-        let pitch = capture.prepare_pitch(48000, PitchConfig { strength: 1.0, ..PitchConfig::default() }).unwrap();
-        assert_eq!(pitch, 2048);
-        let total = pitch + plugin_delay;
-        assert!(capture.prepare_voice_delay(96000, 48000).is_err());
-        assert_eq!(capture.prepare_voice_delay(plugin_delay as u64, 48000).unwrap(), total);
         let mut history = [0.0; PLUGIN_DELAY];
         let mut cursor = 0;
-        let count = total + 384;
-        let mut mic = vec![0.0; count];
-        let mut aux = vec![[0.0; 2]; count];
-        let mut app = aux.clone();
-        mic[17] = 0.5;
-        aux[17] = [0.125, -0.25];
-        app[17] = [-0.0625, 0.125];
-        let mut start = 0;
-        for block in mic.chunks(137) {
-            let end = start + block.len();
-            capture.push_with_effect(block, Some(&aux[start..end]), &[&app[start..end]], &mut |left, right| {
-                if plugin_delay != 0 {
-                    for (l, r) in left.iter_mut().zip(right) {
-                        let delayed = std::mem::replace(&mut history[cursor], *l);
-                        cursor = (cursor + 1) % PLUGIN_DELAY;
-                        *l = delayed; *r = delayed;
+        let layout = capture.delay_layout();
+        for strength in [0.0, 1.0, 0.0] {
+            let config = PitchConfig { key: 2, strength, ..PitchConfig::default() };
+            let previous = capture.pitch_latency();
+            let mut change = PreparedPitchChange::new(48000, capture.pitch_config(), config).unwrap();
+            let pitch = change.latency(previous);
+            assert_eq!(pitch, if strength == 0.0 { 0 } else { 2048 });
+            let total = pitch + plugin_delay;
+            let mut delays = layout.prepare(total as u64, 48000).unwrap();
+            capture.apply_pitch_change(&mut change);
+            capture.swap_voice_delay(&mut delays);
+            assert_eq!(capture.pitch_config(), config);
+            assert_eq!(capture.pitch_latency(), pitch);
+            if previous > 0 {
+                assert_eq!(change.replacement.as_ref().unwrap().as_ref().unwrap().latency(), previous);
+            }
+            if pitch > 0 {
+                assert!(capture.prepare_voice_delay(96000, 48000).is_err());
+                assert_eq!(capture.pitch_config(), config);
+                assert_eq!(capture.voice_latency, total);
+            }
+            for invalid in [PitchConfig { key: 12, ..config },
+                PitchConfig { strength: f32::NAN, ..config }, PitchConfig { retune_ms: 201.0, ..config }] {
+                assert!(PreparedPitchChange::new(48000, config, invalid).is_err());
+                assert_eq!(capture.pitch_config(), config);
+            }
+            let count = total + 384;
+            let mut mic = vec![0.0; count];
+            let mut aux = vec![[0.0; 2]; count];
+            let mut app = aux.clone();
+            mic[17] = 0.5;
+            aux[17] = [0.125, -0.25];
+            app[17] = [-0.0625, 0.125];
+            let mut start = 0;
+            for block in mic.chunks(137) {
+                if start == 137 && pitch > 0 {
+                    // Settings-only changes preserve the in-flight mic impulse and
+                    // outgoing AUX/app histories, with no replacement DSP or PDC.
+                    let next = PitchConfig { key: 7, scale: crate::config::PitchScale::Minor,
+                        strength: 0.5, retune_ms: 200.0 };
+                    let mut settings = PreparedPitchChange::new(48000, capture.pitch_config(), next).unwrap();
+                    assert!(settings.replacement.is_none());
+                    assert_eq!(settings.latency(pitch), pitch);
+                    capture.apply_pitch_change(&mut settings);
+                    assert_eq!(capture.pitch_config(), next);
+                    assert_eq!(capture.voice_latency, total);
+                }
+                let end = start + block.len();
+                capture.push_with_effect(block, Some(&aux[start..end]), &[&app[start..end]], &mut |left, right| {
+                    if plugin_delay != 0 {
+                        for (l, r) in left.iter_mut().zip(right) {
+                            let delayed = std::mem::replace(&mut history[cursor], *l);
+                            cursor = (cursor + 1) % PLUGIN_DELAY;
+                            *l = delayed; *r = delayed;
+                        }
+                    }
+                    true
+                });
+                for mix in [0, 1] {
+                    let output = capture.engine.output(mix).unwrap();
+                    for (i, (&l, &r)) in output.left.iter().zip(output.right).enumerate() {
+                        let frame = start + i;
+                        let voice = if frame == 17 + total { 0.5 } else { 0.0 };
+                        let music_frame = if mix == 0 { 17 } else { 17 + total };
+                        let music = if frame == music_frame { [0.0625, -0.125] } else { [0.0; 2] };
+                        assert_eq!([l, r], [voice + music[0], voice + music[1]],
+                            "strength {strength}, mix {mix}, frame {frame}");
                     }
                 }
-                true
-            });
-            for mix in [0, 1] {
-                let output = capture.engine.output(mix).unwrap();
-                for (i, (&l, &r)) in output.left.iter().zip(output.right).enumerate() {
-                    let expected = match (mix, start + i) {
-                        (0, 17) => [0.0625, -0.125],
-                        (0, frame) if frame == 17 + total => [0.5, 0.5],
-                        (1, frame) if frame == 17 + total => [0.5625, 0.375],
-                        _ => [0.0; 2],
-                    };
-                    assert_eq!([l, r], expected, "mix {mix}, frame {}", start + i);
-                }
+                start = end;
             }
-            start = end;
         }
         assert_eq!(f32::from_bits(health.input_peak.load(Ordering::Relaxed)), 0.5);
         assert!(!health.failed());
