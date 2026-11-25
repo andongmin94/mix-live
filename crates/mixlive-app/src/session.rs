@@ -149,7 +149,7 @@ impl Session {
                 self.last_report = Instant::now();
                 self.last_meter = Instant::now();
                 self.active = Some(active);
-                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 믹서와 VST3 상태를 저장할 수 있습니다.".into();
+                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 믹서·보컬 설정과 VST3 상태를 저장할 수 있습니다.".into();
                 Ok(())
             }
             Err(error) => self.fail("시작하지 못했습니다. 설정과 장치를 확인하세요.", error),
@@ -230,7 +230,7 @@ impl Session {
             Err(error) => return self.fail("오디오를 정지했지만 실행 상태를 저장하지 못했습니다.", error),
         };
         self.save_new(path, scene)?;
-        self.message = "정지 후 현재 믹서와 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
+        self.message = "정지 후 현재 믹서·보컬 설정과 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
         Ok(())
     }
 

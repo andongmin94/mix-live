@@ -33,7 +33,47 @@ impl FromStr for Preset {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// Parameters that can change without changing processing topology or a delay length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum VocalParameter { Trim, Strength, Compressor, Deesser, ReverbMix, ReverbDecay }
+
+impl VocalParameter {
+    pub const ALL: [Self; 6] = [Self::Trim, Self::Strength, Self::Compressor, Self::Deesser, Self::ReverbMix, Self::ReverbDecay];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Trim => "trim", Self::Strength => "strength", Self::Compressor => "compressor",
+            Self::Deesser => "deesser", Self::ReverbMix => "reverb", Self::ReverbDecay => "decay",
+        }
+    }
+
+    pub fn range(self) -> std::ops::RangeInclusive<f32> {
+        match self {
+            Self::Trim => -36.0..=18.0,
+            Self::Strength | Self::ReverbMix => 0.0..=1.0,
+            Self::Compressor | Self::Deesser => -60.0..=0.0,
+            Self::ReverbDecay => 0.2..=5.0,
+        }
+    }
+
+    pub fn available_for(self, preset: Preset) -> bool {
+        preset != Preset::Off || matches!(self, Self::Trim | Self::ReverbMix | Self::ReverbDecay)
+    }
+
+    pub fn validate(self, value: f32) -> Result<(), DspError> {
+        if self.range().contains(&value) { return Ok(()); }
+        Err(match self {
+            Self::Trim => DspError::InputGain,
+            Self::Strength => DspError::Strength,
+            Self::Compressor | Self::Deesser => DspError::Threshold,
+            Self::ReverbMix => DspError::ReverbMix,
+            Self::ReverbDecay => DspError::ReverbDecay,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VocalConfig {
     pub preset: Preset,
     /// Digital trim before the detectors. Cannot repair clipping at the interface input.
@@ -50,14 +90,33 @@ impl Default for VocalConfig {
     }
 }
 impl VocalConfig {
-    pub fn validate(self) -> Result<(), DspError> {
-        if !self.input_gain_db.is_finite() || !(-36.0..=18.0).contains(&self.input_gain_db) { return Err(DspError::InputGain); }
-        if !self.strength.is_finite() || !(0.0..=1.0).contains(&self.strength) { return Err(DspError::Strength); }
-        if [self.compressor_threshold_db, self.deess_threshold_db].iter().any(|v| !v.is_finite() || !(-60.0..=0.0).contains(v)) {
-            return Err(DspError::Threshold);
+    pub fn parameter(self, parameter: VocalParameter) -> f32 {
+        match parameter {
+            VocalParameter::Trim => self.input_gain_db,
+            VocalParameter::Strength => self.strength,
+            VocalParameter::Compressor => self.compressor_threshold_db,
+            VocalParameter::Deesser => self.deess_threshold_db,
+            VocalParameter::ReverbMix => self.reverb.mix,
+            VocalParameter::ReverbDecay => self.reverb.decay_secs,
         }
-        self.reverb.validate()?;
+    }
+
+    pub fn set_parameter(&mut self, parameter: VocalParameter, value: f32) -> Result<(), DspError> {
+        parameter.validate(value)?;
+        match parameter {
+            VocalParameter::Trim => self.input_gain_db = value,
+            VocalParameter::Strength => self.strength = value,
+            VocalParameter::Compressor => self.compressor_threshold_db = value,
+            VocalParameter::Deesser => self.deess_threshold_db = value,
+            VocalParameter::ReverbMix => self.reverb.mix = value,
+            VocalParameter::ReverbDecay => self.reverb.decay_secs = value,
+        }
         Ok(())
+    }
+
+    pub fn validate(self) -> Result<(), DspError> {
+        for parameter in VocalParameter::ALL { parameter.validate(self.parameter(parameter))?; }
+        self.reverb.validate()
     }
 }
 
@@ -111,6 +170,44 @@ fn gain(db: f64) -> f64 { 10.0_f64.powf(db / 20.0) }
 fn smooth(current: &mut f64, target: f64, alpha: f64) {
     *current = target + alpha * (*current - target);
     if current.abs() < 1e-100 { *current = 0.0; }
+}
+
+/// Ten-millisecond linear transition on the processing clock. Repeated requests
+/// for the same target do not restart a transition; the final value is exact.
+struct ParameterRamp {
+    current: f64,
+    target: f64,
+    step: f64,
+    remaining: u32,
+    duration: u32,
+}
+
+impl ParameterRamp {
+    fn new(rate: u32, value: f64) -> Self {
+        Self { current: value, target: value, step: 0.0, remaining: 0, duration: (rate / 100).max(1) }
+    }
+
+    fn set(&mut self, value: f64) {
+        if self.target != value {
+            self.target = value;
+            self.remaining = self.duration;
+            self.step = (value - self.current) / f64::from(self.duration);
+        }
+    }
+
+    fn next_value(&mut self) -> f64 {
+        if self.remaining != 0 {
+            self.remaining -= 1;
+            if self.remaining == 0 { self.current = self.target; }
+            else { self.current += self.step; }
+        }
+        self.current
+    }
+
+    fn reset(&mut self) {
+        self.current = self.target;
+        self.remaining = 0;
+    }
 }
 
 /// Positive attenuation in dB; the quadratic knee meets both straight sections continuously.
@@ -198,9 +295,12 @@ impl Processing {
 
 pub struct VocalChain {
     config: VocalConfig,
-    input_gain: f64,
+    input_gain: ParameterRamp,
+    strength: ParameterRamp,
+    compressor_threshold: ParameterRamp,
+    deesser_threshold: ParameterRamp,
     processing: Option<Processing>,
-    reverb: Option<Reverb>,
+    reverb: Reverb,
 }
 impl VocalChain {
     /// Construct on the control thread, before opening audio streams.
@@ -208,15 +308,41 @@ impl VocalChain {
         config.validate()?;
         let minimum = if config.preset == Preset::Off { 8000 } else { 32000 };
         if !(minimum..=192_000).contains(&sample_rate) { return Err(DspError::SampleRate); }
-        let processing = if config.preset == Preset::Off || config.strength == 0.0 { None }
+        // Prepare the selected EQ/dynamics even at zero strength, and prepare
+        // the fixed room network even at zero mix. Live edits never allocate.
+        let processing = if config.preset == Preset::Off { None }
             else { Some(Processing::new(f64::from(sample_rate), config)?) };
-        let reverb = if config.reverb.mix == 0.0 { None } else { Some(Reverb::new(sample_rate, config.reverb)?) };
-        Ok(Self { config, input_gain: gain(f64::from(config.input_gain_db)), processing, reverb })
+        let reverb = Reverb::new(sample_rate, config.reverb)?;
+        Ok(Self { config,
+            input_gain: ParameterRamp::new(sample_rate, gain(f64::from(config.input_gain_db))),
+            strength: ParameterRamp::new(sample_rate, f64::from(config.strength)),
+            compressor_threshold: ParameterRamp::new(sample_rate, f64::from(config.compressor_threshold_db)),
+            deesser_threshold: ParameterRamp::new(sample_rate, f64::from(config.deess_threshold_db)),
+            processing, reverb })
     }
+    /// Requested settings, not transient ramp values.
     pub fn config(&self) -> VocalConfig { self.config }
+
+    /// Apply a validated target on the audio-processing thread, at a block boundary.
+    /// Preset, sample rate and pre-delay remain fixed. Only changed targets do work.
+    pub fn set_parameter(&mut self, parameter: VocalParameter, value: f32) -> Result<(), DspError> {
+        if self.config.parameter(parameter) == value { return Ok(()); }
+        self.config.set_parameter(parameter, value)?;
+        match parameter {
+            VocalParameter::Trim => self.input_gain.set(gain(f64::from(value))),
+            VocalParameter::Strength => self.strength.set(f64::from(value)),
+            VocalParameter::Compressor => self.compressor_threshold.set(f64::from(value)),
+            VocalParameter::Deesser => self.deesser_threshold.set(f64::from(value)),
+            VocalParameter::ReverbMix => self.reverb.set_mix(value),
+            VocalParameter::ReverbDecay => self.reverb.set_decay(value),
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         if let Some(processing) = &mut self.processing { processing.reset(); }
-        if let Some(reverb) = &mut self.reverb { reverb.reset(); }
+        self.reverb.reset();
+        for ramp in [&mut self.input_gain, &mut self.strength, &mut self.compressor_threshold, &mut self.deesser_threshold] { ramp.reset(); }
     }
 
     /// Process mono input into stereo output without allocation, locks, logging or I/O.
@@ -231,17 +357,26 @@ impl VocalChain {
         }
         let mut meters = Meters::default();
         for ((&sample, left), right) in samples.iter().zip(left.iter_mut()).zip(right.iter_mut()) {
-            let dry = f64::from(sample) * self.input_gain;
+            let dry = f64::from(sample) * self.input_gain.next_value();
+            let strength = self.strength.next_value();
+            let compressor = self.compressor_threshold.next_value();
+            let deesser = self.deesser_threshold.next_value();
             let value = if let Some(processing) = &mut self.processing {
+                processing.compressor.threshold = compressor;
+                processing.deesser.threshold = deesser;
                 let mut wet = dry;
                 for filter in &mut processing.filters { wet = filter.run(wet); }
                 wet = processing.compressor.run(wet);
                 wet = processing.deesser.run(wet);
-                meters.compression_db = meters.compression_db.max(processing.compressor.reduction as f32);
-                meters.deessing_db = meters.deessing_db.max(processing.deesser.reduction as f32);
-                dry + f64::from(self.config.strength) * (wet - dry)
+                if strength == 0.0 {
+                    dry
+                } else {
+                    meters.compression_db = meters.compression_db.max(processing.compressor.reduction as f32);
+                    meters.deessing_db = meters.deessing_db.max(processing.deesser.reduction as f32);
+                    dry + strength * (wet - dry)
+                }
             } else { dry };
-            let stereo = self.reverb.as_mut().map_or_else(|| [value; 2], |reverb| reverb.run(value));
+            let stereo = self.reverb.run(value);
             *left = stereo[0] as f32;
             *right = stereo[1] as f32;
             meters.output_peak = meters.output_peak.max(left.abs()).max(right.abs());

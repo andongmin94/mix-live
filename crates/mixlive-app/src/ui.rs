@@ -16,6 +16,7 @@ use gpui_deck::{
 };
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
 use mixlive_audio_windows::windows::device_catalog;
+use mixlive_effects::VocalParameter;
 
 use crate::{
     form::{FormEvent, SceneForm},
@@ -35,13 +36,38 @@ pub(crate) const DANGER: u32 = 0xff8997;
 enum FaderTarget {
     Gain(GainTarget),
     Route(RouteSource, RouteMix),
+    Vocal(VocalParameter),
 }
 
 impl FaderTarget {
-    fn command(self, db: f32) -> LiveCommand {
+    fn command(self, value: f32) -> LiveCommand {
         match self {
-            Self::Gain(target) => LiveCommand::Gain { target, db },
-            Self::Route(source, mix) => LiveCommand::RouteGain { source, mix, db },
+            Self::Gain(target) => LiveCommand::Gain { target, db: value },
+            Self::Route(source, mix) => LiveCommand::RouteGain { source, mix, db: value },
+            Self::Vocal(parameter) => LiveCommand::Vocal { parameter, value },
+        }
+    }
+
+    fn range(self) -> std::ops::RangeInclusive<f32> {
+        match self {
+            Self::Vocal(parameter) => parameter.range(),
+            _ => -96.0..=0.0,
+        }
+    }
+
+    fn step(self) -> f32 {
+        match self {
+            Self::Vocal(VocalParameter::Strength | VocalParameter::ReverbMix) => 0.01,
+            _ => 0.1,
+        }
+    }
+
+    fn value_label(self, value: f32) -> String {
+        match self {
+            Self::Vocal(VocalParameter::Strength | VocalParameter::ReverbMix) => format!("{:.1}%", value * 100.0),
+            Self::Vocal(VocalParameter::ReverbDecay) => format!("{value:.2} s"),
+            Self::Vocal(VocalParameter::Compressor | VocalParameter::Deesser) => format!("{value:.1} dBFS"),
+            _ => format!("{value:.1} dB"),
         }
     }
 }
@@ -449,8 +475,11 @@ impl MixLive {
                 values.push((FaderTarget::Route(source, mix), db));
             }
         }
+        for parameter in controls.vocal_parameters() {
+            values.push((FaderTarget::Vocal(parameter), controls.vocal_value(parameter)));
+        }
         for (target, value) in values {
-            let state = cx.new(|cx| SliderState::new(-96.0..=0.0, 0.1, [value], cx));
+            let state = cx.new(|cx| SliderState::new(target.range(), target.step(), [value], cx));
             self.subscriptions
                 .push(cx.subscribe(&state, move |this, _, event, cx| {
                     let SliderEvent::Change(values) = event;
@@ -487,7 +516,7 @@ impl MixLive {
         id: impl Into<ElementId>,
         label: &str,
         target: FaderTarget,
-        db: f32,
+        value: f32,
         cx: &App,
     ) -> gpui::AnyElement {
         let state = &self
@@ -552,7 +581,7 @@ impl MixLive {
                     .w(px(70.))
                     .text_right()
                     .text_sm()
-                    .child(format!("{db:.1} dB")),
+                    .child(target.value_label(value)),
             )
             .into_any_element()
     }
@@ -737,6 +766,7 @@ impl MixLive {
                 format!("App {} · 채널 {} · {:+.1} dB", index + 1, channels(&app.channels), app.gain_db)));
         }
 
+        let vocal = self.session.controls().map_or_else(|| route.vocal_config(), |controls| controls.vocal_config());
         let mut sound = panel()
             .flex_1()
             .min_w_0()
@@ -750,18 +780,18 @@ impl MixLive {
                     .child(
                         div()
                             .font_semibold()
-                            .child(format!("내장 보정 · {}", route.vocal)),
+                            .child(format!("내장 보정 · {}", vocal.preset)),
                     )
                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
                         "보정 비율 {:.0}% · 이후 VST3 {}개",
-                        route.vocal_strength * 100.0,
+                        vocal.strength * 100.0,
                         scene.effects.len()
                     )))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(if route.reverb_mix == 0.0 {
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(if vocal.reverb.mix == 0.0 {
                         "스테레오 리버브 · 꺼짐".to_owned()
                     } else {
-                        format!("리버브 {:.0}% · {:.2} s · pre-delay {:.1} ms", route.reverb_mix * 100.0,
-                            route.reverb_decay_secs, route.reverb_predelay_ms)
+                        format!("리버브 {:.1}% · {:.2} s · pre-delay {:.1} ms", vocal.reverb.mix * 100.0,
+                            vocal.reverb.decay_secs, vocal.reverb.predelay_ms)
                     })),
             );
         if scene.effects.is_empty() {
@@ -935,6 +965,40 @@ impl MixLive {
             .into_any_element()
     }
 
+    fn live_vocal(&self, cx: &Context<Self>) -> Div {
+        let controls = self.session.controls().expect("running session");
+        let config = controls.vocal_config();
+        let mut fields = div().flex().flex_wrap().gap_4();
+        for parameter in controls.vocal_parameters() {
+            let label = match parameter {
+                VocalParameter::Trim => "입력 trim",
+                VocalParameter::Strength => "보정 비율",
+                VocalParameter::Compressor => "컴프레서 threshold",
+                VocalParameter::Deesser => "디에서 threshold",
+                VocalParameter::ReverbMix => "리버브 비율",
+                VocalParameter::ReverbDecay => "잔향 시간",
+            };
+            fields = fields.child(div().min_w(px(250.)).flex_1().flex().flex_col().gap_1()
+                .child(div().text_sm().font_semibold().child(label))
+                .child(self.fader(("vocal-param", parameter as usize), &format!("실시간 {label}"),
+                    FaderTarget::Vocal(parameter), controls.vocal_value(parameter), cx)));
+        }
+        let hint = if config.preset == mixlive_effects::Preset::Off {
+            "EQ/다이내믹스 프리셋이 꺼져 있습니다. 정지 후 프리셋을 선택하면 보정 비율과 threshold를 조절할 수 있습니다."
+        } else {
+            "보정 비율을 0으로 내리면 EQ/다이내믹스를 우회합니다. 리버브는 별도로 조절합니다."
+        };
+        panel().gap_3()
+            .child(div().flex().items_center().justify_between().gap_3()
+                .child(div().font_semibold().child("실시간 보컬 보정"))
+                .child(div().text_xs().text_color(rgb(MUTED))
+                    .child(format!("{} · pre-delay {:.1} ms", config.preset, config.reverb.predelay_ms))))
+            .child(fields)
+            .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
+            .child(div().text_xs().text_color(rgb(MUTED))
+                .child("프리셋과 pre-delay는 정지 상태에서 변경합니다. 조절값은 약 10 ms 전환 후 반영되며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
+    }
+
     fn mixer(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let controls = self.session.controls().expect("running session");
         let levels = self.session.levels.as_ref();
@@ -1106,6 +1170,7 @@ impl MixLive {
                         ),
                 ),
             )
+            .child(self.live_vocal(cx))
             .child(
                 div()
                     .flex()
@@ -1226,7 +1291,7 @@ impl Render for MixLive {
             .child(self.header(cx))
             .child(body)
             .child(div().flex_shrink_0().px_7().py_3().border_t_1().border_color(rgb(BORDER)).text_xs().text_color(rgb(MUTED))
-                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 믹서와 VST3 상태를 보존합니다."))
+                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 믹서·보컬 설정과 VST3 상태를 보존합니다."))
     }
 }
 

@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **내장 스테레오 리버브 및 Scene schema 8 구현 · Windows 통합 검증 대기**
+단계: **실시간 보컬 파라미터 제어 구현 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -27,12 +27,15 @@
   장치 timestamp/clock bridge/OS 지연을 실측·보상하는 것은 아니다.
 - 내장 EQ/다이내믹스 뒤에 선택적 8-line orthogonal FDN stereo 리버브를 적용한다.
   기존 biquad 고역 감쇠를 재사용한다. wet 비율(0은 off), 명목 잔향 시간, wet-only pre-delay를
-  정지 상태 GPUI/CLI에서 설정하고 저장한다. dry는 추가 지연하지 않으며 stereo VST3 입력을 유지한다.
+  GPUI/CLI에서 설정하고 저장한다. dry는 추가 지연하지 않으며 stereo VST3 입력을 유지한다.
+  실행 중 trim·strength·compressor/deesser threshold·reverb mix/decay를 독립 atomic 목표값과
+  10 ms sample ramp로 조절한다. zero strength/mix에서도 준비된 DSP 상태를 갱신한다.
+  pre-delay와 프리셋은 정지 상태에서만 변경한다. off 프리셋의 EQ/다이내믹스 파라미터는 비활성이다.
   AUX/앱은 영향을 받지 않는다. 보컬은 한 번만 처리하고 mute는 잔향을 포함해 적용한다.
 - 실행 중 VST3 원본 창은 슬롯별 열기/닫기/재열기. 같은 실제 인스턴스를 유지하며, GPUI가
   메시지 루프를 소유한다. 창 조작과 native poll은 GPUI 변경 참조 밖에서 수행한다.
 - 정지 후 새 Scene 저장은 장치 중지 → 앱 capture thread join → VST3 worker join → 모든
-  상태 수집 → 새 파일 게시를 사용한다. 실행 중 모든 소스/출력 mute·route·gain과 VST3 상태를
+  상태 수집 → 새 파일 게시를 사용한다. 실행 중 모든 소스/출력 mute·route·gain, 보컬 파라미터와 VST3 상태를
   다음 시작 전에 복원한다. 일반 정지/닫기/오류는 저장하지 않으며 파일 덮어쓰기 없음.
   schema 8은 `route.apps` 배열(실행 파일 경로와 슬롯별 설정), 방송 장치·채널·감쇠와 각 믹스의 상태 및 리버브 설정을 저장하고 PID나 잔향 버퍼는 저장하지 않는다.
   schema 1~7, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
@@ -54,10 +57,12 @@ CLI 및 실제 GPUI Scene 생성·편집·저장 검사를 모두 통과했다.
 [Audio #35](https://github.com/andongmin94/mix-live/actions/runs/45562830490)는
 PDC 및 stereo 송출 지연·mute 검사를 포함한 Windows 검사 103개, native fixture, Clippy, locked release
 빌드, CLI와 실제 GPUI Scene 생성·편집·저장 검사를 모두 통과했다.
-이번 리버브 변경은 기존 mono DSP 뒤 stereo 출력을 만들고 VST3 worker에 그대로 전달한다.
-off/임펄스 stereo tail·wet pre-delay·decay·블록 분할·reset·AUX/앱 격리 검사,
-기존 native gain fixture의 stereo 리버브 입력 검사와 실제 GPUI 리버브 저장/취소/재열기 검사를
-추가했다. 별도 의존성 추가 없음. 새 코드의 Windows 통합 검증은 대기 중이다.
+[Audio #36](https://github.com/andongmin94/mix-live/actions/runs/45566374446)의
+리버브 포함 workspace와 native VST3 fixture 검사는 성공했다. Clippy도 통과했다.  나머지 Windows 통합 검사는 새 변경 반영 직전 미완료였다.
+이번 변경은 기존 제어 경계·GPUI Deck 슬라이더를 재사용해 6개 보컬 파라미터를 실제 처리 상태에
+연결한다. 10 ms ramp/블록 독립성·off→on room/strength·threshold·소스 격리·Scene snapshot 및
+기존 native gain fixture의 실시간 trim 검사를 추가했다. schema 8과 의존성은 그대로다.
+새 코드의 Windows 통합 검증은 대기 중이며 실장비 라이브 조작과 청취는 미검증이다.
 
 ## 남은 작업과 제한
 
@@ -66,7 +71,7 @@ off/임펄스 stereo tail·wet pre-delay·decay·블록 분할·reset·AUX/앱 �
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
 - 탭 선택·자체 가상 장치·ASIO·실행 중
   소스/체인 삽입/삭제·내장 음정 보정·CLI 전체 Scene snapshot 출력은 미구현이다.
-  내장 리버브는 현재 고정 시작 설정이며 청취 품질과 실제 상용 VST3 경로는 미검증이다.
+  실행 중 프리셋/pre-delay 변경은 미구현이다. 리버브/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.
 - 원래 앱 재생 경로·장치 기본값은 변경하지 않는다. 자동 mix-minus 추정/외부 피드백 검출/

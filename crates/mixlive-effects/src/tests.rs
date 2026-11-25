@@ -220,3 +220,78 @@ fn room_decay_and_reset_are_finite_and_independent_of_block_size() {
     assert_eq!(left, [0.0; 2]);
     assert_eq!(right, [0.0; 1]);
 }
+
+#[test]
+fn live_trim_transition_is_exact_and_independent_of_block_partition() {
+    let render = |blocks: &[usize]| {
+        let mut chain = VocalChain::new(48000, VocalConfig::default()).unwrap();
+        let mut result = Vec::new();
+        for &count in blocks {
+            chain.set_parameter(VocalParameter::Trim, -6.0).unwrap();
+            let mut left = vec![0.0; count];
+            let mut right = vec![0.0; count];
+            chain.process(&vec![0.5; count], &mut left, &mut right).unwrap();
+            assert_eq!(left, right);
+            result.extend(left);
+        }
+        result
+    };
+    let whole = render(&[512]);
+    assert_eq!(whole, render(&[1, 17, 113, 256, 125]));
+    let target = (0.5 * gain(-6.0)) as f32;
+    assert!(whole[0] < 0.5 && whole[0] > 0.499);
+    assert_eq!(whole[479], target);
+    assert_eq!(whole[511], target);
+    assert!(whole.windows(2).all(|pair| pair[0] >= pair[1]));
+}
+
+#[test]
+fn live_room_opens_from_zero_and_zero_blend_keeps_processing_history_current() {
+    let config = VocalConfig { reverb: ReverbConfig { mix: 0.0, decay_secs: 1.2, predelay_ms: 0.0 }, ..VocalConfig::default() };
+    let mut chain = VocalChain::new(48000, config).unwrap();
+    let mut impulse = [0.0; 512];
+    impulse[0] = 0.5;
+    let mut left = [0.0; 512];
+    let mut right = [0.0; 512];
+    chain.process(&impulse, &mut left, &mut right).unwrap();
+    assert_eq!(left, impulse);
+    assert_eq!(right, impulse);
+    chain.set_parameter(VocalParameter::ReverbMix, 0.5).unwrap();
+    chain.set_parameter(VocalParameter::ReverbDecay, 2.0).unwrap();
+    let mut saw_stereo = false;
+    for _ in 0..8 {
+        chain.process(&[0.0; 512], &mut left, &mut right).unwrap();
+        saw_stereo |= left.iter().zip(&right).any(|(a, b)| (a - b).abs() > 0.001);
+        assert!(left.iter().chain(&right).all(|s| s.is_finite()));
+    }
+    assert!(saw_stereo);
+    chain.set_parameter(VocalParameter::ReverbMix, 0.0).unwrap();
+    chain.process(&[0.1; 512], &mut left, &mut right).unwrap();
+    assert_eq!(left[479..], [0.1; 33]);
+    assert_eq!(right[479..], [0.1; 33]);
+    let before = chain.config();
+    assert!(chain.set_parameter(VocalParameter::ReverbDecay, f32::NAN).is_err());
+    assert_eq!(chain.config(), before);
+}
+
+#[test]
+fn zero_strength_can_enable_the_prepared_dynamics_and_update_thresholds() {
+    let mut chain = VocalChain::new(48000, VocalConfig {
+        preset: Preset::Natural, strength: 0.0, ..VocalConfig::default()
+    }).unwrap();
+    let input = tone(1000.0, 0.5, 48000, 4800);
+    let mut left = vec![0.0; input.len()];
+    let mut right = vec![0.0; input.len()];
+    let meters = chain.process(&input, &mut left, &mut right).unwrap();
+    assert_eq!(left, input);
+    assert_eq!(meters.compression_db, 0.0);
+    chain.set_parameter(VocalParameter::Strength, 1.0).unwrap();
+    chain.set_parameter(VocalParameter::Compressor, -45.0).unwrap();
+    chain.set_parameter(VocalParameter::Deesser, -40.0).unwrap();
+    let meters = chain.process(&input, &mut left, &mut right).unwrap();
+    assert!(meters.compression_db > 5.0);
+    assert_eq!(left, right);
+    assert!(rms(&left[2400..]) < rms(&input[2400..]) * 0.75);
+    assert_eq!(chain.config().compressor_threshold_db, -45.0);
+    assert_eq!(chain.config().deess_threshold_db, -40.0);
+}

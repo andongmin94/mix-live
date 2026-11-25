@@ -5,12 +5,13 @@ use mixlive_effects::{Preset, VocalConfig};
 #[test]
 fn one_capture_feeds_two_independent_mixes_without_dry_bypass() {
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(-6.0), None], false, 0).unwrap());
+    let config = VocalConfig { input_gain_db: -6.0, ..VocalConfig::default() };
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(-6.0), None], false, 0, config).unwrap());
     let (first, mut monitor) = channel(48_000, 48_000, 10, 1, health.clone()).unwrap();
     let (second, mut send) = channel(48_000, 48_000, 10, 1, health.clone()).unwrap();
     let mut a_gain = PlaybackGains::new(48000, &[0], controls.clone()).unwrap();
     let mut b_gain = PlaybackGains::new(48000, &[1], controls.clone()).unwrap();
-    let vocal = VocalChain::new(48000, VocalConfig { input_gain_db: -6.0, ..VocalConfig::default() }).unwrap();
+    let vocal = VocalChain::new(48000, config).unwrap();
     let mut capture = Capture::new(vocal, 48000, None, &[], vec![(first, vec![0]), (second, vec![1])], health.clone(), controls).unwrap();
     let prime = (monitor.queue_ms * 48.0).round() as usize + 1024;
     capture.push(&vec![0.4; prime], None, &[]);
@@ -32,7 +33,7 @@ fn vocal_is_processed_once_before_sends_and_playback_attenuation() {
     let mut expected = vec![0.0; input.len()];
     VocalChain::new(48000, config).unwrap().process(&input, &mut expected, &mut vec![0.0; input.len()]).unwrap();
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], false, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], false, 0, config).unwrap());
     let (first, _a) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let (second, _b) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000, None, &[],
@@ -59,7 +60,7 @@ fn vocal_is_processed_once_before_sends_and_playback_attenuation() {
 fn shared_endpoint_applies_independent_gains_after_one_resampler() {
     use crate::config::{OutputMap, output_sample};
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(-6.0, [Some(0.0), Some(-12.0), None], false, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(-6.0, [Some(0.0), Some(-12.0), None], false, 0, VocalConfig::default()).unwrap());
     let (writer, mut reader) = channel(48_000, 48_000, 10, 2, health.clone()).unwrap();
     let mut gains = PlaybackGains::new(48000, &[0, 1], controls.clone()).unwrap();
     let vocal = VocalChain::new(48000, VocalConfig::default()).unwrap();
@@ -89,9 +90,9 @@ fn shared_endpoint_applies_independent_gains_after_one_resampler() {
 fn aux_is_stereo_selective_and_never_passes_through_vocal_processing() {
     for destination in [AuxDestination::Output, AuxDestination::Send, AuxDestination::Both] {
         let health = Arc::new(Health::default());
-        let controls = Arc::new(LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0).unwrap());
-        let (writer, _reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
         let config = VocalConfig { preset: Preset::Bright, input_gain_db: 6.0, ..VocalConfig::default() };
+        let controls = Arc::new(LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0, config).unwrap());
+        let (writer, _reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
         let input: Vec<f32> = (0..613).map(|i| (i as f32 * 0.17).sin() * 0.4).collect();
         let aux = vec![[2.0, -1.0]; input.len()];
         let mut expected = vec![0.0; input.len()];
@@ -135,9 +136,9 @@ fn aux_is_stereo_selective_and_never_passes_through_vocal_processing() {
 #[test]
 fn live_routes_keep_call_vocals_while_removing_only_monitor_vocals() {
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0).unwrap());
-    let (writer, _reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
     let config = VocalConfig { preset: Preset::Natural, ..VocalConfig::default() };
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, config).unwrap());
+    let (writer, _reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
     let mut reference = VocalChain::new(48000, config).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
         Some((0.0, AuxDestination::Send)), &[], vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
@@ -181,7 +182,7 @@ fn single_output_route_fades_are_block_invariant_and_keep_inactive_routes_off() 
     for has_aux in [false, true] {
         let run = |chunks: &[usize]| {
             let health = Arc::new(Health::default());
-            let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], has_aux, 0).unwrap());
+            let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], has_aux, 0, VocalConfig::default()).unwrap());
             let (writer, _reader) = channel(48_000, 48_000, 30, 1, health.clone()).unwrap();
             let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
                 has_aux.then_some((0.0, AuxDestination::Output)), &[], vec![(writer, vec![0])], health.clone(), controls.clone()).unwrap();
@@ -213,7 +214,7 @@ fn single_output_route_fades_are_block_invariant_and_keep_inactive_routes_off() 
 #[test]
 fn external_effect_preserves_stereo_and_never_processes_aux_or_falls_back_to_dry() {
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, VocalConfig::default()).unwrap());
     let (writer, mut reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
         Some((0.0, AuxDestination::Send)), &[], vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
@@ -237,7 +238,7 @@ fn external_effect_preserves_stereo_and_never_processes_aux_or_falls_back_to_dry
 fn separate_app_sources_keep_stereo_and_mix_minus_with_and_without_physical_aux() {
     for has_aux in [false, true] {
         let health = Arc::new(Health::default());
-        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], has_aux, 2).unwrap());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], has_aux, 2, VocalConfig::default()).unwrap());
         controls.apply("route app1 send on".parse().unwrap()).unwrap();
         controls.apply("route app2 output on".parse().unwrap()).unwrap();
         controls.apply("level app2 output -6".parse().unwrap()).unwrap();
@@ -283,7 +284,7 @@ fn separate_app_sources_keep_stereo_and_mix_minus_with_and_without_physical_aux(
 fn broadcast_and_monitor_route_independently_with_or_without_call() {
     for call in [false, true] {
         let health = Arc::new(Health::default());
-        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), call.then_some(0.0), Some(0.0)], false, 2).unwrap());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), call.then_some(0.0), Some(0.0)], false, 2, VocalConfig::default()).unwrap());
         controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
         controls.apply("route app2 output on".parse().unwrap()).unwrap();
         if call { controls.apply("route app1 send on".parse().unwrap()).unwrap(); }
@@ -331,7 +332,7 @@ fn reported_vst3_delay_aligns_stereo_sends_across_blocks_without_delaying_monito
     const IMPULSE: usize = 7;
     for call in [false, true] {
         let health = Arc::new(Health::default());
-        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), call.then_some(0.0), Some(0.0)], true, 2).unwrap());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), call.then_some(0.0), Some(0.0)], true, 2, VocalConfig::default()).unwrap());
         for command in ["route app1 output on", "route app1 broadcast on", "route app2 output on"] {
             controls.apply(command.parse().unwrap()).unwrap();
         }
@@ -394,7 +395,7 @@ fn reported_vst3_delay_aligns_stereo_sends_across_blocks_without_delaying_monito
 #[test]
 fn source_mute_applies_after_compensation_and_route_reenable_keeps_current_history() {
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, VocalConfig::default()).unwrap());
     controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
     let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
@@ -430,7 +431,7 @@ fn room_is_processed_once_before_vst3_and_never_affects_aux_or_apps() {
     let mut expected_right = vec![0.0; mic.len()];
     VocalChain::new(48000, config).unwrap().process(&mic, &mut expected_left, &mut expected_right).unwrap();
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0); 3], true, 1).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0); 3], true, 1, config).unwrap());
     controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
     let (writer, _reader) = channel(48000, 48000, 30, 3, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
@@ -459,4 +460,33 @@ fn room_is_processed_once_before_vst3_and_never_affects_aux_or_apps() {
         position = end;
     }
     assert!(saw_stereo && !health.failed());
+}
+
+#[test]
+fn live_vocal_controls_reach_the_audio_thread_without_touching_other_sources() {
+    use mixlive_effects::VocalParameter;
+    let config = VocalConfig::default();
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, config).unwrap());
+    controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
+    let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+        Some((0.0, AuxDestination::Broadcast)), &[0.0], vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
+    let mic = [0.25; 256];
+    let aux = [[0.125, -0.25]; 256];
+    let app = [[-0.0625, 0.125]; 256];
+    capture.push(&mic, Some(&aux), &[&app]);
+    assert_eq!(capture.engine.output(0).unwrap().left[255], 0.25);
+    controls.apply("vocal trim -6".parse().unwrap()).unwrap();
+    capture.push(&mic, Some(&aux), &[&app]);
+    let middle = capture.engine.output(0).unwrap().left[255];
+    assert!(middle < 0.25 && middle > 0.25 * 10.0_f32.powf(-6.0 / 20.0));
+    capture.push(&mic, Some(&aux), &[&app]);
+    let expected = 0.25 * 10.0_f32.powf(-6.0 / 20.0);
+    assert!((capture.engine.output(0).unwrap().left[255] - expected).abs() < 1e-6);
+    let broadcast = capture.engine.output(1).unwrap();
+    assert!((broadcast.left[255] - (expected + aux[255][0] + app[255][0])).abs() < 1e-6);
+    assert!((broadcast.right[255] - (expected + aux[255][1] + app[255][1])).abs() < 1e-6);
+    assert_eq!(capture.vocal.config().parameter(VocalParameter::Trim), -6.0);
+    assert!(!health.failed());
 }

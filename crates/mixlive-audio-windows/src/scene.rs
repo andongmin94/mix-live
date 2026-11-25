@@ -115,6 +115,8 @@ mod tests {
         route.aux_input = Some("aux".into());
         let controls = LiveControls::from_route(&route).unwrap();
         for command in ["mute all", "mute mic", "mute send", "gain master -96", "gain send -8",
+            "vocal trim -7", "vocal strength 0.25", "vocal compressor -35", "vocal deesser -40",
+            "vocal reverb 0.375", "vocal decay 2.5",
             "route mic output off", "level mic output -13", "level mic send -7",
             "route aux output off", "route aux send off", "level aux output -11", "level aux send -12"] {
             controls.apply(command.parse().unwrap()).unwrap();
@@ -125,6 +127,8 @@ mod tests {
         let restored = AudioScene::read(&path).unwrap();
         let live = Arc::new(LiveControls::from_route(&restored.route).unwrap());
         assert_eq!(live.describe(), controls.describe());
+        assert_eq!(restored.route.vocal_config(), controls.vocal_config());
+        assert_eq!(restored.route.reverb_predelay_ms, 22.5);
         let mut playback = PlaybackGains::new(48000, &[0, 1], live.clone()).unwrap();
         assert_eq!(playback.next_gains(), [0.0; 3]);
         live.apply("unmute all".parse().unwrap()).unwrap();

@@ -247,6 +247,17 @@ impl RouteOptions {
             compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db,
             reverb: ReverbConfig { mix: self.reverb_mix, decay_secs: self.reverb_decay_secs, predelay_ms: self.reverb_predelay_ms } }
     }
+
+    pub fn set_vocal_config(&mut self, config: VocalConfig) {
+        self.vocal = config.preset;
+        self.input_gain_db = config.input_gain_db;
+        self.vocal_strength = config.strength;
+        self.vocal_threshold_db = config.compressor_threshold_db;
+        self.deess_threshold_db = config.deess_threshold_db;
+        self.reverb_mix = config.reverb.mix;
+        self.reverb_decay_secs = config.reverb.decay_secs;
+        self.reverb_predelay_ms = config.reverb.predelay_ms;
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.input.trim().is_empty() || self.output.trim().is_empty() || self.input_channel == 0 {
             return Err("explicit endpoint IDs and a one-based input channel are required".into());

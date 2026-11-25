@@ -56,6 +56,9 @@ impl Capture {
             || app_gains.len() != controls.app_count() {
             return Err("source controls do not match the capture configuration".into());
         }
+        if vocal.config() != controls.vocal_config() {
+            return Err("vocal controls do not match the prepared processing configuration".into());
+        }
         if outputs.is_empty() || outputs.iter().any(|(writer, mixes)| {
             mixes.len() != writer.mix_count() || mixes.iter().any(|mix| !mix_slots.contains(mix))
         }) { return Err("endpoint mix bindings do not match their clock bridges".into()); }
@@ -145,6 +148,11 @@ impl Capture {
             self.health.fail(Fault::Input); return;
         }
         for (block_index, block) in samples.chunks(CAPTURE_BLOCK).enumerate() {
+            for parameter in self.controls.vocal_parameters() {
+                if self.vocal.set_parameter(parameter, self.controls.vocal_value(parameter)).is_err() {
+                    self.health.fail(Fault::Routing); return;
+                }
+            }
             for (ramp, target) in self.source_mutes.iter_mut().zip(self.controls.source_targets()) { ramp.set(target); }
             let targets = self.controls.route_targets();
             let mix_count = self.mix_slots.len();

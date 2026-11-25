@@ -91,6 +91,8 @@ VST3는 **파일 추가** 또는 Windows bundle용 **폴더 추가**로 선택�
 - 고정 상단의 전체 출력 음소거, 소스별 mic/AUX/앱 음소거, 출력별 음소거.
 - 모든 출력에 공통으로 적용되는 master와 모니터/통화/방송의 독립 감쇠.
 - 각 소스를 어느 출력에 보낼지 선택하는 스위치와 경로별 음량.
+- 라이브 보컬 trim·보정 비율·컴프레서/디에서 threshold·리버브 비율·잔향 시간 슬라이더.
+  EQ/다이내믹스 프리셋이 off이면 trim과 리버브만 표시한다.
 - 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 모니터/통화/방송 sample peak.
   약 100ms 간격의 최대값을 dBFS로 표시한다. 소스 peak는 mute 전, AUX와 앱은 입력 trim 전이며
   출력 peak는 감쇠·mute·sample guard 후 장치 채널 매핑 전이다. 공유 endpoint의 각 믹스도 독립 계측한다.
@@ -103,10 +105,10 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 
 실행 중 **정지 후 새 Scene 저장**을 선택하면 파일명 선택을 취소할 때는 오디오를 계속 실행하고,
 확정하면 장치 중지 → worker join → 모든 VST3 슬롯 상태 수집 → 새 Scene 저장을 수행한다.
-저장된 전체/믹스별 음량, 소스·출력·전체 mute, 모든 경로의 연결·gain과 VST3 상태는 다음 명시적 시작부터
+저장된 전체/믹스별 음량, 소스·출력·전체 mute, 모든 경로의 연결·gain, 라이브 보컬 파라미터와 VST3 상태는 다음 명시적 시작부터
 적용된다. 초기 mute는 스트림 시작 전에 복원한다. 오류·상태 수집 실패·기존 파일 충돌 시 이전 Scene 선택을
 유지하고 새 파일을 게시하지 않는다. 일반 정지/창 닫기는 저장하지 않는다.
-장치·출력 및 보컬·VST3 시작 설정 편집은 정지 상태에서만 제공한다.
+장치·출력, EQ/다이내믹스 프리셋, 리버브 pre-delay 및 VST3 체인 순서 편집은 정지 상태에서만 제공한다.
 실행 중 보컬 체인의 각 VST3 슬롯에서 **원본 창 열기/닫기**를 선택할 수 있다. 기존 라이브
 인스턴스의 네이티브 편집창이며 별도 검사 인스턴스가 아니다. 닫았다 다시 열어도 파라미터와
 체인 순서를 유지한다. 원본 창의 닫기 버튼도 다음 상태 확인에서 반영한다. 편집창이 없는
@@ -153,7 +155,13 @@ sample clipping guard는 전문 리미터·true-peak·음향 피드백 방지·�
 | `--broadcast-gain-db 0` | 방송 초기 추가 감쇠 -96..0 dB |
 
 자동 makeup gain은 없다. A/B 청취의 원본/보정 음량은 따로 맞춘다. 프리셋은 32..192 kHz,
-off는 8..192 kHz를 받는다. 입력 trim/보컬 파라미터는 실행 중 고정이다.
+off는 8..192 kHz를 받는다. 프리셋과 리버브 pre-delay는 실행 중 고정이며, 나머지 여섯 보컬
+파라미터는 실행 중에도 조절할 수 있다. 각 대상값은 블록 경계에서 읽고 처리 clock의 약 10 ms
+sample ramp를 적용한다. trim은 선형 gain, 보정/리버브 비율은 blend, threshold는 dB,
+decay는 각 FDN feedback gain을 전환한다. 콜백 안에서 버퍼를 만들거나 VST3를 다시 로드하지 않는다.
+보정 비율 0에서도 선택한 EQ/다이내믹스 상태를 유지하며, 리버브 0에서도 room 이력을 갱신한다.
+따라서 처음 꺼 둔 리버브를 실행 중 켤 수 있고 다시 켤 때 정지된 과거 이력을 재생하지 않는다.
+이 구조는 off 상태에서도 내부 DSP 비용이 들며, 실제 장비 CPU/청취 지연은 미측정이다.
 
 스테레오 리버브는 **보컬 설정**의 별도 ROOM 카드에서 조절한다. 기본값은 꺼짐이며,
 예를 들어 `--reverb-mix 0.15 --reverb-decay-secs 1.2 --reverb-predelay-ms 15`로
@@ -162,8 +170,8 @@ off여도 리버브 비율이 0보다 크면 리버브가 동작한다. 보정 �
 적용하고, dry 신호는 추가 지연하지 않는다. 8-line orthogonal FDN과 기존 biquad 고역 감쇠를
 사용하며, 서로 다른 stereo wet 신호를 VST3에 전달한다. 잔향은 예술적 시간 응답으로 PDC의
 고정 신고 지연에 합산하지 않는다. AUX/앱은 공간계를 거치지 않는다. 소스 mute는 잔향을
-포함한 보컬을 차단하며, 내부 잔향 이력은 계속 갱신된다. 설정은 다음 시작부터 적용하고
-종료 시 잔향 샘플을 녹음/저장하지 않는다. 실제 청취·음질 수용은 미검증이다.
+포함한 보컬을 차단하며, 내부 잔향 이력은 계속 갱신된다. 설정 편집 화면의 값은 다음 시작부터
+적용하고 라이브 슬라이더는 실행 중 적용한다. 종료 시 잔향 샘플을 녹음/저장하지 않는다. 실제 청취·음질 수용은 미검증이다.
 
 ### 출력과 MR/AUX
 
@@ -260,9 +268,14 @@ GUI의 정지 후 새 Scene 저장에서만 전체 실행 상태를 저장한다
 | `route mic output off`, `route mic output on` | 내 목소리의 첫 믹스 포함 여부 |
 | `route aux send off` | 두 번째 믹스의 MR만 제외 |
 | `level aux send -6`, `level mic output -9` | 지정 경로만 추가 감쇠 -96..0 dB |
+| `vocal trim -3`, `vocal strength 0.75` | 입력 trim(dB) / EQ·다이내믹스 blend(0..1) |
+| `vocal compressor -28`, `vocal deesser -35` | threshold(-60..0 dBFS) |
+| `vocal reverb 0.15`, `vocal decay 1.5` | room blend(0..1) / 명목 잔향 시간(0.2..5초) |
 | `status`, `stop` | 요청된 제어 상태 / 장치 해제 후 종료 |
 
 일반형은 `route mic|aux|appN output|send|broadcast on|off`, `level mic|aux|appN output|send|broadcast <dB>`다. `appN`은 1부터 시작하는 현재 앱 슬롯이다.
+`vocal` 명령의 값 범위는 시작 옵션과 같다. off 프리셋의 strength/compressor/deesser 제어는 거절하며,
+pre-delay 및 프리셋 전환은 실행 중 지원하지 않는다.
 꺼둔 경로의 level 변경은 켜짐이 아니고 전체 unmute도 개별 mute를 풀지 않는다.
 source/route 제어는 합산 전이어서 출력 queue 지연이 남는다. 급한 송출 중단은 queue 뒤의
 `mute send`/`mute broadcast`/`mute all`을 사용한다. mute 중에도 queue를 소비해 오래된 소리를 재생하지 않는다.

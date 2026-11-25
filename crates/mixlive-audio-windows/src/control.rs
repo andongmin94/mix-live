@@ -1,6 +1,7 @@
 //! Live session controls. Parsing/printing stays on the control thread; callbacks only load atomics.
 use crate::config::{AuxDestination, RouteOptions, MAX_APPS, MAX_MIXES};
 use serde::{Deserialize, Serialize};
+use mixlive_effects::{VocalConfig, VocalParameter};
 use std::{str::FromStr, sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}}};
 
 const MIC: u32 = 1;
@@ -13,7 +14,7 @@ const BROADCAST: u32 = 1 << (5 + MAX_APPS);
 pub(crate) const MAX_SOURCES: usize = MAX_APPS + 2;
 pub(crate) const MAX_ROUTES: usize = MAX_MIXES * MAX_SOURCES;
 
-pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; status; stop. Changes last for this run only.";
+pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; vocal trim|strength|compressor|deesser|reverb|decay <value>; status; stop. Changes last for this run only.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuteTarget { Mic, Aux, App(usize), Output, Send, Broadcast, All }
@@ -65,6 +66,7 @@ pub enum LiveCommand {
     Gain { target: GainTarget, db: f32 },
     Route { source: RouteSource, mix: RouteMix, enabled: bool },
     RouteGain { source: RouteSource, mix: RouteMix, db: f32 },
+    Vocal { parameter: VocalParameter, value: f32 },
     Status,
     Stop,
 }
@@ -111,6 +113,13 @@ impl FromStr for LiveCommand {
                     validate_db(db)?;
                     Self::RouteGain { source, mix, db }
                 }
+            }
+            Some("vocal") => {
+                let name = words.next().ok_or(HELP)?;
+                let parameter = VocalParameter::ALL.into_iter().find(|parameter| parameter.name() == name).ok_or(HELP)?;
+                let value: f32 = words.next().ok_or(HELP)?.parse().map_err(|_| HELP)?;
+                parameter.validate(value).map_err(|error| error.to_string())?;
+                Self::Vocal { parameter, value }
             }
             Some("status") => Self::Status,
             Some("stop") => Self::Stop,
@@ -179,9 +188,13 @@ pub struct LiveControls {
     // Enabled state is independent of fader level and global source/output mutes.
     routes_enabled: AtomicU32,
     route_levels: [AtomicU32; MAX_ROUTES],
+    vocal_start: VocalConfig,
+    vocal_targets: [AtomicU32; VocalParameter::ALL.len()],
 }
 impl LiveControls {
-    pub fn new(master_db: f32, mix_db: [Option<f32>; MAX_MIXES], has_aux: bool, app_count: usize) -> Result<Self, String> {
+    pub fn new(master_db: f32, mix_db: [Option<f32>; MAX_MIXES], has_aux: bool, app_count: usize,
+        vocal: VocalConfig) -> Result<Self, String> {
+        vocal.validate().map_err(|error| error.to_string())?;
         if app_count > MAX_APPS { return Err("too many application sources".into()); }
         if mix_db[0].is_none() { return Err("a monitor mix is required".into()); }
         validate_db(master_db)?;
@@ -195,7 +208,9 @@ impl LiveControls {
             mix_gains: mix_db.map(|db| AtomicU32::new(gain(db.unwrap_or(0.0)).to_bits())),
             enabled_mixes, has_aux, app_count,
             routes_enabled: AtomicU32::new(mic_routes),
-            route_levels: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())) })
+            route_levels: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
+            vocal_start: vocal,
+            vocal_targets: VocalParameter::ALL.map(|parameter| AtomicU32::new(vocal.parameter(parameter).to_bits())) })
     }
 
     /// Restore requested controls before constructing capture or playback ramps.
@@ -203,7 +218,7 @@ impl LiveControls {
         route.validate()?;
         let controls = Self::new(route.output_gain_db, [Some(route.monitor_gain_db),
             route.send.as_ref().map(|_| route.send_gain_db),
-            route.broadcast.as_ref().map(|_| route.broadcast_gain_db)], route.has_aux(), route.apps.len())?;
+            route.broadcast.as_ref().map(|_| route.broadcast_gain_db)], route.has_aux(), route.apps.len(), route.vocal_config())?;
         let settings = route.mix;
         for (target, muted) in [(MuteTarget::Mic, settings.mute_mic), (MuteTarget::All, settings.mute_all)] {
             controls.apply(LiveCommand::Mute { target, muted })?;
@@ -244,7 +259,11 @@ impl LiveControls {
             || self.app_count != route.apps.len() {
             return Err("live controls do not match the Scene topology".into());
         }
+        if route.vocal != self.vocal_start.preset || route.reverb_predelay_ms != self.vocal_start.reverb.predelay_ms {
+            return Err("live vocal processing does not match the Scene topology".into());
+        }
         let mut saved = route.clone();
+        saved.set_vocal_config(self.vocal_config());
         let db = |value: f32| value.clamp(-96.0, 0.0);
         saved.output_gain_db = db(self.gain_db(GainTarget::Master)?);
         saved.monitor_gain_db = db(self.gain_db(GainTarget::Monitor)?);
@@ -309,6 +328,24 @@ impl LiveControls {
     }
     pub fn stop_requested(&self) -> bool { self.stop_requested.load(Ordering::Relaxed) }
 
+    pub fn vocal_parameters(&self) -> impl Iterator<Item = VocalParameter> + '_ {
+        VocalParameter::ALL.into_iter().filter(move |parameter| parameter.available_for(self.vocal_start.preset))
+    }
+
+    /// Read one requested value, not a transient DSP ramp.
+    pub fn vocal_value(&self, parameter: VocalParameter) -> f32 {
+        f32::from_bits(self.vocal_targets[parameter as usize].load(Ordering::Relaxed))
+    }
+
+    /// Control-thread snapshot of the targets and the fixed startup topology.
+    pub fn vocal_config(&self) -> VocalConfig {
+        let mut config = self.vocal_start;
+        for parameter in VocalParameter::ALL {
+            config.set_parameter(parameter, self.vocal_value(parameter)).expect("validated atomic vocal target");
+        }
+        config
+    }
+
     /// Requested mute for this stage; global and local mutes remain independent.
     pub fn is_muted(&self, target: MuteTarget) -> bool {
         target.bit().is_some_and(|bit| self.muted.load(Ordering::Relaxed) & bit != 0)
@@ -371,6 +408,13 @@ impl LiveControls {
                 validate_db(db)?;
                 self.route_levels[index].store(gain(db).to_bits(), Ordering::Relaxed);
             }
+            LiveCommand::Vocal { parameter, value } => {
+                if !parameter.available_for(self.vocal_start.preset) {
+                    return Err("this parameter requires a non-off vocal preset; stop and select a preset first".into());
+                }
+                parameter.validate(value).map_err(|error| error.to_string())?;
+                self.vocal_targets[parameter as usize].store(value.to_bits(), Ordering::Relaxed);
+            }
             LiveCommand::Stop => self.stop_requested.store(true, Ordering::Relaxed),
             LiveCommand::Status => {}
         }
@@ -418,6 +462,9 @@ impl LiveControls {
         for mix in self.mixes() {
             let gain = self.gain_db(mix.gain_target()).expect("configured mix");
             text.push_str(&format!(" {}_extra_gain={gain:.1}dB mute[{}={}]", mix.name(), mix.name(), self.is_muted(mix.mute_target())));
+        }
+        for parameter in self.vocal_parameters() {
+            text.push_str(&format!(" vocal.{}={:.3}", parameter.name(), self.vocal_value(parameter)));
         }
         let enabled = self.routes_enabled.load(Ordering::Relaxed);
         for source in self.sources() {
@@ -494,7 +541,7 @@ mod tests {
     use super::*;
     #[test]
     fn typed_reads_preserve_independent_requested_controls_and_reject_absent_routes() {
-        let controls = LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0).unwrap();
+        let controls = LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0, VocalConfig::default()).unwrap();
         assert!((controls.gain_db(GainTarget::Master).unwrap() + 18.0).abs() < 1e-5);
         assert!((controls.gain_db(GainTarget::Send).unwrap() + 6.0).abs() < 1e-5);
         assert_eq!(controls.route_state(RouteSource::Mic, RouteMix::Output).unwrap(), (true, 0.0));
@@ -517,7 +564,7 @@ mod tests {
         assert!(!controls.is_muted(MuteTarget::All));
         assert!(controls.is_muted(MuteTarget::Mic));
 
-        let single = LiveControls::new(0.0, [Some(0.0), None, None], false, 0).unwrap();
+        let single = LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
         assert_eq!(single.gain_db(GainTarget::Master).unwrap(), 0.0);
         assert!(single.gain_db(GainTarget::Send).is_err());
         assert!(single.route_state(RouteSource::Aux, RouteMix::Output).is_err());
@@ -526,7 +573,7 @@ mod tests {
 
     #[test]
     fn commands_validate_before_mutating_and_master_unmute_preserves_local_mutes() {
-        let controls = LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0).unwrap();
+        let controls = LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0, VocalConfig::default()).unwrap();
         for invalid in ["", "mute", "mute mic now", "stop now", "gain output -6", "gain master NaN", "gain send inf", "gain master 1", "gain master -97"] {
             assert!(invalid.parse::<LiveCommand>().is_err(), "{invalid}");
         }
@@ -542,7 +589,7 @@ mod tests {
         assert_eq!(controls.output_targets()[1], 0.0); // changing a fader never unmutes it
         controls.apply("unmute send".parse().unwrap()).unwrap();
         assert!((controls.output_targets()[1] - gain(-30.0)).abs() < 1e-7);
-        let single = LiveControls::new(-18.0, [Some(0.0), None, None], false, 0).unwrap();
+        let single = LiveControls::new(-18.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
         for command in ["mute aux", "mute send", "gain send -12"] {
             assert!(single.apply(command.parse().unwrap()).is_err());
         }
@@ -574,6 +621,37 @@ mod tests {
         assert!("mute app0".parse::<LiveCommand>().is_err());
         route.apps.push(AppSource::new("browser.exe".into()));
         assert!(route.validate().is_err());
+    }
+
+    #[test]
+    fn live_vocal_parameters_are_validated_and_preserved_in_scene_snapshot() {
+        use crate::config::{Cli, Command};
+        use clap::Parser;
+        use mixlive_effects::Preset;
+        let Command::Check(mut route) = Cli::parse_from(["audio", "check", "--input", "mic", "--output", "phones",
+            "--vocal", "warm", "--vocal-strength", "0", "--reverb-predelay-ms", "25"]).command else { panic!("expected check") };
+        let controls = LiveControls::from_route(&route).unwrap();
+        for command in ["vocal trim -3", "vocal strength 0.75", "vocal compressor -35",
+            "vocal deesser -40", "vocal reverb 0.25", "vocal decay 2.5"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        let before = controls.vocal_config();
+        for command in ["vocal reverb NaN", "vocal decay 5.1", "vocal trim -37",
+            "vocal compressor 1", "vocal strength 1.01", "vocal predelay 10", "vocal preset warm"] {
+            assert!(command.parse::<LiveCommand>().is_err(), "{command}");
+        }
+        assert!(controls.apply(LiveCommand::Vocal { parameter: VocalParameter::Trim, value: f32::NAN }).is_err());
+        assert_eq!(controls.vocal_config(), before);
+        controls.snapshot_into(&mut route).unwrap();
+        assert_eq!(route.vocal_config(), before);
+        assert_eq!(route.vocal, Preset::Warm);
+        assert_eq!(route.reverb_predelay_ms, 25.0);
+        let restored = LiveControls::from_route(&route).unwrap();
+        assert_eq!(restored.describe(), controls.describe());
+        let off = LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
+        assert!(off.apply("vocal strength 1".parse().unwrap()).is_err());
+        assert!(off.apply("vocal reverb 0.5".parse().unwrap()).is_ok());
+        assert_eq!(off.vocal_parameters().count(), 3);
     }
 
     #[test]
@@ -627,7 +705,7 @@ mod tests {
     #[test]
     fn output_mutes_act_on_already_queued_audio_and_keep_other_mix_running() {
         use crate::bridge::{channel, Health, QUANTUM};
-        let controls = Arc::new(LiveControls::new(-6.0, [Some(0.0), Some(-12.0), None], false, 0).unwrap());
+        let controls = Arc::new(LiveControls::new(-6.0, [Some(0.0), Some(-12.0), None], false, 0, VocalConfig::default()).unwrap());
         let health = Arc::new(Health::default());
         let (mut writer, mut reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
         let mut faders = PlaybackGains::new(48_000, &[0, 1], controls.clone()).unwrap();
@@ -671,7 +749,7 @@ mod tests {
 
     #[test]
     fn route_switches_and_levels_are_independent_of_mutes_and_each_other() {
-        let controls = LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0).unwrap();
+        let controls = LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0, VocalConfig::default()).unwrap();
         assert_eq!(controls.route_targets()[..6], [1.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
         for invalid in ["route mic", "route mic output", "route mic output yes", "route mic output off extra",
             "route none send on", "route aux all on", "level aux send", "level mic output 1",
@@ -697,7 +775,7 @@ mod tests {
         let before = controls.describe();
         assert!(controls.apply(LiveCommand::RouteGain { source: RouteSource::Mic, mix: RouteMix::Output, db: f32::NAN }).is_err());
         assert_eq!(controls.describe(), before);
-        let single = LiveControls::new(0.0, [Some(0.0), None, None], false, 0).unwrap();
+        let single = LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
         let before = single.describe();
         for command in ["route aux output on", "level aux output -6", "route mic send on", "level mic send -3"] {
             assert!(single.apply(command.parse().unwrap()).is_err());

@@ -73,14 +73,7 @@ impl SoundDraft {
     pub fn apply_to(&self, route: &RouteOptions) -> Result<AudioScene, String> {
         let config = self.vocal_config()?;
         let mut route = route.clone();
-        route.vocal = config.preset;
-        route.input_gain_db = config.input_gain_db;
-        route.vocal_strength = config.strength;
-        route.vocal_threshold_db = config.compressor_threshold_db;
-        route.deess_threshold_db = config.deess_threshold_db;
-        route.reverb_mix = config.reverb.mix;
-        route.reverb_decay_secs = config.reverb.decay_secs;
-        route.reverb_predelay_ms = config.reverb.predelay_ms;
+        route.set_vocal_config(config);
         AudioScene::new(route, self.effects.clone()).map_err(|error| error.to_string())
     }
 
