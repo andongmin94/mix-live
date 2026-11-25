@@ -5,7 +5,7 @@ use mixlive_audio_windows::{
     control::{LiveCommand, LiveControls},
     plugin::PluginArgs,
     scene::AudioScene,
-    windows::{Active, Prepared},
+    windows::{Active, LevelReadings, Prepared},
 };
 use std::{
     path::{Path, PathBuf},
@@ -16,6 +16,8 @@ pub struct Session {
     loaded: Option<(PathBuf, AudioScene)>,
     active: Option<Active>,
     last_report: Instant,
+    last_meter: Instant,
+    pub levels: Option<LevelReadings>,
     pub message: String,
     pub error: Option<String>,
     pub device_details: String,
@@ -29,6 +31,8 @@ impl Default for Session {
             loaded: None,
             active: None,
             last_report: Instant::now(),
+            last_meter: Instant::now(),
+            levels: None,
             message: "새 Scene을 만들거나 파일을 열어 시작 설정을 확인하세요.".into(),
             error: None,
             device_details: String::new(),
@@ -75,6 +79,7 @@ impl Session {
         self.device_details.clear();
         self.timing.clear();
         self.report.clear();
+        self.levels = None;
         match AudioScene::read(&path) {
             Ok(scene) => {
                 self.loaded = Some((path, scene));
@@ -105,6 +110,7 @@ impl Session {
         self.device_details.clear();
         self.timing.clear();
         self.report.clear();
+        self.levels = None;
         self.message = "새 Scene을 저장했습니다. 설정을 확인한 뒤 오디오 시작을 누르세요.".into();
         Ok(())
     }
@@ -121,6 +127,7 @@ impl Session {
         self.device_details.clear();
         self.timing.clear();
         self.report.clear();
+        self.levels = None;
         let Some(scene) = self.scene() else {
             return self.fail("먼저 Scene을 열어 주세요.", "no scene is selected");
         };
@@ -140,6 +147,7 @@ impl Session {
                 self.device_details = details;
                 self.timing = active.timing.clone();
                 self.last_report = Instant::now();
+                self.last_meter = Instant::now();
                 self.active = Some(active);
                 self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 믹서와 VST3 상태를 저장할 수 있습니다.".into();
                 Ok(())
@@ -191,14 +199,21 @@ impl Session {
         if let Some(error) = active.health.error() {
             return self.fail("오디오 경로 오류 · 정지 중입니다.", error);
         }
-        if self.last_report.elapsed() >= Duration::from_secs(1) {
-            self.report = active.report();
-            self.last_report = Instant::now();
+        let now = Instant::now();
+        let meter_updated = now.duration_since(self.last_meter) >= Duration::from_millis(100);
+        if meter_updated {
+            let levels = active.take_levels();
+            self.levels = Some(levels);
+            self.last_meter = now;
+            if now.duration_since(self.last_report) >= Duration::from_secs(1) {
+                self.report = active.report(&levels);
+                self.last_report = now;
+            }
         }
         if dismissed {
             self.message = "VST3 원본 창 닫힘 · 오디오 실행 중".into();
         }
-        Ok(dismissed)
+        Ok(dismissed || meter_updated)
     }
 
     /// Explicitly finish and save a new Scene. Failure or an occupied path keeps the old selection.
@@ -208,7 +223,8 @@ impl Session {
             return self.fail("실행 중인 Scene이 없습니다.", "audio is not running");
         };
         let route = self.scene().expect("active session has a Scene").route.clone();
-        self.report = active.report();
+        self.report = active.report(&active.take_levels());
+        self.levels = None;
         let scene = match active.finish_scene(route) {
             Ok(scene) => scene,
             Err(error) => return self.fail("오디오를 정지했지만 실행 상태를 저장하지 못했습니다.", error),
@@ -223,7 +239,8 @@ impl Session {
         let Some(active) = self.active.take() else {
             return Ok(());
         };
-        self.report = active.report();
+        self.report = active.report(&active.take_levels());
+        self.levels = None;
         let result = active.finish(None).map_err(|error| error.to_string());
         match result {
             Ok(()) => {

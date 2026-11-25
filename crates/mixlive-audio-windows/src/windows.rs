@@ -179,8 +179,8 @@ impl Prepared {
         for (index, endpoint) in self.outputs.into_iter().enumerate() {
             let (writer, reader) = bridge::channel(self.input_config.sample_rate(), endpoint.config.sample_rate(), self.queue_ms, endpoint.routes.len(), health.clone())?;
             timing.push(format!("stream {index}: {} mix(es), shared queue target {:.2} ms + resampler delay {:.2} ms (excludes hardware and OS; NOT round-trip latency)", endpoint.routes.len(), reader.queue_ms, reader.resampler_delay_ms));
-            stats.push(reader.stats.clone());
             let mixes: Vec<usize> = endpoint.routes.iter().map(|(mix, _)| *mix).collect();
+            stats.push(PlaybackStats { mixes: mixes.clone(), stats: reader.stats.clone() });
             let gains = PlaybackGains::new(endpoint.config.sample_rate(), &mixes, controls.clone())?;
             writers.push((writer, mixes));
             let maps: Vec<OutputMap> = endpoint.routes.iter().map(|(_, map)| *map).collect();
@@ -244,6 +244,21 @@ impl Prepared {
     }
 }
 
+struct PlaybackStats {
+    mixes: Vec<usize>,
+    stats: Arc<OutputStats>,
+}
+
+/// One control-thread read of actual sample maxima; absent optional sources/mixes stay absent.
+#[derive(Clone, Copy, Debug)]
+pub struct LevelReadings {
+    pub mic_input: f32,
+    pub aux_input: Option<f32>,
+    pub vocal: mixlive_effects::Meters,
+    pub voice: f32,
+    pub outputs: [Option<f32>; 2],
+}
+
 pub struct Active {
     // Drop devices, then join processing and release native plugin state on the loading thread.
     _input: Stream,
@@ -253,7 +268,7 @@ pub struct Active {
     pub health: Arc<Health>,
     pub controls: Arc<LiveControls>,
     /// One set per physical playback endpoint, shared by its channel routes.
-    pub outputs: Vec<Arc<OutputStats>>,
+    outputs: Vec<PlaybackStats>,
     aux_enabled: bool,
     aux_clock_stats: Option<Arc<OutputStats>>,
     pub vocal_stats: Arc<VocalStats>,
@@ -371,20 +386,39 @@ impl Active {
         (plugin_worker, health)
     }
 
-    /// UI/CLI thread only. Peaks and gain reduction maxima are since the previous read.
-    pub fn report(&self) -> String {
-        let vocal = self.vocal_stats.take();
-        let mut text = format!("captured={} input_peak={:.3} vocal_peak={:.3} comp_gr={:.1}dB deess_gr={:.1}dB", self.health.captured_frames.load(Ordering::Relaxed), f32::from_bits(self.health.input_peak.swap(0, Ordering::Relaxed)), vocal.output_peak, vocal.compression_db, vocal.deessing_db);
-        if self.aux_enabled {
-            text.push_str(&format!(" aux_peak={:.3}", f32::from_bits(self.health.aux_peak.swap(0, Ordering::Relaxed))));
+    /// Single consumer on the control thread. Peak intervals are independent of callback blocks.
+    pub fn take_levels(&self) -> LevelReadings {
+        let mut outputs = [None; 2];
+        for endpoint in &self.outputs {
+            for (&mix, peak) in endpoint.mixes.iter().zip(endpoint.stats.take_peaks()) {
+                outputs[mix] = Some(peak);
+            }
+        }
+        LevelReadings {
+            mic_input: f32::from_bits(self.health.input_peak.swap(0, Ordering::Relaxed)),
+            aux_input: self.aux_enabled.then(|| f32::from_bits(self.health.aux_peak.swap(0, Ordering::Relaxed))),
+            vocal: self.vocal_stats.take(),
+            voice: f32::from_bits(self.health.voice_peak.swap(0, Ordering::Relaxed)),
+            outputs,
+        }
+    }
+
+    /// Reuse the same readings for the diagnostic text; never drain the meter twice.
+    pub fn report(&self, levels: &LevelReadings) -> String {
+        let vocal = levels.vocal;
+        let mut text = format!("captured={} input_peak={:.3} vocal_peak={:.3} voice_peak={:.3} comp_gr={:.1}dB deess_gr={:.1}dB", self.health.captured_frames.load(Ordering::Relaxed), levels.mic_input, vocal.output_peak, levels.voice, vocal.compression_db, vocal.deessing_db);
+        if let Some(aux) = levels.aux_input {
+            text.push_str(&format!(" aux_peak={aux:.3}"));
             if let Some(stats) = &self.aux_clock_stats {
                 text.push_str(&format!(" aux_queue={} frames aux_correction={}ppm aux_underruns={}",
                     stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed),
                     stats.underruns.load(Ordering::Relaxed)));
             }
         }
-        for (index, stats) in self.outputs.iter().enumerate() {
-            text.push_str(&format!(" | stream{index}: peak={:.3} queue={} frames correction={}ppm underruns={} clipped={}", f32::from_bits(stats.peak.swap(0, Ordering::Relaxed)), stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed), stats.underruns.load(Ordering::Relaxed), stats.clipped_frames.load(Ordering::Relaxed)));
+        for (index, endpoint) in self.outputs.iter().enumerate() {
+            let stats = &endpoint.stats;
+            let peak = endpoint.mixes.iter().filter_map(|&mix| levels.outputs[mix]).fold(0.0_f32, f32::max);
+            text.push_str(&format!(" | stream{index}: peak={peak:.3} queue={} frames correction={}ppm underruns={} clipped={}", stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed), stats.underruns.load(Ordering::Relaxed), stats.clipped_frames.load(Ordering::Relaxed)));
         }
         text
     }

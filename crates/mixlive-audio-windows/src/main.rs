@@ -129,12 +129,12 @@ mod device {
             active.poll_plugin()?;
             if let Some(error) = active.health.error() { return Err(error.into()); }
             if started.elapsed() >= next_report {
-                println!("{} | {}", active.report(), active.controls.describe());
+                println!("{} | {}", active.report(&active.take_levels()), active.controls.describe());
                 next_report += Duration::from_secs(1);
             }
             std::thread::sleep(poll_interval);
         }
-        let report = active.report();
+        let report = active.report(&active.take_levels());
         let finished = active.finish(plugin.chain_out.as_deref());
         println!("Stopped. {report}");
         finished?;

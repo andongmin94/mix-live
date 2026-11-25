@@ -493,6 +493,11 @@ mod tests {
         for _ in 0..240 { after = reader.next_frame(faders.next_gains()); }
         assert_eq!(&after[..2], &[0.0; 2]);
         assert!((after[2] - before[2]).abs() < 1e-4);
+        let _ = reader.stats.take_peaks(); // discard the preceding fade interval
+        reader.next_frame(faders.next_gains());
+        let peaks = reader.stats.take_peaks();
+        assert_eq!(peaks[0], 0.0);
+        assert!((peaks[1] - after[2].abs()).abs() < 1e-4);
         controls.apply("gain send -6".parse().unwrap()).unwrap();
         faders.update();
         for _ in 0..240 { after = reader.next_frame(faders.next_gains()); }
@@ -502,9 +507,9 @@ mod tests {
         for _ in 0..240 { after = reader.next_frame(faders.next_gains()); }
         assert_eq!(after, [0.0; 4]);
         // Peak is measured AFTER mute/attenuation; stale queued samples are still consumed.
-        reader.stats.peak.store(0, Ordering::Relaxed);
+        let _ = reader.stats.take_peaks();
         assert_eq!(reader.next_frame(faders.next_gains()), [0.0; 4]);
-        assert_eq!(reader.stats.peak.load(Ordering::Relaxed), 0);
+        assert_eq!(reader.stats.take_peaks(), [0.0; 2]);
         assert!(!health.failed());
         let mut send_only = PlaybackGains::new(44_100, &[1], controls.clone()).unwrap();
         controls.apply("unmute all".parse().unwrap()).unwrap();

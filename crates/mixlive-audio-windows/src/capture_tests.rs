@@ -46,6 +46,9 @@ fn vocal_is_processed_once_before_sends_and_playback_attenuation() {
         assert_eq!(b.left[index], a.left[index]);
         assert_eq!(a.left[index], a.right[index]);
     }
+    let voice = f32::from_bits(health.voice_peak.swap(0, Ordering::Relaxed));
+    let expected_peak = expected.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+    assert!((voice - expected_peak).abs() < 1e-6);
     let meters = capture.vocal_stats.take();
     assert!(meters.compression_db > 0.0);
     assert!(meters.output_peak > 0.0);
@@ -72,6 +75,10 @@ fn shared_endpoint_applies_independent_gains_after_one_resampler() {
     assert!((values[2] / values[0] - 10.0_f32.powf(-12.0 / 20.0)).abs() < 1e-6);
     assert_eq!(values[2], values[3]);
     assert_eq!(&values[4..], &[0.0; 2]);
+    let peaks = reader.stats.take_peaks();
+    assert!(peaks[0] > 0.0 && peaks[1] > 0.0);
+    assert!((peaks[1] / peaks[0] - 10.0_f32.powf(-12.0 / 20.0)).abs() < 1e-5);
+    assert_eq!(reader.stats.take_peaks(), [0.0; 2]);
     assert_eq!(health.captured_frames.load(Ordering::Relaxed), prime as u64);
     capture.push(&[f32::NAN], None);
     assert!(health.failed());

@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실행 중 VST3 원본 창 열기·닫기·재열기 구현 · Windows 통합 검증 대기**
+단계: **라이브 sample peak 미터 및 VST3 편집창 컴파일 수정 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -29,7 +29,11 @@
   성공은 새 파일 선택 후 명시적 시작 대기다. 실행 중 설정 편집은 막는다.
 - native 장치 조회/시작/종료는 GPUI foreground의 UI 객체 변경 참조 밖에서 실행한다.
   `Prepared::new/start`, `Active::poll_plugin/report/finish`, `LiveControls`와
-  장치 중지 → worker join → plugin 해제 순서를 유지한다. 가짜 meter는 없다.
+  장치 중지 → worker join → plugin 해제 순서를 유지한다.
+- 라이브 믹서에서 마이크 입력·내장 보정 후·보컬 체인 후·AUX 입력·각 출력 mix의 실제 sample peak를
+  약 100ms마다 dBFS로 표시한다. 소스는 mute 전, 출력은 감쇠·mute·guard 후 장치 채널 매핑 전이다.
+  기존 peak 누적을 공유 endpoint의 lane별로 분리했고 진단 문자열은 같은 읽기값을 사용한다.
+  내장 gain reduction도 표시한다. 실측 장치·LUFS·true peak·청력 보호 검증은 아니다.
 - gpui-deck `78c0898ccb6feba03e3a3243ac7d4729fd80aee6` (0.0.1), GPUI family `=0.3.12`로 갱신했다.
   기존 Select/Input/Button/ScrollArea를 유지하며 라이브 fader는 단일 값 SliderState와 SliderThumb을
   사용한다. Deck과 GPUI 계열의 잠금 파일은 Cargo로 갱신했다.
@@ -53,9 +57,11 @@ CLI Scene Save에 발생하여 release/GUI 검사는 실행되지 않았다.
 mix 설정은 인라인으로 유지하도록 수정했다. 린트 억제 없음.
 수정 후 [Audio #29](https://github.com/andongmin94/mix-live/actions/runs/45550324761) 전체 성공:
 workspace/native fixture, Clippy, release 빌드 및 실제 Scene 편집·저장 GUI 검사 통과.
-이번 native 원본 창 변경의 Windows 통합 검증은 대기 중이다. 기존 instrumented synth fixture의
-창 attach/detach 및 동일 슬롯 재열기 검사를 추가했다(라이브 마이크용 stereo effect는 아님).
-실제 장치와 라이브 fader는 미검증이다.
+원본 창 변경 [Audio #30](https://github.com/andongmin94/mix-live/actions/runs/45551519959)는
+반복 poll의 이동된 WeakEntity(E0382)로 컴파일 실패했다. 이번 묶음에서 해당 소유권을 바로잡고
+실제 peak 미터를 추가했다. 기존 instrumented synth fixture의 창 attach/detach·재열기 검사,
+합성 shared endpoint lane peak 및 mute 검사와 dBFS 표시 검사를 포함한다.
+수정본의 통합 검증은 대기 중이다. 실제 장치와 라이브 fader/미터는 미검증이다.
 
 ## 남은 작업과 제한
 

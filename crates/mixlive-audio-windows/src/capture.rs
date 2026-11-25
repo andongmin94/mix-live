@@ -118,9 +118,12 @@ impl Capture {
                 self.health.fail(Fault::Routing); return;
             }
             // Keep both DSP stages running while source-muted, including their tail/history.
+            let mut voice_peak = 0.0_f32;
             for (left, right) in left.iter_mut().zip(right.iter_mut()) {
+                voice_peak = voice_peak.max(left.abs()).max(right.abs());
                 let gain = self.source_mutes[0].next_gain(); *left *= gain; *right *= gain;
             }
+            self.health.voice_peak.fetch_max(voice_peak.to_bits(), Ordering::Relaxed);
             let voice = Input::Stereo { left, right };
             let rendered = if let Some(aux) = aux {
                 let start = block_index * CAPTURE_BLOCK;

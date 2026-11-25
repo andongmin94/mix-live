@@ -3,7 +3,7 @@
 
 use std::{
     path::PathBuf,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use gpui::{
@@ -72,7 +72,6 @@ pub struct MixLive {
     form: Option<Entity<SceneForm>>,
     form_subscription: Option<Subscription>,
     workspace_scroll: ScrollHandle,
-    last_refresh: Instant,
 }
 
 impl MixLive {
@@ -122,15 +121,14 @@ impl MixLive {
                     _ => break,
                 };
                 let result = session.poll();
-                let alive = cx.update(move |window, cx| {
+                let alive = cx.update(|window, cx| {
                     owner.update(cx, |this, cx| {
                         this.session = session;
                         this.busy = None;
                         match result {
                             Err(_) => this.perform(Operation::Stop, window, cx),
-                            Ok(dismissed) => {
-                                if dismissed || this.last_refresh.elapsed() >= Duration::from_secs(1) {
-                                    this.last_refresh = Instant::now();
+                            Ok(changed) => {
+                                if changed {
                                     cx.notify();
                                 }
                             }
@@ -155,7 +153,6 @@ impl MixLive {
             form: None,
             form_subscription: None,
             workspace_scroll: ScrollHandle::new(),
-            last_refresh: Instant::now(),
         }
     }
 
@@ -931,6 +928,7 @@ impl MixLive {
 
     fn mixer(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let controls = self.session.controls().expect("running session");
+        let levels = self.session.levels.as_ref();
         let mut source_mutes = div().flex().items_center().gap_5().child(
             div()
                 .flex()
@@ -957,7 +955,16 @@ impl MixLive {
                 .flex_col()
                 .gap_3()
                 .child(div().font_semibold().child("소스별 보내기"))
-                .child(source_mutes),
+                .child(source_mutes)
+                .child(peak_meter("마이크 입력 · trim 전", levels.map(|l| l.mic_input)))
+                .child(peak_meter("내장 보정 후 · VST3 전", levels.map(|l| l.vocal.output_peak)))
+                .child(peak_meter("보컬 체인 후 · mute 전", levels.map(|l| l.voice)))
+                .children(controls.has_aux().then(|| peak_meter("AUX 입력 · trim/mute 전", levels.and_then(|l| l.aux_input))))
+                .children(levels.map(|l| {
+                    div().text_xs().text_color(rgb(MUTED)).child(format!(
+                        "내장 보정 GR · 컴프레서 {:.1} / 디에서 {:.1} dB",
+                        l.vocal.compression_db, l.vocal.deessing_db))
+                })),
         );
         for (mix_index, mix) in [RouteMix::Output, RouteMix::Send]
             .into_iter()
@@ -1042,6 +1049,7 @@ impl MixLive {
             .flex_shrink_0()
             .gap_4()
             .child(div().font_semibold().child("최종 출력 음량"))
+            .child(peak_meter("주 출력 믹스 peak", levels.and_then(|l| l.outputs[0])))
             .child(
                 div()
                     .flex()
@@ -1081,6 +1089,7 @@ impl MixLive {
                     .pt_4()
                     .border_t_1()
                     .border_color(rgb(BORDER))
+                    .child(peak_meter("추가 송출 믹스 peak", levels.and_then(|l| l.outputs[1])))
                     .child(div().text_sm().child("송출 추가 감쇠"))
                     .child(self.fader(
                         "send-level",
@@ -1112,7 +1121,7 @@ impl MixLive {
             );
         }
         output = output.child(div().text_xs().text_color(rgb(MUTED)).pt_3().child(
-            "음소거와 경로 선택은 각각 유지됩니다. 음량을 바꿔도 음소거는 해제되지 않습니다.",
+            "출력 peak는 감쇠·mute·sample guard 후, 장치 채널 매핑 전입니다. 음소거와 경로 선택은 각각 유지됩니다.",
         ));
 
         div()
@@ -1256,6 +1265,43 @@ impl Render for MixLive {
             .child(body)
             .child(div().flex_shrink_0().px_7().py_3().border_t_1().border_color(rgb(BORDER)).text_xs().text_color(rgb(MUTED))
                 .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 믹서와 VST3 상태를 보존합니다."))
+    }
+}
+
+/// Scale the measured sample peak over a -60..0 dBFS rail; silence is not -60 dBFS.
+fn peak_display(peak: Option<f32>) -> (f32, String, u32) {
+    match peak {
+        None => (0.0, "측정 대기".into(), MUTED),
+        Some(0.0) => (0.0, "−∞ dBFS".into(), ACCENT),
+        Some(peak) => {
+            let db = 20.0 * peak.log10();
+            let fill = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+            (fill, format!("{db:.1} dBFS"), if db >= 0.0 { DANGER } else if db >= -6.0 { 0xf2c879 } else { ACCENT })
+        }
+    }
+}
+
+fn peak_meter(label: &'static str, peak: Option<f32>) -> Div {
+    let (fill, value, color) = peak_display(peak);
+    div().flex().flex_col().gap_1()
+        .child(div().flex().items_center().justify_between().gap_2()
+            .child(div().text_xs().text_color(rgb(MUTED)).child(label))
+            .child(div().text_xs().text_color(rgb(color)).child(value)))
+        .child(div().h(px(7.)).w_full().rounded_full().bg(rgb(BACKGROUND)).overflow_hidden()
+            .child(div().h_full().w(relative(fill)).rounded_full().bg(rgb(color))))
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+    #[test]
+    fn sample_peak_display_has_a_logarithmic_scale_and_no_synthetic_signal() {
+        assert_eq!(peak_display(None).0, 0.0);
+        assert_eq!(peak_display(Some(0.0)).1, "−∞ dBFS");
+        assert_eq!(peak_display(Some(0.0001)).0, 0.0);
+        assert!((peak_display(Some(10.0_f32.powf(-30.0 / 20.0))).0 - 0.5).abs() < 1e-6);
+        assert_eq!(peak_display(Some(1.0)), (1.0, "0.0 dBFS".into(), DANGER));
+        assert_eq!(peak_display(Some(2.0)), (1.0, "6.0 dBFS".into(), DANGER));
     }
 }
 

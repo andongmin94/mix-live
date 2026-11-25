@@ -21,6 +21,7 @@ pub struct Health {
     pub captured_frames: AtomicU64,
     pub input_peak: AtomicU32,
     pub aux_peak: AtomicU32,
+    pub voice_peak: AtomicU32,
 }
 impl Health {
     pub fn fail(&self, fault: Fault) {
@@ -45,7 +46,14 @@ pub struct OutputStats {
     pub clipped_frames: AtomicU64,
     pub queue_frames: AtomicU64,
     pub correction_ppm: AtomicI32,
-    pub peak: AtomicU32,
+    peaks: [AtomicU32; 2],
+}
+impl OutputStats {
+    /// One peak per stereo mix in endpoint lane order, after playback gain and clipping.
+    /// Only the control thread consumes these interval maxima.
+    pub fn take_peaks(&self) -> [f32; 2] {
+        std::array::from_fn(|lane| f32::from_bits(self.peaks[lane].swap(0, Ordering::Relaxed)))
+    }
 }
 
 pub struct OutputWriter {
@@ -125,8 +133,10 @@ impl OutputReader {
             self.stats.clipped_frames.fetch_add(1, Ordering::Relaxed);
             frame.iter_mut().for_each(|x| *x = x.clamp(-CEILING, CEILING));
         }
-        let peak = frame.iter().fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
-        self.stats.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
+        for lane in 0..self.channels / 2 {
+            let peak = frame[lane * 2].abs().max(frame[lane * 2 + 1].abs());
+            self.stats.peaks[lane].fetch_max(peak.to_bits(), Ordering::Relaxed);
+        }
         frame
     }
 
