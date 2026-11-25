@@ -39,29 +39,32 @@ fn save_and_show_work_without_audio_hardware_and_do_not_overwrite() {
 }
 
 #[test]
-fn app_binding_persists_an_executable_path_not_a_pid_and_is_exclusive_with_device_aux() {
+fn multiple_apps_persist_distinct_executable_paths_and_disconnected_defaults() {
+    use mixlive_audio_windows::config::AuxDestination;
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("app.json");
-    let app = r"C:\Program Files\Browser\browser.exe";
+    let path = directory.path().join("apps.json");
+    let browser = r"C:\Program Files\Browser\browser.exe";
+    let call = r"C:\Program Files\Call\call.exe";
     let saved = command().args(["scene", "save"]).arg(&path)
-        .args(["--input", "mic", "--output", "phones", "--send", "cable", "--aux-app", app])
+        .args(["--input", "mic", "--output", "phones", "--send", "cable",
+            "--aux-input", "mr-device", "--app", browser, "--app", call])
         .output().unwrap();
     assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stderr));
     let restored = AudioScene::read(&path).unwrap();
-    assert_eq!(restored.route.aux_app.as_deref(), Some(app));
-    assert!(restored.route.aux_input.is_none() && restored.route.has_aux());
-    assert!(restored.route.validate().is_ok());
+    assert_eq!(restored.route.apps.len(), 2);
+    assert_eq!(restored.route.apps[0].path, browser);
+    assert_eq!(restored.route.apps[1].path, call);
+    assert!(restored.route.has_aux());
+    assert!(restored.route.apps.iter().all(|app| app.to == AuxDestination::Off));
     let mut route = restored.route;
-    route.aux_input = Some("other-device".into());
-    assert!(route.validate().is_err());
-    route.aux_input = None;
-    route.aux_channels = vec![3];
-    assert!(route.validate().is_err());
-    route.aux_channels = vec![1, 2];
-    route.send = None;
-    assert!(route.validate().is_err());
-    route.aux_to = mixlive_audio_windows::config::AuxDestination::Output;
+    route.apps[0].to = AuxDestination::Send;
+    route.apps[1].to = AuxDestination::Output;
     assert!(route.validate().is_ok());
+    route.apps[0].channels = vec![3];
+    assert!(route.validate().is_err());
+    route.apps[0].channels = vec![1, 2];
+    route.apps[1].path = browser.into();
+    assert!(route.validate().is_err());
     assert!(!String::from_utf8(std::fs::read(&path).unwrap()).unwrap().contains("\"pid\""));
 }
 

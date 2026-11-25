@@ -1,6 +1,7 @@
 //! Bounded SPSC clock transport. Output mixes share a bridge; AUX uses one at its input boundary.
 //! Rubato owns the anti-alias filter; we only steer its ratio from queue occupancy.
 use std::sync::{Arc, atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering}};
+use crate::config::MAX_APPS;
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
@@ -21,6 +22,7 @@ pub struct Health {
     pub captured_frames: AtomicU64,
     pub input_peak: AtomicU32,
     pub aux_peak: AtomicU32,
+    pub app_peaks: [AtomicU32; MAX_APPS],
     pub voice_peak: AtomicU32,
 }
 impl Health {

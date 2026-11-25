@@ -10,14 +10,14 @@ use gpui_deck::{
     SelectItem, SelectOption, SelectState, StyledExt as _,
 };
 use mixlive_audio_windows::{
-    config::RouteOptions,
+    config::{AppSource, AuxDestination, RouteOptions, MAX_APPS},
     control::MixSettings,
-    devices::{DeviceCatalog, DeviceInfo},
+    devices::{DeviceCatalog, DeviceInfo, resolve_apps},
     scene::AudioScene,
 };
 
 use crate::{
-    draft::SceneDraft,
+    draft::{SceneDraft, channels, number},
     sound::SoundDraft,
     sound_editor::SoundEditor,
     ui::{
@@ -44,13 +44,52 @@ enum Endpoint {
     Aux,
 }
 
+struct AppField {
+    source: AppSource,
+    channels: Entity<InputState>,
+    trim: Entity<InputState>,
+    output_gain: Entity<InputState>,
+    send_gain: Entity<InputState>,
+}
+
+impl AppField {
+    fn new(source: AppSource, window: &mut Window, cx: &mut App) -> Self {
+        let label = |field: &str| format!("{} {field}", source.path);
+        let channels = text_input(&label("채널"), &source.channels.iter().map(u16::to_string).collect::<Vec<_>>().join(","), window, cx);
+        let trim = text_input(&label("입력 trim"), &source.gain_db.to_string(), window, cx);
+        let output_gain = text_input(&label("주 출력 음량"), &source.output_gain_db.to_string(), window, cx);
+        let send_gain = text_input(&label("추가 송출 음량"), &source.send_gain_db.to_string(), window, cx);
+        Self { source, channels, trim, output_gain, send_gain }
+    }
+
+    fn build(&self, cx: &App) -> Result<AppSource, String> {
+        let mut source = self.source.clone();
+        source.channels = channels(self.channels.read(cx).value().as_ref())?;
+        source.gain_db = number(self.trim.read(cx).value().as_ref(), "앱 입력 trim")?;
+        source.output_gain_db = number(self.output_gain.read(cx).value().as_ref(), "앱 주 출력 음량")?;
+        source.send_gain_db = number(self.send_gain.read(cx).value().as_ref(), "앱 추가 송출 음량")?;
+        Ok(source)
+    }
+
+    fn set_busy(&self, busy: bool, has_send: bool, cx: &mut App) {
+        for input in [&self.channels, &self.trim, &self.output_gain] {
+            input.update(cx, |input, cx| input.set_disabled(busy, cx));
+        }
+        self.send_gain.update(cx, |input, cx| input.set_disabled(busy || !has_send, cx));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AppAction { Remove, Mute, Output, Send }
+
 struct DeviceSetup {
     catalog: DeviceCatalog,
     mic: EndpointField,
     output: EndpointField,
     send: EndpointField,
     aux: EndpointField,
-    aux_app: Entity<SelectState>,
+    app_picker: Entity<SelectState>,
+    apps: Vec<AppField>,
     aux_to: Entity<SelectState>,
     output_gain: Entity<InputState>,
     send_gain: Entity<InputState>,
@@ -134,21 +173,18 @@ impl SceneForm {
             window,
             cx,
         );
-        let aux_app = cx.new(|cx| {
-            let mut items = vec![SelectItem::new("", "사용 안 함")];
+        let app_picker = cx.new(|cx| {
+            let mut items = vec![SelectItem::new("", "추가할 앱 선택")];
             for app in &catalog.apps {
                 let label = match &app.target {
                     Ok(target) => format!("{} · PID {}", app.path, target.pid),
                     Err(error) => format!("{} · {error}", app.path),
                 };
-                items.push(SelectItem::new(app.path.clone(), label)
-                    .disabled(app.target.is_err() && draft.aux_app.as_ref() != Some(&app.path)));
+                items.push(SelectItem::new(app.path.clone(), label).disabled(app.target.is_err()));
             }
-            if let Some(path) = draft.aux_app.as_ref().filter(|path| !catalog.apps.iter().any(|app| &app.path == *path)) {
-                items.push(SelectItem::new(path.clone(), format!("현재 없는 앱 · {path}")));
-            }
-            SelectState::new(items, cx).default_value(draft.aux_app.as_deref().unwrap_or(""))
+            SelectState::new(items, cx).default_value("")
         });
+        let apps = draft.apps.into_iter().map(|source| AppField::new(source, window, cx)).collect();
         let aux_to = cx.new(|cx| {
             SelectState::new(
                 [
@@ -208,18 +244,7 @@ impl SceneForm {
                 },
             ));
         }
-        subscriptions.push(cx.observe(&aux_app, |_, _, cx| cx.notify()));
-        subscriptions.push(cx.subscribe_in(&aux_app, window, |this, _, event, window, cx| {
-            if this.is_busy(cx) { return; }
-            let Setup::Devices { fields, .. } = &this.setup else { return; };
-            let SelectEvent::Change(id) = event;
-            if !id.is_empty() && selected(&fields.aux.select, cx).is_none() {
-                fields.aux.channels.update(cx, |input, cx| input.set_value("1,2", window, cx));
-            }
-            fields.set_busy(false, window, cx);
-            this.error = None;
-            cx.notify();
-        }));
+        subscriptions.push(cx.observe(&app_picker, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&aux_to, |_, _, cx| cx.notify()));
         for input in [&output_gain, &send_gain, &aux_gain, &queue_ms] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
@@ -230,7 +255,8 @@ impl SceneForm {
             output,
             send,
             aux,
-            aux_app,
+            app_picker,
+            apps,
             aux_to,
             output_gain,
             send_gain,
@@ -289,6 +315,105 @@ impl SceneForm {
         cx.notify();
     }
 
+    fn add_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy(cx) { return; }
+        let Setup::Devices { fields, .. } = &mut self.setup else { return; };
+        let Some(path) = selected(&fields.app_picker, cx) else { return; };
+        if fields.apps.len() >= MAX_APPS || fields.apps.iter().any(|app| app.source.path.eq_ignore_ascii_case(&path)) {
+            return;
+        }
+        let source = AppSource::new(path);
+        let mut sources: Vec<_> = fields.apps.iter().map(|app| app.source.clone()).collect();
+        sources.push(source.clone());
+        if let Err(error) = resolve_apps(&sources, &fields.catalog.apps) {
+            self.error = Some(error);
+        } else {
+            let field = AppField::new(source, window, cx);
+            field.set_busy(false, selected(&fields.send.select, cx).is_some(), cx);
+            fields.apps.push(field);
+            self.error = None;
+        }
+        cx.notify();
+    }
+
+    fn edit_app(&mut self, index: usize, action: AppAction, cx: &mut Context<Self>) {
+        if self.is_busy(cx) { return; }
+        let Setup::Devices { fields, .. } = &mut self.setup else { return; };
+        let Some(app) = fields.apps.get_mut(index) else { return; };
+        match action {
+            AppAction::Remove => { fields.apps.remove(index); }
+            AppAction::Mute => { app.source.muted = !app.source.muted; }
+            AppAction::Output | AppAction::Send => {
+                let mut output = app.source.to.includes(0);
+                let mut send = app.source.to.includes(1);
+                if matches!(action, AppAction::Output) { output = !output; }
+                else { send = !send; }
+                app.source.to = match (output, send) {
+                    (false, false) => AuxDestination::Off, (true, false) => AuxDestination::Output,
+                    (false, true) => AuxDestination::Send, (true, true) => AuxDestination::Both,
+                };
+            }
+        }
+        self.error = None;
+        cx.notify();
+    }
+
+    fn app_sources(&self, fields: &DeviceSetup, window: &Window, cx: &Context<Self>) -> Div {
+        let busy = self.is_busy(cx);
+        let has_send = selected(&fields.send.select, cx).is_some();
+        let can_add = selected(&fields.app_picker, cx).is_some_and(|path| {
+            fields.catalog.apps.iter().any(|app| app.path == path && app.target.is_ok())
+                && !fields.apps.iter().any(|app| app.source.path.eq_ignore_ascii_case(&path))
+        });
+        let mut rack = panel().gap_4()
+            .child(section_title("APP", "앱 소스"))
+            .child(div().text_xs().text_color(rgb(MUTED))
+                .child(format!("실행 중인 앱 최대 {MAX_APPS}개 · 서로 다른 프로세스 트리만 선택 · 원래 재생 경로는 유지됩니다.")))
+            .child(div().flex().items_center().gap_2()
+                .child(div().flex_1().min_w_0().child(select_control("app-picker", "추가할 앱", &fields.app_picker, None, window, cx)))
+                .child(button("add-app", "앱 추가", true)
+                    .disabled(busy || !can_add || fields.apps.len() >= MAX_APPS)
+                    .on_click(cx.listener(|this, _, window, cx| this.add_app(window, cx)))));
+        for (index, app) in fields.apps.iter().enumerate() {
+            let slot = index + 1;
+            let source = &app.source;
+            let output_on = source.to.includes(0);
+            let send_on = source.to.includes(1);
+            let problem = match fields.catalog.apps.iter().find(|candidate| candidate.path == source.path) {
+                Some(candidate) => candidate.target.as_ref().err().cloned(),
+                None => Some("저장된 앱이 현재 실행 목록에 없습니다. 앱을 실행하고 설정을 다시 열거나 슬롯을 삭제하세요.".into()),
+            };
+            rack = rack.child(div().id(("app-source", index)).flex().flex_col().gap_3()
+                .pt_3().border_t_1().border_color(rgb(BORDER))
+                .child(div().flex().items_center().justify_between().gap_3()
+                    .child(div().flex_1().min_w_0().font_semibold().whitespace_normal()
+                        .child(format!("{slot:02}  {}", source.path)))
+                    .child(button("app-remove", "삭제", false).accessibility_label(format!("앱 {slot} 삭제"))
+                        .disabled(busy).on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Remove, cx)))))
+                .children(problem.map(|error| div().text_xs().text_color(rgb(DANGER)).child(error)))
+                .child(div().flex().flex_wrap().gap_2()
+                    .child(button("app-mute", if source.muted { "음소거 중" } else { "음소거 해제" }, source.muted)
+                        .accessibility_label(format!("앱 {slot} 음소거")).disabled(busy)
+                        .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Mute, cx))))
+                    .child(button("app-output", if output_on { "주 출력 연결됨" } else { "주 출력 꺼짐" }, output_on)
+                        .accessibility_label(format!("앱 {slot} 주 출력")).disabled(busy)
+                        .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Output, cx))))
+                    .child(button("app-send", if send_on { "추가 송출 연결됨" } else { "추가 송출 꺼짐" }, send_on)
+                        .accessibility_label(format!("앱 {slot} 추가 송출")).disabled(busy || (!has_send && !send_on))
+                        .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Send, cx)))))
+                .child(div().flex().flex_wrap().gap_4()
+                    .children([("app-channels", "채널 1 또는 1,2", &app.channels),
+                        ("app-trim", "입력 trim (dB)", &app.trim),
+                        ("app-output-gain", "주 출력 (dB)", &app.output_gain),
+                        ("app-send-gain", "추가 송출 (dB)", &app.send_gain)].into_iter().map(|(id, label, input)| {
+                        div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child(label))
+                            .child(number_input(id, input, window, cx))
+                    }))));
+        }
+        rack.child(div().text_xs().text_color(rgb(MUTED))
+            .child("새 앱은 두 경로가 모두 꺼져 있습니다. 통화 수신 앱을 통화 송출로 보내지 않도록 직접 지정하세요."))
+    }
+
     pub fn show_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
         self.error = error;
         cx.notify();
@@ -314,7 +439,7 @@ impl DeviceSetup {
             send: selected(&self.send.select, cx),
             send_channels: self.send.channels.read(cx).value().to_string(),
             aux_input: selected(&self.aux.select, cx),
-            aux_app: selected(&self.aux_app, cx),
+            apps: self.apps.iter().map(|app| app.build(cx)).collect::<Result<Vec<_>, _>>()?,
             aux_channels: self.aux.channels.read(cx).value().to_string(),
             aux_to: selected(&self.aux_to, cx).unwrap_or_default(),
             output_gain_db: self.output_gain.read(cx).value().to_string(),
@@ -347,14 +472,10 @@ impl DeviceSetup {
                 .channels
                 .update(cx, |input, cx| input.set_disabled(busy || !available, cx));
         }
-        self.aux_app.update(cx, |state, cx| state.set_disabled(busy, window, cx));
-        let app = selected(&self.aux_app, cx);
-        if selected(&self.aux.select, cx).is_none() {
-            let available = app.as_ref().is_some_and(|path| self.catalog.apps.iter()
-                .any(|app| &app.path == path && app.target.is_ok()));
-            self.aux.channels.update(cx, |input, cx| input.set_disabled(busy || !available, cx));
-        }
-        let aux_disabled = busy || (selected(&self.aux.select, cx).is_none() && app.is_none());
+        self.app_picker.update(cx, |state, cx| state.set_disabled(busy, window, cx));
+        let has_send = selected(&self.send.select, cx).is_some();
+        for app in &self.apps { app.set_busy(busy, has_send, cx); }
+        let aux_disabled = busy || selected(&self.aux.select, cx).is_none();
         self.aux_to
             .update(cx, |state, cx| state.set_disabled(aux_disabled, window, cx));
         self.aux_gain
@@ -374,31 +495,8 @@ impl DeviceSetup {
             .gap_5()
             .child(section_title("01", "소스 선택"))
             .child(self.device_field(Endpoint::Mic, "new-mic", "내 목소리 · 필수", window, cx))
-            .child(self.device_field(Endpoint::Aux, "new-aux", "AUX / MR · 선택", window, cx))
-            .child(div().flex().flex_col().gap_2().min_w_0()
-                .child(div().font_semibold().child("AUX 앱 캡처 · 선택"))
-                .child(select_control("new-aux-app", "AUX 앱 캡처 · 선택", &self.aux_app, None, window, cx))
-                .child(div().text_xs().text_color(rgb(MUTED)).child("녹음 장치 또는 실행 중인 앱 하나를 선택하세요. 원래 앱 재생은 유지됩니다.")));
-        let app = selected(&self.aux_app, cx);
-        let device = selected(&self.aux.select, cx);
-        if let Some(path) = &app {
-            if device.is_none() {
-                sources = sources.child(div().flex().items_center().gap_3()
-                    .child(div().text_xs().text_color(rgb(MUTED)).child("앱 채널 1 또는 1,2"))
-                    .child(number_input("new-aux-app", &self.aux.channels, window, cx)));
-            }
-            let problem = match self.catalog.apps.iter().find(|app| &app.path == path) {
-                Some(app) => app.target.as_ref().err().cloned(),
-                None => Some("저장된 앱이 현재 실행 목록에 없습니다. 앱을 실행하고 장치 설정을 다시 여세요.".into()),
-            };
-            if let Some(problem) = problem {
-                sources = sources.child(div().text_xs().text_color(rgb(DANGER)).child(problem));
-            }
-            if device.is_some() {
-                sources = sources.child(div().text_xs().text_color(rgb(DANGER)).child("AUX 장치와 앱 중 하나만 선택하세요."));
-            }
-        }
-        if device.is_some() || app.is_some() {
+            .child(self.device_field(Endpoint::Aux, "new-aux", "AUX / MR · 선택", window, cx));
+        if selected(&self.aux.select, cx).is_some() {
             sources = sources.child(
                 div()
                     .flex()
@@ -424,7 +522,7 @@ impl DeviceSetup {
             div()
                 .text_xs()
                 .text_color(rgb(MUTED))
-                .child("AUX는 선택한 녹음 장치 또는 앱의 소리를 받으며 보컬 보정을 거치지 않습니다."),
+                .child("AUX는 선택한 녹음 장치의 소리를 받습니다. 앱 소스는 아래에서 별도로 추가합니다."),
         );
         let destinations = panel()
             .flex_1()
@@ -661,6 +759,7 @@ impl Render for SceneForm {
             }));
         if let Setup::Devices { fields, .. } = &self.setup {
             content = content.child(fields.render(window, cx))
+                .child(self.app_sources(fields, window, cx))
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child("채널은 이 WASAPI 장치가 노출한 번호입니다. ASIO·물리 단자·하드웨어 루프백 번호와의 대응은 장치에서 확인하세요."));
         }

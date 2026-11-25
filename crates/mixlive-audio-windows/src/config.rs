@@ -70,6 +70,47 @@ impl AuxDestination {
     }
 }
 
+/// Bound the real-time frame/queue and UI route matrix to eight independent applications.
+pub const MAX_APPS: usize = 8;
+
+/// A persistent source identity and its independent initial mix settings. No PID is stored.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppSource {
+    pub path: String,
+    pub channels: Vec<u16>,
+    pub gain_db: f32,
+    pub to: AuxDestination,
+    pub muted: bool,
+    pub output_gain_db: f32,
+    pub send_gain_db: f32,
+}
+
+impl AppSource {
+    pub fn new(path: String) -> Self {
+        Self { path, channels: vec![1, 2], gain_db: -12.0, to: AuxDestination::Off,
+            muted: false, output_gain_db: 0.0, send_gain_db: 0.0 }
+    }
+
+    fn validate(&self, has_send: bool) -> Result<(), String> {
+        if self.path.trim().is_empty() { return Err("application executable path must not be blank".into()); }
+        InputMap::new(&self.channels, 2)?;
+        if self.to.includes(1) && !has_send { return Err("application send destination requires --send".into()); }
+        for db in [self.gain_db, self.output_gain_db, self.send_gain_db] {
+            if !db.is_finite() || !(-96.0..=0.0).contains(&db) {
+                return Err("application trim/route gain must be finite and between -96 and 0 dB".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_app(path: &str) -> Result<AppSource, String> {
+    let app = AppSource::new(path.to_owned());
+    app.validate(true)?;
+    Ok(app)
+}
+
 /// Selected capture channels. Mono is duplicated; stereo order is preserved, never downmixed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputMap { pub left: usize, pub right: usize }
@@ -99,12 +140,12 @@ pub struct RouteOptions {
     #[arg(long, default_value_t = 1)]
     pub input_channel: u16,
     /// Optional capture endpoint carrying MR/line/virtual-cable audio, NOT an app name or playback ID.
-    #[arg(long, conflicts_with = "aux_app")]
+    #[arg(long)]
     pub aux_input: Option<String>,
-    /// Exact executable path from apps; capture that process tree, not the entire desktop.
-    #[arg(long, conflicts_with = "aux_input")]
-    pub aux_app: Option<String>,
-    /// One-based mono channel or stereo pair. App capture exposes channels 1 and 2.
+    /// Add an exact executable path from apps. Repeat for distinct trees; initially disconnected.
+    #[arg(long = "app", value_parser = parse_app)]
+    pub apps: Vec<AppSource>,
+    /// One-based mono channel or stereo pair for the physical AUX endpoint.
     #[arg(long, value_delimiter = ',', default_value = "1,2")]
     pub aux_channels: Vec<u16>,
     /// AUX trim before mixing (-96..0 dB); vocal effects never process this source.
@@ -155,7 +196,7 @@ pub struct RouteOptions {
 }
 
 impl RouteOptions {
-    pub fn has_aux(&self) -> bool { self.aux_input.is_some() || self.aux_app.is_some() }
+    pub fn has_aux(&self) -> bool { self.aux_input.is_some() }
 
     pub fn vocal_config(&self) -> VocalConfig {
         VocalConfig { preset: self.vocal, input_gain_db: self.input_gain_db, strength: self.vocal_strength,
@@ -176,12 +217,12 @@ impl RouteOptions {
             return Err("output and send channels must not overlap on the same endpoint".into());
         }
         let aux = InputMap::new(&self.aux_channels, u16::MAX)?;
-        if self.aux_input.is_some() && self.aux_app.is_some() {
-            return Err("choose an AUX device OR an application, not both".into());
-        }
-        if let Some(path) = &self.aux_app {
-            if path.trim().is_empty() { return Err("application executable path must not be blank".into()); }
-            InputMap::new(&self.aux_channels, 2)?;
+        if self.apps.len() > MAX_APPS { return Err(format!("at most {MAX_APPS} application sources are supported")); }
+        for (index, app) in self.apps.iter().enumerate() {
+            app.validate(self.send.is_some())?;
+            if self.apps[..index].iter().any(|other| other.path.eq_ignore_ascii_case(&app.path)) {
+                return Err(format!("duplicate application source: {}", app.path));
+            }
         }
         if self.has_aux() && self.aux_to.includes(1) && self.send.is_none() {
             return Err("AUX destination send/both requires --send; use --aux-to output for one mix".into());

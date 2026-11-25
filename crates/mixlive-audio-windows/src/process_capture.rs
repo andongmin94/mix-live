@@ -7,7 +7,7 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
-    sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::{self, SyncSender}},
+    sync::{Arc, atomic::{AtomicBool, Ordering}, mpsc::{self, Receiver, SyncSender}},
     thread::{self, JoinHandle},
 };
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
@@ -54,7 +54,8 @@ fn catalog_from_rows(rows: &[ProcessRow], own_pid: u32) -> Vec<AppInfo> {
         } else {
             Err(format!("{} independent process trees use this path; leave only the intended app instance running", candidates.len()))
         };
-        AppInfo { path, target }
+        let parents = target.as_ref().map(|target| ancestors(&indexed, target.pid)).unwrap_or_default();
+        AppInfo { path, target, ancestors: parents }
     }).collect()
 }
 
@@ -77,47 +78,60 @@ pub(crate) fn resolve(path: &str) -> Result<ProcessTarget, String> {
         .target
 }
 
-/// A running client whose stop/join follows the existing device-stream teardown.
+/// A prepared process client. Initialization of all app clients precedes stream start,
+/// so an early app cannot fill its bounded queue while another activation is pending.
 pub(crate) struct ProcessCapture {
     stop: Arc<AtomicBool>,
+    start: Option<SyncSender<()>>,
+    ready: Receiver<Result<(), String>>,
     thread: Option<JoinHandle<()>>,
     health: Arc<Health>,
 }
 
 impl ProcessCapture {
-    pub fn start(path: String, target: ProcessTarget, map: InputMap,
+    pub fn prepare(path: String, target: ProcessTarget, map: InputMap,
         writer: OutputWriter, health: Arc<Health>) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (start_tx, start_rx) = mpsc::sync_channel(1);
         let thread_stop = stop.clone();
         let thread_health = health.clone();
         let thread = thread::Builder::new().name("mixlive-app-capture".into()).spawn(move || {
-            let result = capture(&path, target, map, writer, &thread_stop, &thread_health, &ready_tx);
+            let result = capture((&path, target, map), writer, &thread_stop, &thread_health, &ready_tx, &start_rx);
             if let Err(error) = result {
                 let _ = ready_tx.try_send(Err(error));
                 thread_health.fail(Fault::Application);
             }
         }).map_err(|error| error.to_string())?;
-        let owner = Self { stop, thread: Some(thread), health };
-        match ready_rx.recv() {
-            Ok(Ok(())) => Ok(owner),
-            Ok(Err(error)) => Err(error),
-            Err(_) => Err("application capture thread exited during startup".into()),
-        }
+        let owner = Self { stop, start: Some(start_tx), ready: ready_rx, thread: Some(thread), health };
+        owner.wait_ready()?;
+        Ok(owner)
+    }
+
+    fn wait_ready(&self) -> Result<(), String> {
+        self.ready.recv().map_err(|_| "application capture thread exited during startup".to_owned())?
+    }
+
+    pub fn start(&mut self) -> Result<(), String> {
+        self.start.take().ok_or("application capture already started")?.send(())
+            .map_err(|_| "application capture thread exited before start")?;
+        self.wait_ready()
     }
 }
 
 impl Drop for ProcessCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        drop(self.start.take()); // also wake a prepared but unstarted client
         if let Some(thread) = self.thread.take() {
             if thread.join().is_err() { self.health.fail(Fault::Application); }
         }
     }
 }
 
-fn capture(path: &str, target: ProcessTarget, map: InputMap, mut writer: OutputWriter,
-    stop: &AtomicBool, health: &Health, ready: &SyncSender<Result<(), String>>) -> Result<(), String> {
+fn capture(binding: (&str, ProcessTarget, InputMap), mut writer: OutputWriter,
+    stop: &AtomicBool, health: &Health, ready: &SyncSender<Result<(), String>>, start: &Receiver<()>) -> Result<(), String> {
+    let (path, target, map) = binding;
     // Recheck the resolved identity immediately before opening the process-loopback client.
     if resolve(path)? != target { return Err("application process changed before capture started; start again".into()); }
     wasapi::initialize_mta().ok().map_err(|error| error.to_string())?;
@@ -132,6 +146,8 @@ fn capture(path: &str, target: ProcessTarget, map: InputMap, mut writer: OutputW
         let capture = client.get_audiocaptureclient().map_err(|error| error.to_string())?;
         // Process loopback's reported buffer size is unreliable. Allocate bounded scratch once.
         let mut packet = vec![0_u8; RATE as usize * FRAME_BYTES];
+        ready.send(Ok(())).map_err(|_| "application capture preparation was cancelled")?;
+        if start.recv().is_err() || stop.load(Ordering::Relaxed) || health.failed() { return Ok(()); }
         client.start_stream().map_err(|error| error.to_string())?;
         let running = (|| -> Result<(), String> {
             ready.send(Ok(())).map_err(|_| "application capture startup was cancelled")?;
@@ -197,6 +213,13 @@ mod tests {
         let apps = catalog_from_rows(&rows, 5);
         let find = |apps: &[AppInfo], path: &str| apps.iter().find(|app| app.path == path).unwrap().target.clone();
         assert_eq!(find(&apps, "chrome.exe").unwrap().pid, 2);
+        let chrome = apps.iter().find(|app| app.path == "chrome.exe").unwrap();
+        assert_eq!(chrome.ancestors, vec![1]);
+        let sources = [crate::config::AppSource::new("chrome.exe".into()), crate::config::AppSource::new("other.exe".into())];
+        assert_eq!(crate::devices::resolve_apps(&sources, &apps).unwrap().len(), 2);
+        let mut overlapping = apps.clone();
+        overlapping.iter_mut().find(|app| app.path == "other.exe").unwrap().ancestors.push(2);
+        assert!(crate::devices::resolve_apps(&sources, &overlapping).unwrap_err().contains("overlapping"));
         assert!(find(&apps, "launcher.exe").is_err());
         assert!(find(&apps, "mixlive.exe").is_err());
         assert_eq!(find(&apps, "other.exe").unwrap().pid, 6);

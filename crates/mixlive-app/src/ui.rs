@@ -443,10 +443,7 @@ impl MixLive {
                 controls.gain_db(GainTarget::Send).expect("send exists"),
             ));
         }
-        for source in [RouteSource::Mic, RouteSource::Aux] {
-            if source == RouteSource::Aux && !controls.has_aux() {
-                continue;
-            }
+        for source in controls.sources() {
             for mix in [RouteMix::Output, RouteMix::Send]
                 .into_iter()
                 .take(controls.mix_count())
@@ -721,13 +718,7 @@ impl MixLive {
                     route.input_channel, route.input_gain_db
                 ),
             ));
-        if let Some(app) = &route.aux_app {
-            sources = sources.child(device(
-                "AUX / MR · 앱 캡처",
-                app,
-                format!("프로세스 트리 · 채널 {} · {:+.1} dB", channels(&route.aux_channels), route.aux_gain_db),
-            ));
-        } else if let Some(aux) = &route.aux_input {
+        if let Some(aux) = &route.aux_input {
             sources = sources.child(device(
                 "AUX / MR",
                 aux,
@@ -744,6 +735,11 @@ impl MixLive {
                     .text_color(rgb(MUTED))
                     .child("AUX / MR 미선택"),
             );
+        }
+
+        for (index, app) in route.apps.iter().enumerate() {
+            sources = sources.child(device("앱 캡처", &app.path,
+                format!("App {} · 채널 {} · {:+.1} dB", index + 1, channels(&app.channels), app.gain_db)));
         }
 
         let mut sound = panel()
@@ -935,6 +931,7 @@ impl MixLive {
     fn mixer(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let controls = self.session.controls().expect("running session");
         let levels = self.session.levels.as_ref();
+        let scene = self.session.scene().expect("running Scene");
         let mut source_mutes = div().flex().items_center().gap_5().child(
             div()
                 .flex()
@@ -972,6 +969,15 @@ impl MixLive {
                         l.vocal.compression_db, l.vocal.deessing_db))
                 })),
         );
+        for (index, app) in scene.route.apps.iter().enumerate() {
+            let label = source_name(RouteSource::App(index), scene);
+            routing = routing.child(div().flex().flex_col().gap_2().pt_3().border_t_1().border_color(rgb(BORDER))
+                .child(div().flex().items_center().justify_between().gap_2()
+                    .child(div().flex_1().min_w_0().font_semibold().child(label.clone()))
+                    .child(self.mute(("mute-app", index), &format!("{label} 음소거"), MuteTarget::App(index), cx)))
+                .child(peak_meter("앱 입력 · trim/mute 전", levels.and_then(|l| l.app_inputs[index])))
+                .child(div().text_xs().text_color(rgb(MUTED)).truncate().child(app.path.clone())));
+        }
         for (mix_index, mix) in [RouteMix::Output, RouteMix::Send]
             .into_iter()
             .take(controls.mix_count())
@@ -992,13 +998,8 @@ impl MixLive {
                         .text_color(rgb(MUTED))
                         .child(format!("{destination}에 보내기")),
                 );
-            for (source_index, source) in
-                [RouteSource::Mic, RouteSource::Aux].into_iter().enumerate()
-            {
-                if source == RouteSource::Aux && !controls.has_aux() {
-                    continue;
-                }
-                let source_label = source_name(source);
+            for (source_index, source) in controls.sources().enumerate() {
+                let source_label = source_name(source, scene);
                 let (enabled, db) = controls
                     .route_state(source, mix)
                     .expect("configured route exists");
@@ -1015,7 +1016,7 @@ impl MixLive {
                                 .items_center()
                                 .justify_between()
                                 .gap_3()
-                                .child(div().text_sm().child(source_label))
+                                .child(div().text_sm().child(source_label.clone()))
                                 .child(
                                     toggle(
                                         ("route-enabled", key),
@@ -1313,10 +1314,15 @@ fn channels(values: &[u16]) -> String {
         .join(", ")
 }
 
-fn source_name(source: RouteSource) -> &'static str {
+fn source_name(source: RouteSource, scene: &mixlive_audio_windows::scene::AudioScene) -> String {
     match source {
-        RouteSource::Mic => "내 목소리",
-        RouteSource::Aux => "AUX / MR",
+        RouteSource::Mic => "내 목소리".into(),
+        RouteSource::Aux => "AUX / MR".into(),
+        RouteSource::App(index) => {
+            let app = &scene.route.apps[index];
+            let name = std::path::Path::new(&app.path).file_name().and_then(|name| name.to_str()).unwrap_or(&app.path);
+            format!("App {} · {name}", index + 1)
+        }
     }
 }
 

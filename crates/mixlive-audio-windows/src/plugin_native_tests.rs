@@ -20,13 +20,13 @@ fn wait_for(worker: &mut PluginWorker, health: &Health, frames: u64) {
 fn capture_queue_rejects_overflow_and_invalid_input_without_waiting() {
     let health = Arc::new(Health::default());
     let (writer, _reader) = RingBuffer::new(2);
-    let mut input = QueuedInput { writer, has_aux: true, health: health.clone() };
-    input.push(&[0.1; 3], Some(&[[0.2, -0.1]; 3]));
+    let mut input = QueuedInput { writer, has_aux: true, app_count: 0, health: health.clone() };
+    input.push(&[0.1; 3], Some(&[[0.2, -0.1]; 3]), &[]);
     assert_eq!(health.error(), Some("audio clock queue overflow; stopped instead of building unbounded latency"));
     let health = Arc::new(Health::default());
     let (writer, _reader) = RingBuffer::new(2);
-    let mut input = QueuedInput { writer, has_aux: false, health: health.clone() };
-    input.push(&[f32::NAN], None);
+    let mut input = QueuedInput { writer, has_aux: false, app_count: 0, health: health.clone() };
+    input.push(&[f32::NAN], None, &[]);
     assert!(health.failed());
 }
 
@@ -41,40 +41,46 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
         plugins.push(plugin);
     }
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, Some(0.0), true).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, Some(0.0), true, 2).unwrap());
+    controls.apply("route app1 send on".parse().unwrap()).unwrap();
+    controls.apply("route app2 output on".parse().unwrap()).unwrap();
     let (writer, mut reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        Some((0.0, AuxDestination::Send)), vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
+        Some((0.0, AuxDestination::Send)), &[0.0, 0.0], vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
     let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, true, health.clone()).unwrap();
     assert!(worker.description.contains("Serial chain: 2 effects"));
     assert!(worker.set_editor_open(0, true).unwrap_err().contains("no native editor"));
     assert!(!worker.editor_is_open(0));
     assert!(worker.set_editor_open(2, true).is_err());
     assert!(!health.failed());
-    for count in [1, 137, 256, 219, 923] { input.push(&vec![0.4; count], Some(&vec![[0.1, -0.2]; count])); }
+    for count in [1, 137, 256, 219, 923] {
+        input.push(&vec![0.4; count], Some(&vec![[0.1, -0.2]; count]),
+            &[&vec![[0.1, -0.05]; count], &vec![[0.04, 0.02]; count]]);
+    }
     wait_for(&mut worker, &health, 1536);
     for _ in 0..512 { reader.next_frame([1.0; 2]); }
-    for (actual, expected) in reader.next_frame([1.0; 2]).into_iter().zip([0.05, 0.05, 0.15, -0.15]) {
+    for (actual, expected) in reader.next_frame([1.0; 2]).into_iter().zip([0.09, 0.07, 0.25, -0.20]) {
         assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
     }
     for _ in 0..4096 { reader.next_frame([1.0; 2]); }
     // Editing the SECOND instance cannot alter the first or create another copy per output.
     worker.slots[1].plugin.lock().unwrap().set_parameter(0, 0.75).unwrap();
     assert!((worker.slots[0].plugin.lock().unwrap().get_parameter(0).unwrap() - 0.5).abs() < 1e-6);
-    input.push(&[0.4; 1536], Some(&[[0.1, -0.2]; 1536]));
+    input.push(&[0.4; 1536], Some(&[[0.1, -0.2]; 1536]),
+        &[&[[0.1, -0.05]; 1536], &[[0.04, 0.02]; 1536]]);
     wait_for(&mut worker, &health, 3072);
     for _ in 0..512 { reader.next_frame([1.0; 2]); }
-    for (actual, expected) in reader.next_frame([1.0; 2]).into_iter().zip([0.15, 0.15, 0.25, -0.05]) {
+    for (actual, expected) in reader.next_frame([1.0; 2]).into_iter().zip([0.19, 0.17, 0.35, -0.10]) {
         assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
     }
     worker.finish(None).unwrap();
     assert!(!health.failed());
 
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, None, false).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, None, false, 0).unwrap());
     let (writer, _reader) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        None, vec![(writer, vec![0])], health.clone(), controls).unwrap();
+        None, &[], vec![(writer, vec![0])], health.clone(), controls).unwrap();
     let plugins = vec![load_effect(&spec, 48000).unwrap(), load_effect(&fixture("MIXLIVE_STATE_VST3"), 48000).unwrap()];
     let error = spawn(capture, plugins, 48000, 30, false, health).err().unwrap();
     assert!(error.contains("slot 2") && error.contains("stereo"));

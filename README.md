@@ -4,22 +4,23 @@
 
 Windows용 실시간 마이크·MR 라우팅/믹싱/보정 앱을 만드는 프로젝트다. DAW 타임라인이나
 OBS 전용 플러그인이 아니다. 현재는 **GPUI Scene 실행 화면과 명령줄 도구를 제공하는 개발 빌드**다.
-자체 가상 마이크·ASIO는 아직 없다. 하나의 앱 프로세스 트리를 AUX로 직접 캡처할 수 있다. 실제 검증 결과와 미검증 범위는
+자체 가상 마이크·ASIO는 아직 없다. 물리 AUX와 최대 8개의 앱 프로세스 트리를 독립 소스로 직접 캡처할 수 있다. 실제 검증 결과와 미검증 범위는
 [STATUS.md](STATUS.md)를 따른다.
 
 ## 현재 처리 경로
 
 ```text
 마이크 → 입력 trim → 내장 보컬 보정 → 순차 stereo VST3 체인 → 목적지별 보내기 ─┐
-AUX/MR → 필요 시 입력 clock bridge → AUX trim → 목적지별 보내기 ─────────┴→ 믹스
+AUX/MR → 필요 시 입력 clock bridge → AUX trim → 목적지별 보내기 ─────────┤
+앱 1..8 → 각각의 입력 clock bridge → 앱별 trim → 목적지별 보내기 ───────────┴→ 믹스
 믹스 → 출력 clock bridge → master/send 음량·mute → sample clipping guard → 출력 장치
 ```
 
-보컬은 한 번만 처리하고 AUX에는 보컬 DSP/VST3를 걸지 않는다. 출력 믹스는 최대 두 개다.
+보컬은 한 번만 처리하고 AUX와 앱 소스에는 보컬 DSP/VST3를 걸지 않는다. 출력 믹스는 최대 두 개다.
 동일 endpoint의 분리 채널은 하나의 스트림/클럭을 공유하며 별도 장치는 bounded queue와
 Rubato sinc resampler로 연결한다. 오류 시 임의 장치 선택이나 원음 마이크 우회는 하지 않는다.
 
-VST3를 선택하면 장치 callback은 mic/AUX 프레임을 함께 bounded queue로 보낸다. 체인 전체에
+VST3를 선택하면 장치 callback은 mic/AUX/각 앱 프레임을 함께 bounded queue로 보낸다. 체인 전체에
 worker/입력 queue는 각각 하나다. 로딩·editor·state·종료는 main/제어 스레드에서 수행한다.
 호스트 내부 및 editor/control mutex는 남아 있으므로 **hard-real-time/무중단 보장은 없다.**
 VST3 미선택 시 기존 직접 처리 경로다. 제품 요구사항은 [DESIGN.md](DESIGN.md)를 따른다.
@@ -37,7 +38,7 @@ cargo build --release -p mixlive-app -p mixlive-audio-windows -p mixlive-vst3 --
 ### 네이티브 Scene 화면
 
 `mixlive.exe`에서 **새 Scene → 장치·보컬·VST3 선택 → 새 파일로 저장 → 오디오 시작** 순서로 시작할 수 있다.
-마이크와 주 출력은 직접 선택하며, AUX/MR 녹음 장치 또는 실행 중인 앱 하나와 추가 송출 재생 장치는 선택 사항이다.
+마이크와 주 출력은 직접 선택하며, AUX/MR 녹음 장치, 최대 8개의 실행 중인 앱, 추가 송출 재생 장치는 선택 사항이다. 앱 소스는 물리 AUX와 함께 사용할 수 있다.
 목록은 실제 WASAPI endpoint 이름·ID·기본 채널/샘플레이트/형식을 표시한다. 같은 이름이어도
 ID로 구분하며, 사용할 수 없는 설정은 이유를 표시한다. 장치를 연결한 뒤에는 새 Scene이나
 **장치·출력 설정**을 다시 열어 목록을 조회한다. 조회는 스트림을 만들지 않고 시스템 기본 장치를 바꾸지 않는다.
@@ -50,7 +51,7 @@ AUX를 추가 송출로 보내려면 해당 출력 장치도 선택해야 한다
 내장 보정 `off/natural/warm/bright`를 고를 수 있으며, 새 Scene의 초기값은 출력 −18 dB,
 AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. 전체/추가 송출/AUX 시작 음량과
 queue 목표, 입력 trim, 보정 비율, 컴프레서/디에서 threshold와 VST3 순서를 저장 전에 바꿀 수 있다.
-저장은 기존 schema 5의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
+저장은 기존 schema 6의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
 이전 Scene 선택을 유지한다. 장치와 현재 설정은 실제 시작 때 다시 검사한다.
 
 기존 체인은 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작**으로 실행한다.
@@ -87,11 +88,11 @@ VST3는 **파일 추가** 또는 Windows bundle용 **폴더 추가**로 선택�
 
 실행 중에는 다음을 화면에서 조절한다.
 
-- 고정 상단의 전체 출력 음소거, 소스별 mic/AUX 음소거, 출력별 음소거.
+- 고정 상단의 전체 출력 음소거, 소스별 mic/AUX/앱 음소거, 출력별 음소거.
 - 두 출력에 공통으로 적용되는 전체 음량과 추가 송출의 추가 감쇠.
 - 각 소스를 어느 출력에 보낼지 선택하는 스위치와 경로별 음량.
-- 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력과 주 출력/추가 송출 sample peak.
-  약 100ms 간격의 최대값을 dBFS로 표시한다. 소스 peak는 mute 전, AUX는 입력 trim 전이며
+- 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 주 출력/추가 송출 sample peak.
+  약 100ms 간격의 최대값을 dBFS로 표시한다. 소스 peak는 mute 전, AUX와 앱은 입력 trim 전이며
   출력 peak는 감쇠·mute·sample guard 후 장치 채널 매핑 전이다. 공유 endpoint의 두 믹스도 독립 계측한다.
   내장 보정 gain reduction과 초당 갱신되는 진단 수치는 같은 계측값을 사용한다. 가짜 level 애니메이션은 없다.
 
@@ -102,7 +103,7 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 
 실행 중 **정지 후 새 Scene 저장**을 선택하면 파일명 선택을 취소할 때는 오디오를 계속 실행하고,
 확정하면 장치 중지 → worker join → 모든 VST3 슬롯 상태 수집 → 새 Scene 저장을 수행한다.
-저장된 전체/추가 음량, 소스·출력·전체 mute, 네 경로의 연결·gain과 VST3 상태는 다음 명시적 시작부터
+저장된 전체/추가 음량, 소스·출력·전체 mute, 모든 경로의 연결·gain과 VST3 상태는 다음 명시적 시작부터
 적용된다. 초기 mute는 스트림 시작 전에 복원한다. 오류·상태 수집 실패·기존 파일 충돌 시 이전 Scene 선택을
 유지하고 새 파일을 게시하지 않는다. 일반 정지/창 닫기는 저장하지 않는다.
 장치·출력 및 보컬·VST3 시작 설정 편집은 정지 상태에서만 제공한다.
@@ -166,9 +167,9 @@ Windows가 stereo만 노출하면 ASIO 3/4를 만들어 주지 않는다.
 ```
 
 `--aux-input`은 **INPUT 목록의 캡처 endpoint**다. 분리된 루프백/라인 입력 또는 기존 가상
-케이블의 녹음 쪽을 받는다. 앱 직접 캡처는 별도의 --aux-app 옵션을 사용한다. 의도한 MR만 선택하고 MixLive 출력·
+케이블의 녹음 쪽을 받는다. 앱 직접 캡처는 별도의 `--app` 옵션을 사용한다. 의도한 MR만 선택하고 MixLive 출력·
 통화 수신음이 포함된 전체 루프백을 다시 넣지 않는다. 외부 피드백 자동 검출은 없다.
-`--aux-to send|output|both`의 기본 send-only는 이미 듣는 MR의 이중 모니터를 피한다.
+`--aux-to off|send|output|both`의 기본 send-only는 이미 듣는 MR의 이중 모니터를 피한다.
 send/both에는 `--send`가 필요하다. AUX gain은 -96..0 dB, mono 복제·stereo·역순을 지원한다.
 같은 INPUT ID의 mic 1/AUX 3,4는 한 스트림으로 추출하고 겹치는 채널은 거절한다.
 
@@ -177,28 +178,35 @@ send/both에는 `--send`가 필요하다. AUX gain은 -96..0 dB, mono 복제·st
 장치/비유한 sample/overflow 오류는 전체 경로 중단이다. `stream0`/`stream1` 통계는
 물리 출력 스트림 단위이며 `queue-ms`는 queue 목표이지 하드웨어 버퍼/실측 왕복 지연이 아니다.
 
-### 앱 직접 캡처 (Windows 11)
+### 다중 앱 직접 캡처 (Windows 11)
 
-앱을 실행한 뒤 장치·출력 설정의 **AUX 앱 캡처**에서 실제 실행 파일 경로를 선택한다.
-AUX 녹음 장치와 앱 중 하나만 사용할 수 있다. 앱은 기존 출력에서 계속 재생하며 기본 AUX
-목적지는 추가 송출이다. 주 출력에도 보내면 원래 소리와 이중 모니터링될 수 있다.
+실행 중인 앱을 장치·출력 설정의 **앱 소스** 목록에서 하나씩 추가한다. 최대 8개이며
+물리 AUX와 동시에 사용할 수 있다. 각 앱의 채널(1, 2 또는 stereo 순서), 입력 trim,
+시작 mute, 주 출력·추가 송출 연결 및 경로별 gain을 독립적으로 지정한다.
+새 앱의 두 경로는 모두 꺼져 있다. 통화 수신음을 통화 송출로 되돌리지 않도록 직접 연결한다.
+앱은 기존 장치로 계속 재생하므로 주 출력에 다시 보내면 이중 모니터링될 수 있다.
 
 ```powershell
 .\target\release\mixlive-audio.exe apps
-.\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --aux-app "C:\Program Files\Browser\browser.exe" --aux-to send --seconds 30
+.\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --app "C:\Program Files\Browser\browser.exe" --app "C:\Program Files\Call\call.exe" --interactive --seconds 3600
 ```
 
-`--aux-app`에는 apps가 표시한 정확한 실행 파일 경로를 지정한다. Scene에는 경로만 저장하고
-시작 때 해당 경로의 프로세스 트리 루트를 다시 조회한다. 동일 경로에 독립 루트가 둘 이상이면
-거절하고 MixLive가 포함된 트리도 거절한다. 시작 후 다른 PID로 자동 전환하지 않는다.
-Windows Process Loopback의 include-tree 모드만 사용하며 전체 시스템 캡처로 대체하지 않는다.
-별도 MTA 스레드에서 float32 stereo 48 kHz를 요청하고 기존 AUX clock bridge를 재사용한다.
-앱의 원래 재생이나 개별 브라우저 탭 제어, 다중 앱 동시 캡처, 자체 private render endpoint는 제공하지 않는다.
-실제 프로세스 오디오 수신은 실장비 확인이 필요하다.
+`--app`은 정확한 실행 파일 경로를 반복 지정한다. 이 예에서는 `route app1 send on`으로
+첫 앱만 송출에 연결할 수 있다. `route app2 send off`로 두 번째 앱의 송출 제외를 확인한다.
+번호는 현재 Scene의 목록 순서이며, 영구 ID는 실행 파일 경로다. Scene에는 PID를 저장하지 않는다.
+동일 경로의 여러 독립 루트, 중복 경로, 서로 포함 관계인 프로세스 트리, MixLive를 포함한
+트리는 거절한다. Windows Process Loopback의 include-tree 모드만 사용하며 전체 데스크톱
+캡처나 다른 PID로 자동 전환하지 않는다.
+
+각 앱은 별도 MTA 스레드, float32 stereo 48 kHz와 독립 bounded clock bridge를 사용한다.
+모든 앱 클라이언트를 준비한 뒤 시작하고, 실제 믹싱 및 VST3 worker의 source 순서는 하나의
+세션으로 유지된다. 앱별 실시간 peak와 mute, 목적지별 연결·gain을 표시하며 정지 후 Scene 저장에
+함께 기록한다. 탭 선택, 자체 private render endpoint, 자동 재연결은 없다.
+실제 앱의 동시 오디오 수신과 지연·장시간 안정성은 실장비에서 확인해야 한다.
 
 ## 장치·보컬·VST3를 Scene 하나로 재실행
 
-**Scene schema 5**는 mic/AUX/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
+**Scene schema 6**는 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
 한 파일에 담는다. 기존 체인을 넣으면 상태 바이트를 복사하므로 원래 체인 JSON은 재실행에
 필요하지 않다. 플러그인 DLL과 외부 샘플/라이선스 등은 여전히 설치되어 있어야 한다.
 
@@ -221,7 +229,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. CLI는 실행 중
 GUI의 정지 후 새 Scene 저장에서만 전체 실행 상태를 저장한다. CLI에서 편집한 VST3 상태는 새 체인 파일로 내보낸 뒤 다음 `scene save`에 넣는다.
 
 상대 경로는 들어 있던 chain/scene 파일 기준으로 해석한다. CLI에서 지정한 경로는 현재 작업
-폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~4는 읽지 않으며 현재 옵션으로
+폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~5는 읽지 않으며 현재 옵션으로
 다시 저장한다. 마이그레이션/누락값 복구는 없다. Scene에는 개인 장치 ID와 플러그인 상태가
 포함되므로 공개하지 않는다. `*.mixlive-scene.json`은 Git에서 제외한다.
 
@@ -231,14 +239,14 @@ GUI의 정지 후 새 Scene 저장에서만 전체 실행 상태를 저장한다
 
 | 명령 | 동작 |
 |---|---|
-| `mute/unmute mic|aux|output|send|all` | 소스·출력·전체 음소거 |
+| `mute/unmute mic|aux|appN|output|send|all` | 소스·출력·전체 음소거 |
 | `gain master -18`, `gain send -6` | 공통 출력/두 번째 믹스 추가 감쇠 |
 | `route mic output off`, `route mic output on` | 내 목소리의 첫 믹스 포함 여부 |
 | `route aux send off` | 두 번째 믹스의 MR만 제외 |
 | `level aux send -6`, `level mic output -9` | 지정 경로만 추가 감쇠 -96..0 dB |
 | `status`, `stop` | 요청된 제어 상태 / 장치 해제 후 종료 |
 
-일반형은 `route mic|aux output|send on|off`, `level mic|aux output|send <dB>`다.
+일반형은 `route mic|aux|appN output|send on|off`, `level mic|aux|appN output|send <dB>`다. `appN`은 1부터 시작하는 현재 앱 슬롯이다.
 꺼둔 경로의 level 변경은 켜짐이 아니고 전체 unmute도 개별 mute를 풀지 않는다.
 source/route 제어는 합산 전이어서 출력 queue 지연이 남는다. 급한 송출 중단은 queue 뒤의
 `mute send`/`mute all`을 사용한다. mute 중에도 queue를 소비해 오래된 소리를 재생하지 않는다.
@@ -304,7 +312,7 @@ cargo run -p mixlive-core --example discord_singing --locked
 ```
 
 Windows CI의 기존 native fixture 검사도 따른다. 화면 검사는 UIAutomation과 Windows 키보드
-입력으로 실제 창과 컨트롤을 조작한다. 임시 Scene의 장치 ID와 플러그인 경로는 합성 값이며
+입력으로 실제 창과 컨트롤을 조작한다. 임시 Scene의 장치 ID, 앱 실행 파일 및 플러그인 경로는 합성 값이며
 오디오 시작을 누르지 않는다.
 장치 편집은 실제 목록 조회 후 누락 ID·채널·시작값 유지, 저장 거절과 취소를 확인한다.
 장치 교체 후 성공적인 파일 저장/재열기는 합성 catalog를 쓰는 모델 검사이며 실제 장치 검증과 구분한다.

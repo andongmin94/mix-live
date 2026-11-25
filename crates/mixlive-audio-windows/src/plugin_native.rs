@@ -1,27 +1,38 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
 use super::{ChainFile, EffectSpec, ResolvedPlugins};
-use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}};
+use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}, config::MAX_APPS};
 use mixlive_vst3::editor::flush_editor_changes;
 use rtrb::{Producer, RingBuffer};
 use std::{path::Path, sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
 use vst3_host::{Plugin, PluginWindow, Vst3Host, audio::BusAudioBuffers, plugin::ProcessMode};
 
-// Mic and clock-converted AUX travel together. The chain only processes the mic.
+// All clock-converted source samples travel together; only the mic enters VST3.
+// Fixed-capacity frames are copied by value. No callback allocation or extra processing worker.
+struct CaptureFrame {
+    mic: f32,
+    aux: [f32; 2],
+    apps: [[f32; 2]; MAX_APPS],
+}
+
 pub(crate) struct QueuedInput {
-    writer: Producer<[f32; 3]>,
+    writer: Producer<CaptureFrame>,
     has_aux: bool,
+    app_count: usize,
     health: Arc<Health>,
 }
 impl QueuedInput {
-    fn push(&mut self, mic: &[f32], aux: Option<&[[f32; 2]]>) {
+    fn push(&mut self, mic: &[f32], aux: Option<&[[f32; 2]]>, apps: &[&[[f32; 2]]]) {
         if self.health.failed() { return; }
-        if aux.is_some() != self.has_aux || aux.is_some_and(|a| a.len() != mic.len()) {
+        if aux.is_some() != self.has_aux || aux.is_some_and(|a| a.len() != mic.len())
+            || apps.len() != self.app_count || apps.iter().any(|a| a.len() != mic.len()) {
             self.health.fail(Fault::Input); return;
         }
         for (i, &voice) in mic.iter().enumerate() {
             let music = aux.map_or([0.0; 2], |a| a[i]);
-            let frame = [voice, music[0], music[1]];
-            if frame.iter().any(|s| !s.is_finite()) {
+            let mut frame = CaptureFrame { mic: voice, aux: music, apps: [[0.0; 2]; MAX_APPS] };
+            for (dst, app) in frame.apps.iter_mut().zip(apps) { *dst = app[i]; }
+            if !voice.is_finite() || music.iter().any(|s| !s.is_finite())
+                || frame.apps[..self.app_count].iter().flatten().any(|s| !s.is_finite()) {
                 self.health.fail(Fault::Input); return;
             }
             if self.writer.push(frame).is_err() {
@@ -33,8 +44,8 @@ impl QueuedInput {
 
 pub(crate) enum CaptureSink { Direct(Box<Capture>), Queued(QueuedInput) }
 impl CaptureSink {
-    pub fn push(&mut self, mic: &[f32], aux: Option<&[[f32; 2]]>) {
-        match self { Self::Direct(capture) => capture.push(mic, aux), Self::Queued(input) => input.push(mic, aux) }
+    pub fn push(&mut self, mic: &[f32], aux: Option<&[[f32; 2]]>, apps: &[&[[f32; 2]]]) {
+        match self { Self::Direct(capture) => capture.push(mic, aux, apps), Self::Queued(input) => input.push(mic, aux, apps) }
     }
 }
 
@@ -118,7 +129,8 @@ fn spawn(mut capture: Capture, plugins: Vec<Plugin>, rate: u32, queue_ms: u32, h
         return Err("invalid VST3 chain/rate/queue capacity".into());
     }
     let capacity = (rate as usize * queue_ms as usize / 1000).max(CAPTURE_BLOCK * 2);
-    let (writer, mut reader) = RingBuffer::<[f32; 3]>::new(capacity);
+    let app_count = capture.app_count();
+    let (writer, mut reader) = RingBuffer::<CaptureFrame>::new(capacity);
     let mut owner = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots: Vec::new(),
         stopped: false, health: health.clone(), description: String::new() };
     let mut processors = Vec::new();
@@ -150,21 +162,24 @@ fn spawn(mut capture: Capture, plugins: Vec<Plugin>, rate: u32, queue_ms: u32, h
     owner.thread = Some(thread::Builder::new().name("mixlive-vst3-audio".into()).spawn(move || {
         let mut mic = [0.0; CAPTURE_BLOCK];
         let mut aux = [[0.0; 2]; CAPTURE_BLOCK];
+        let mut app_buffers = [[[0.0; 2]; CAPTURE_BLOCK]; MAX_APPS];
         while !stop.load(Ordering::Relaxed) && !worker_health.failed() {
             let count = reader.slots().min(CAPTURE_BLOCK);
             if count == 0 { thread::sleep(Duration::from_millis(1)); continue; }
             for i in 0..count {
                 let Ok(frame) = reader.pop() else { worker_health.fail(Fault::Routing); return; };
-                mic[i] = frame[0]; aux[i] = [frame[1], frame[2]];
+                mic[i] = frame.mic; aux[i] = frame.aux;
+                for (buffer, sample) in app_buffers.iter_mut().zip(frame.apps).take(app_count) { buffer[i] = sample; }
             }
-            capture.push_with_effect(&mic[..count], has_aux.then_some(&aux[..count]), &mut |voice, left, right| {
+            let apps: [&[[f32; 2]]; MAX_APPS] = std::array::from_fn(|slot| &app_buffers[slot][..count]);
+            capture.push_with_effect(&mic[..count], has_aux.then_some(&aux[..count]), &apps[..app_count], &mut |voice, left, right| {
                 left.copy_from_slice(voice);
                 right.copy_from_slice(voice);
                 process_chain(&mut processors, left, right)
             });
         }
     }).map_err(|e| e.to_string())?);
-    Ok((QueuedInput { writer, has_aux, health }, owner))
+    Ok((QueuedInput { writer, has_aux, app_count, health }, owner))
 }
 
 /// Worker is already joined. Always attempt stop, including when the final flush fails.

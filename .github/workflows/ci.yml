@@ -228,10 +228,14 @@ jobs:
           $savedPath = Join-Path $sceneDirectory 'Edited scene.mixlive-scene.json'
           $pluginPath = Join-Path $sceneDirectory 'not-installed.vst3'
           $scene = [ordered]@{
-            schema = 5
+            schema = 6
             route = [ordered]@{
               input = 'ci-absent-mic'; input_channel = 2
-              aux_input = 'ci-absent-aux'; aux_app = $null; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
+              aux_input = 'ci-absent-aux'; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
+              apps = @(
+                [ordered]@{ path = 'C:\ci-fixtures\missing-browser.exe'; channels = @(1, 2); gain_db = -12; to = 'send'; muted = $false; output_gain_db = -7; send_gain_db = -3 },
+                [ordered]@{ path = 'C:\ci-fixtures\missing-call.exe'; channels = @(2, 1); gain_db = -9; to = 'output'; muted = $true; output_gain_db = -5; send_gain_db = -11 }
+              )
               output = 'ci-absent-output'; output_channels = @(4, 3)
               send = 'ci-absent-send'; send_channels = @(1)
               input_gain_db = 1.25; output_gain_db = -23; send_gain_db = -6
@@ -391,14 +395,25 @@ jobs:
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
             if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
             $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json
-            if ($saved.schema -ne 5 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
+            if ($saved.schema -ne 6 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
               throw 'The saved Scene did not contain the edited vocal values'
             }
             foreach ($field in $scene.route.Keys) {
               if ($field -in @('input_gain_db', 'vocal_strength')) { continue }
               $expected = $scene.route[$field]
               $actual = $saved.route.$field
-              if ($expected -is [array]) {
+              if ($field -eq 'apps') {
+                if (@($actual).Count -ne $expected.Count) { throw 'Sound editing changed app source count' }
+                for ($i = 0; $i -lt $expected.Count; $i++) {
+                  foreach ($key in $expected[$i].Keys) {
+                    if ($key -eq 'channels') {
+                      if (($actual[$i].channels -join ',') -cne ($expected[$i].channels -join ',')) { throw 'Sound editing changed app channels' }
+                    } elseif ($actual[$i].$key -cne $expected[$i][$key]) {
+                      throw "Sound editing changed app slot $i field $key"
+                    }
+                  }
+                }
+              } elseif ($expected -is [array]) {
                 if (@($actual).Count -ne $expected.Count -or ($actual -join ',') -cne ($expected -join ',')) {
                   throw "Sound editing changed the route array: $field"
                 }

@@ -20,6 +20,25 @@ pub struct AppInfo {
     pub path: String,
     /// Multiple independent roots or a tree containing MixLive are not selectable.
     pub target: Result<ProcessTarget, String>,
+    /// Ancestor PIDs observed in this same snapshot; used only to reject overlapping trees.
+    pub ancestors: Vec<u32>,
+}
+
+/// Match every selected path against one catalog snapshot. Overlapping process trees
+/// would capture the same audio twice, so reject them before native activation.
+pub fn resolve_apps(sources: &[crate::config::AppSource], catalog: &[AppInfo]) -> Result<Vec<ProcessTarget>, String> {
+    let mut selected: Vec<(&AppInfo, ProcessTarget)> = Vec::with_capacity(sources.len());
+    for source in sources {
+        let app = catalog.iter().find(|app| app.path == source.path)
+            .ok_or_else(|| format!("application is not running: {}", source.path))?;
+        let target = *app.target.as_ref().map_err(Clone::clone)?;
+        if selected.iter().any(|(other, previous)| previous.pid == target.pid
+            || app.ancestors.contains(&previous.pid) || other.ancestors.contains(&target.pid)) {
+            return Err(format!("overlapping application process trees: {}", source.path));
+        }
+        selected.push((app, target));
+    }
+    Ok(selected.into_iter().map(|(_, target)| target).collect())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
