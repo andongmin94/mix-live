@@ -158,6 +158,7 @@ impl SceneDraft {
             return Err("AUX를 방송에 보내려면 방송 송출 장치를 선택하세요.".into());
         }
         let vocal = self.sound.vocal_config()?;
+        let (pitch_key, pitch_scale) = self.sound.pitch_reference()?;
         let route =
             RouteOptions {
                 input: input.id.clone(),
@@ -179,6 +180,8 @@ impl SceneDraft {
                 send_gain_db: number(&self.send_gain_db, "추가 송출 감쇠")?,
                 broadcast_gain_db: number(&self.broadcast_gain_db, "방송 송출 감쇠")?,
                 vocal: vocal.preset,
+                pitch_key,
+                pitch_scale,
                 vocal_strength: vocal.strength,
                 vocal_threshold_db: vocal.compressor_threshold_db,
                 deess_threshold_db: vocal.deess_threshold_db,

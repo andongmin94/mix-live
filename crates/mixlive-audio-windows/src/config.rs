@@ -66,6 +66,36 @@ pub enum SceneCommand {
     },
 }
 
+/// Reference scale for the microphone tuner; does not alter audio.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum PitchScale {
+    #[default]
+    Chromatic,
+    Major,
+    Minor,
+}
+impl PitchScale {
+    pub const NAMES: [&'static str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+    pub fn name(self) -> &'static str {
+        match self { Self::Chromatic => "chromatic", Self::Major => "major", Self::Minor => "minor" }
+    }
+
+    /// Nearest allowed equal-tempered MIDI note; exact ties choose the lower note.
+    /// Call with a validated root (0..=11) and a finite MIDI pitch.
+    pub fn nearest_note(self, root: u8, midi: f64) -> u8 {
+        let allowed: &[u8] = match self {
+            Self::Chromatic => &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            Self::Major => &[0, 2, 4, 5, 7, 9, 11],
+            Self::Minor => &[0, 2, 3, 5, 7, 8, 10],
+        };
+        (0..=127_u8).filter(|note| allowed.contains(&((note % 12 + 12 - root) % 12)))
+            .min_by(|a, b| (f64::from(*a) - midi).abs().total_cmp(&(f64::from(*b) - midi).abs()))
+            .expect("every valid scale contains MIDI notes")
+    }
+}
+
 /// Three fixed logical destinations, independent of selected physical endpoints.
 pub const MAX_MIXES: usize = 3;
 
@@ -211,6 +241,12 @@ pub struct RouteOptions {
     #[arg(long, default_value_t = Preset::Off)]
     #[serde(with = "preset_serde")]
     pub vocal: Preset,
+    /// Root pitch class (0=C, 1=C#, ..., 11=B) for major/minor tuning reference.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=11))]
+    pub pitch_key: u8,
+    /// Microphone tuner reference scale; no automatic pitch shift.
+    #[arg(long, value_enum, default_value = "chromatic")]
+    pub pitch_scale: PitchScale,
     /// Dry/processed blend (0..1), not loudness matching.
     #[arg(long, default_value = "1")]
     pub vocal_strength: f32,
@@ -312,6 +348,7 @@ impl RouteOptions {
         self.echo_feedback = config.echo.feedback;
     }
     pub fn validate(&self) -> Result<(), String> {
+        if self.pitch_key > 11 { return Err("pitch-key must be in 0..=11 (C..B)".into()); }
         if self.input.trim().is_empty() || self.output.trim().is_empty() || self.input_channel == 0 {
             return Err("explicit endpoint IDs and a one-based input channel are required".into());
         }

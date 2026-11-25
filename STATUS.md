@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **가상 장치 개발 패키지 빌드 완료 · 출력 sample limiter 및 음정 관측 추가**
+단계: **가상 장치 개발 패키지 빌드 완료 · 출력 리미터 및 스케일 기준 음정 관측**
 
 ## 현재 구현
 
@@ -23,8 +23,10 @@
   출력의 기존 개별 sample clamp를 믹스별 stereo-linked limiter로 교체했다. ceiling 0.98,
   즉시 감쇠/최대 80 ms 선형 회복, lookahead 없음. 각 믹스의 pre-limit peak와 GR 및
   endpoint의 감쇠 frame 수를 표시한다. true peak·청력 보호·피드백 방지는 아니다.
-  마이크 raw window를 기존 bounded SPSC로 control thread에 전달하여 McLeod pitch 추정
-  (70..1200 Hz, A440 note/cents/clarity)을 표시한다. 자동 보정·오디오 변경·녹음은 없다.
+  마이크 raw window를 기존 bounded SPSC로 control thread에 전달한다. RustFFT 자기상관과
+  정확한 중첩 에너지 정규화로 pitch(70..1200 Hz, A440 note/cents/clarity)를 추정한다.
+  Scene에 chromatic/major/natural minor 및 기준 조성을 저장하고 가장 가까운 허용음과 편차를 표시한다.
+  자동 보정·오디오 변경·녹음은 없다.
 - 정지 상태의 장치·출력 설정은 기존 장치/앱·채널·보컬·플러그인 설정과 모든 앱의 mixer 값을
   보존한다. 누락/지원 불가 장치와 앱을 명시하며 저장/시작을 거절하고 임의로 대체하지 않는다.
   보컬 설정은 장치 조회 없이 preset·trim·strength·threshold·VST3 순서와 상태를 편집한다.
@@ -56,11 +58,11 @@
 - 정지 후 새 Scene 저장은 장치 중지 → 앱 capture thread join → VST3 worker join → 모든
   상태 수집 → 새 파일 게시를 사용한다. 실행 중 모든 소스/출력 mute·route·gain, 보컬 파라미터와 VST3 상태를
   다음 시작 전에 복원한다. 일반 정지/닫기/오류는 저장하지 않으며 파일 덮어쓰기 없음.
-  schema 11은 EQ·다이내믹스·에코 설정과 슬롯별 `bypassed`와 `route.apps` 배열(실행 파일 경로와 슬롯별 설정), 방송 장치·채널·감쇠와 각 믹스의 상태 및 리버브 설정을 저장하고 PID나 잔향 버퍼는 저장하지 않는다.
+  schema 12는 음정 기준 및 EQ·다이내믹스·에코 설정과 슬롯별 `bypassed`와 `route.apps` 배열(실행 파일 경로와 슬롯별 설정), 방송 장치·채널·감쇠와 각 믹스의 상태 및 리버브 설정을 저장하고 PID나 잔향 버퍼는 저장하지 않는다.
   CLI의 직접 `run`/`scene run --scene-out`도 같은 전체 snapshot을 정상 정지 후 새 파일에 저장한다.
   종료 시 console 명령을 닫아 늦은 입력이 snapshot을 바꾸지 못하게 한다. 기존 파일·chain-out 동시 요청은
   시작 전에 거절한다. VST3 chain schema는 2이며 bypassed는 필수다.
-  Scene schema 1~10 및 chain schema 1, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
+  Scene schema 1~11 및 chain schema 1, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
   `appN` 제어 명령을 사용한다.
 
 - `drivers/virtual-audio/`에 고정 Call/Broadcast/Return PnP 하드웨어 ID와 독립 render/capture
@@ -101,10 +103,12 @@
   GUI 자동화에서 `VST3 검색 결과` 접근성 이름 조회가 실패했다. 검색 완료 후 다시 검색 버튼이
   표시되는 계약으로 수정했다.
 - [Audio #43](https://github.com/andongmin94/mix-live/actions/runs/45581536089) `561caff`:
-  EQ/다이내믹스 workspace 테스트 성공, 마지막 확인 당시 native/Clippy/release/GUI 통합 검사는 미완료.
-- 출력 리미터 및 pitch 관측: stereo 비율/회복/믹스 격리/계측, 합성 주파수·cent·침묵·window
-  경계/느린 관측기 테스트를 추가했다. 이전 CI를 취소하지 않도록 개발 브랜치에서 통합 검사한다.
-  새 변경의 실행 결과는 아직 확인하지 않았다.
+  EQ/다이내믹스 workspace·native·Clippy·release·CLI·GPUI 검사 전체 성공.
+- [Audio #44](https://github.com/andongmin94/mix-live/actions/runs/45582621843) `dedd686`:
+  limiter의 stereo 비율/회복/믹스 격리/계측 테스트 성공. 기존 pitch-detection 정규화로 인해
+  낮은 합성음 검출 테스트가 실패했다. 기존 FFT dependency를 직접 사용하고 lag별 양쪽 중첩 에너지를
+  계산하도록 교체했다. 75..1190 Hz 순음, 대역 밖 거절, 배음 포함, 기준 스케일·Scene/UI 검사를 추가했다.
+  [PR #1](https://github.com/andongmin94/mix-live/pull/1)의 수정된 통합 검사 결과는 아직 확인하지 않았다.
 
 ## 남은 작업과 제한
 

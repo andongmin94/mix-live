@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use mixlive_audio_windows::{
-    config::RouteOptions,
+    config::{PitchScale, RouteOptions},
     plugin::{EffectSpec, PluginArgs},
     scene::AudioScene,
 };
@@ -12,6 +12,8 @@ use mixlive_effects::{DynamicsConfig, EchoConfig, EqConfig, Preset, ReverbConfig
 #[derive(Clone, Debug)]
 pub struct SoundDraft {
     pub preset: String,
+    pub pitch_key: String,
+    pub pitch_scale: String,
     pub input_gain_db: String,
     pub strength: String,
     pub compressor_threshold_db: String,
@@ -41,12 +43,17 @@ impl Default for SoundDraft {
 
 impl SoundDraft {
     pub fn from_scene(scene: &AudioScene) -> Self {
-        Self::from_config(scene.route.vocal_config(), scene.effects.clone())
+        let mut draft = Self::from_config(scene.route.vocal_config(), scene.effects.clone());
+        draft.pitch_key = scene.route.pitch_key.to_string();
+        draft.pitch_scale = scene.route.pitch_scale.name().into();
+        draft
     }
 
     pub fn from_config(config: VocalConfig, effects: Vec<EffectSpec>) -> Self {
         Self {
             preset: config.preset.to_string(),
+            pitch_key: "0".into(),
+            pitch_scale: "chromatic".into(),
             input_gain_db: config.input_gain_db.to_string(),
             strength: config.strength.to_string(),
             compressor_threshold_db: config.compressor_threshold_db.to_string(),
@@ -67,6 +74,12 @@ impl SoundDraft {
             echo_feedback: config.echo.feedback.to_string(),
             effects,
         }
+    }
+
+    pub fn pitch_reference(&self) -> Result<(u8, PitchScale), String> {
+        let key = self.pitch_key.parse::<u8>().ok().filter(|key| *key < 12).ok_or("음정 기준 조성을 선택하세요.")?;
+        let scale = <PitchScale as clap::ValueEnum>::from_str(&self.pitch_scale, false).map_err(|_| "음정 기준 스케일을 선택하세요.")?;
+        Ok((key, scale))
     }
 
     pub fn vocal_config(&self) -> Result<VocalConfig, String> {
@@ -113,6 +126,7 @@ impl SoundDraft {
         let config = self.vocal_config()?;
         let mut route = route.clone();
         route.set_vocal_config(config);
+        (route.pitch_key, route.pitch_scale) = self.pitch_reference()?;
         AudioScene::new(route, self.effects.clone()).map_err(|error| error.to_string())
     }
 
@@ -203,6 +217,7 @@ mod tests {
             "-25.25",
             "--vocal",
             "warm",
+            "--pitch-key", "9", "--pitch-scale", "minor",
             "--vocal-strength",
             "0.625",
             "--vocal-threshold-db",
@@ -248,6 +263,8 @@ mod tests {
         assert_eq!(unchanged.effects, original.effects);
 
         draft.preset = "bright".into();
+        draft.pitch_key = "2".into();
+        draft.pitch_scale = "major".into();
         draft.input_gain_db = " -3.25 ".into();
         draft.strength = "0.375".into();
         draft.compressor_threshold_db = "-18.5".into();
@@ -269,6 +286,8 @@ mod tests {
         let changed = draft.apply_to(&original.route).unwrap();
         let mut expected = original.route.clone();
         expected.vocal = Preset::Bright;
+        expected.pitch_key = 2;
+        expected.pitch_scale = PitchScale::Major;
         expected.input_gain_db = -3.25;
         expected.vocal_strength = 0.375;
         expected.vocal_threshold_db = -18.5;
@@ -379,6 +398,12 @@ mod tests {
             assert!(draft.apply_to(&original.route).is_err());
         }
         let mut draft = SoundDraft::from_scene(&original);
+        draft.pitch_key = "12".into();
+        assert!(draft.apply_to(&original.route).is_err());
+        draft.pitch_key = "0".into();
+        draft.pitch_scale = "invalid".into();
+        assert!(draft.apply_to(&original.route).is_err());
+        draft.pitch_scale = "chromatic".into();
         draft.preset = "unknown".into();
         assert!(draft.vocal_config().is_err());
         draft.preset = "off".into();

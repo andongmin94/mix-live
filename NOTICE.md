@@ -158,14 +158,15 @@ DEALINGS IN THE SOFTWARE.
 
 ## 마이크 음정 관측
 
-- pitch-detection 0.3.0 (MIT/Apache-2.0), Alessandro Genova:
-  https://crates.io/crates/pitch-detection/0.3.0
-  Registry checksum: `e086e70dfcfd46cd6097c501a66fb07cd73ee8c27844b0941d9b2b3e43dfbf92`.
-  McLeod detector의 기존 API를 control thread에서만 사용한다. 새로운 detector 구현을 복사하지 않는다.
-  RustFFT 6.4.1, primal-check 0.3.4, transpose 0.2.3, strength_reduce 0.2.4가 잠금 파일에 추가되며 기존 num-*를 재사용한다.
-  이 기능은 pitch correction이나 시프팅이 아니다. 원본 MIT 고지 blob: `005bb79429aa833730ce9fbc08da69c2411b9541`.
+- RustFFT 6.4.1 (MIT OR Apache-2.0): https://github.com/ejmahler/RustFFT
+  Registry checksum: `21db5f9893e91f41798c88680037dba611ca6674703c1a18601b01a72c8adb89`.
+  기존 transitive dependency를 직접 사용한다. 문제가 확인된 pitch-detection 0.3.0은 제거했다.
+  FFT 계획·scratch를 재사용하고 중첩 에너지 정규화는 MixLive가 계산한다.
+  참고: P. McLeod, G. Wyvill, "A Smarter Way to Find Pitch" (ICMC 2005).
+  추가 패키지 없이 primal-check 0.3.4, transpose 0.2.3, strength_reduce 0.2.4 및 기존 num-*를 유지한다.
+  원본 MIT 고지 blob: `75dbd461c0fd6d98ea271f2f4be397ff2d8eeaeb`.
 
-Copyright (c) 2019-2022 Alessandro Genova
+Copyright (c) 2015 The RustFFT Developers
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

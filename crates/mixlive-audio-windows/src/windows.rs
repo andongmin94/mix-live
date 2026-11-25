@@ -5,7 +5,7 @@ use mixlive_effects::VocalChain;
 use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget, resolve_apps};
 use crate::process_capture::{self, ProcessCapture};
 use crate::pitch::{self, PitchMonitor, PitchReading, PitchTap};
-use crate::{bridge::{self, Fault, Health, LimiterReading, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{InputMap, OutputMap, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{LiveControls, PlaybackGains, RouteSource}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
+use crate::{bridge::{self, Fault, Health, LimiterReading, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{InputMap, OutputMap, PitchScale, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{LiveControls, PlaybackGains, RouteSource}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -73,6 +73,8 @@ pub struct Prepared {
     auxiliary: Option<AuxiliaryEndpoint>,
     apps: Vec<(String, ProcessTarget, InputMap)>,
     vocal: VocalChain,
+    pitch_key: u8,
+    pitch_scale: PitchScale,
     output_gain_db: f32,
     mix_gains_db: [f32; MAX_MIXES],
     queue_ms: u32,
@@ -153,6 +155,7 @@ impl Prepared {
         };
         for (mix, id, channels) in options.playback_bindings() { add(id, channels, mix)?; }
         Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal,
+            pitch_key: options.pitch_key, pitch_scale: options.pitch_scale,
             auxiliary, apps,
             output_gain_db: options.output_gain_db, mix_gains_db: [options.monitor_gain_db, options.send_gain_db, options.broadcast_gain_db],
             queue_ms: options.queue_ms, controls: LiveControls::from_route(options)?, outputs })
@@ -160,6 +163,7 @@ impl Prepared {
 
     pub fn describe(&self) -> String {
         let mut text = format!("WASAPI input: {}\n  {:?}; channel {}\nvocal: {:?}\ninitial master attenuation: {} dB\nplayback streams: {}\n", self.input, self.input_config, self.input_channel + 1, self.vocal.config(), self.output_gain_db, self.outputs.len());
+        text.push_str(&format!("Pitch reference: {} {} (tuner only)\n", PitchScale::NAMES[usize::from(self.pitch_key)], self.pitch_scale.name()));
         for (index, endpoint) in self.outputs.iter().enumerate() {
             text.push_str(&format!("stream {index}: {}\n  {:?}; one queue/resampler for {} mix(es)\n", endpoint.device, endpoint.config, endpoint.routes.len()));
             for (mix, map) in &endpoint.routes {
@@ -255,7 +259,7 @@ impl Prepared {
         if let Some(worker) = &plugin_worker { timing.push(worker.description.clone()); }
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
-        let (pitch_tap, pitch_monitor) = pitch::channel(self.input_config.sample_rate())?;
+        let (pitch_tap, pitch_monitor) = pitch::channel(self.input_config.sample_rate(), self.pitch_key, self.pitch_scale)?;
         let feeds = InputFeeds { aux: aux_feed, apps: app_readers, pitch: pitch_tap };
         let input_stream = match format {
             SampleFormat::F32 => input::<f32>(&self.input, config, self.input_channel, capture, feeds, health.clone())?,
@@ -465,7 +469,7 @@ impl Active {
         let vocal = levels.vocal;
         let mut text = format!("captured={} input_peak={:.3} vocal_peak={:.3} voice_peak={:.3} comp_gr={:.1}dB deess_gr={:.1}dB", self.health.captured_frames.load(Ordering::Relaxed), levels.mic_input, vocal.output_peak, levels.voice, vocal.compression_db, vocal.deessing_db);
         if let Some(pitch) = levels.pitch {
-            text.push_str(&format!(" pitch={}@{:.2}Hz({:+.1}c) clarity={:.2}", pitch.note_name(), pitch.frequency_hz, pitch.cents, pitch.clarity));
+            text.push_str(&format!(" pitch={}@{:.2}Hz({:+.1}c) target={}({:+.1}c) clarity={:.2}", pitch.note_name(), pitch.frequency_hz, pitch.cents, pitch.target_note_name(), pitch.target_cents, pitch.clarity));
         } else { text.push_str(" pitch=unvoiced"); }
         if let Some(aux) = levels.aux_input {
             text.push_str(&format!(" aux_peak={aux:.3}"));

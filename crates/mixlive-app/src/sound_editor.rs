@@ -7,6 +7,7 @@ use gpui::{
     px, rgb,
 };
 use gpui_deck::{InputState, SelectItem, SelectState, StyledExt as _};
+use mixlive_audio_windows::config::PitchScale;
 
 use crate::{
     form::{number_input, select_control, selected, text_input},
@@ -30,6 +31,8 @@ struct InstalledPlugins {
 pub struct SoundEditor {
     draft: SoundDraft,
     preset: Entity<SelectState>,
+    pitch_key: Entity<SelectState>,
+    pitch_scale: Entity<SelectState>,
     input_gain: Entity<InputState>,
     strength: Entity<InputState>,
     compressor: Entity<InputState>,
@@ -70,6 +73,14 @@ impl SoundEditor {
             )
             .default_value(&draft.preset)
         });
+        let pitch_key = cx.new(|cx| {
+            SelectState::new(PitchScale::NAMES.into_iter().enumerate().map(|(key, name)| SelectItem::new(key.to_string(), name)).collect::<Vec<_>>(), cx)
+                .default_value(&draft.pitch_key)
+        });
+        let pitch_scale = cx.new(|cx| {
+            SelectState::new([SelectItem::new("chromatic", "Chromatic · 반음계"), SelectItem::new("major", "Major · 장조"), SelectItem::new("minor", "Minor · 자연단음계")], cx)
+                .default_value(&draft.pitch_scale)
+        });
         let input_gain = text_input("마이크 입력 trim", &draft.input_gain_db, window, cx);
         let strength = text_input("보컬 보정 비율", &draft.strength, window, cx);
         let compressor = text_input(
@@ -93,13 +104,16 @@ impl SoundEditor {
         let echo_mix = text_input("에코 비율", &draft.echo_mix, window, cx);
         let echo_time = text_input("에코 시간", &draft.echo_time_ms, window, cx);
         let echo_feedback = text_input("에코 피드백", &draft.echo_feedback, window, cx);
-        let mut subscriptions = vec![cx.observe(&preset, |_, _, cx| cx.notify())];
+        let mut subscriptions = vec![cx.observe(&preset, |_, _, cx| cx.notify()),
+            cx.observe(&pitch_key, |_, _, cx| cx.notify()), cx.observe(&pitch_scale, |_, _, cx| cx.notify())];
         for input in [&input_gain, &strength, &compressor, &deesser, &eq_hpf_hz, &eq_body_db, &eq_presence_db, &eq_air_db, &compressor_ratio, &compressor_attack_ms, &compressor_release_ms, &deess_max_db, &reverb_mix, &reverb_decay, &reverb_predelay, &echo_mix, &echo_time, &echo_feedback] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
         }
         Self {
             draft,
             preset,
+            pitch_key,
+            pitch_scale,
             input_gain,
             strength,
             compressor,
@@ -130,6 +144,8 @@ impl SoundEditor {
     pub fn draft(&self, cx: &App) -> SoundDraft {
         SoundDraft {
             preset: selected(&self.preset, cx).unwrap_or_default(),
+            pitch_key: selected(&self.pitch_key, cx).unwrap_or_default(),
+            pitch_scale: selected(&self.pitch_scale, cx).unwrap_or_default(),
             input_gain_db: self.input_gain.read(cx).value().to_string(),
             strength: self.strength.read(cx).value().to_string(),
             compressor_threshold_db: self.compressor.read(cx).value().to_string(),
@@ -165,6 +181,9 @@ impl SoundEditor {
         let disabled = self.is_busy();
         self.preset
             .update(cx, |state, cx| state.set_disabled(disabled, window, cx));
+        for select in [&self.pitch_key, &self.pitch_scale] {
+            select.update(cx, |state, cx| state.set_disabled(disabled, window, cx));
+        }
         if let Some(installed) = &self.installed {
             installed.picker.update(cx, |state, cx| state.set_disabled(disabled, window, cx));
         }
@@ -463,6 +482,17 @@ impl Render for SoundEditor {
                     .child(field("sound-strength", "보정 비율", "0~1 · EQ/다이내믹스 blend", &self.strength, window, cx)))
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child("저장한 값은 다음 오디오 시작부터 적용됩니다. 보정 비율은 음량 일치 기능이 아니며, 자동 makeup gain은 없습니다.")))
+            .child(panel().gap_4()
+                .child(section_title("PITCH", "음정 기준"))
+                .child(div().flex().flex_wrap().gap_5()
+                    .child(div().flex_1().min_w(px(180.)).flex().flex_col().gap_2()
+                        .child(div().text_sm().font_semibold().child("조성"))
+                        .child(select_control("pitch-key", "음정 기준 조성", &self.pitch_key, None, window, cx)))
+                    .child(div().flex_1().min_w(px(220.)).flex().flex_col().gap_2()
+                        .child(div().text_sm().font_semibold().child("스케일"))
+                        .child(select_control("pitch-scale", "음정 기준 스케일", &self.pitch_scale, None, window, cx))))
+                .child(div().text_xs().text_color(rgb(MUTED))
+                    .child("A4=440 Hz. 반음계 또는 선택한 장조·자연단음계의 가장 가까운 목표 음을 표시합니다. 반음계에서는 조성에 영향을 받지 않으며 음성을 자동 보정하지 않습니다.")))
             .child(panel().gap_4()
                 .child(section_title("EQ", "보컬 EQ 세부 설정"))
                 .child(div().flex().flex_wrap().gap_5()

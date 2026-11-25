@@ -1067,14 +1067,15 @@ impl MixLive {
                 .child(div().font_semibold().child("소스별 보내기"))
                 .child(source_mutes)
                 .child(peak_meter("마이크 입력 · trim 전", levels.map(|l| l.mic_input)))
-                .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child("마이크 음정 · A4 = 440 Hz · 검출 전용"))
+                .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child(format!("마이크 음정 · A4 = 440 Hz · {} {} · 검출 전용", mixlive_audio_windows::config::PitchScale::NAMES[usize::from(scene.route.pitch_key)], scene.route.pitch_scale.name())))
                     .child(match levels.and_then(|l| l.pitch) {
                         Some(pitch) => div().flex().items_center().gap_3()
                             .child(div().font_semibold().text_color(rgb(ACCENT)).child(pitch.note_name()))
                             .child(div().text_sm().child(format!("{:.1} Hz · {:+.1} cent", pitch.frequency_hz, pitch.cents)))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(format!("명료도 {:.0}%", pitch.clarity * 100.0))),
                         None => div().text_sm().text_color(rgb(MUTED)).child("명확한 음정 없음"),
-                    }))
+                    })
+                    .children(levels.and_then(|l| l.pitch).map(|pitch| div().text_sm().child(format!("스케일 목표 {} · 편차 {:+.1} cent", pitch.target_note_name(), pitch.target_cents)))))
                 .child(peak_meter("내장 보정 후 · VST3 전", levels.map(|l| l.vocal.output_peak)))
                 .child(peak_meter("보컬 체인 후 · mute 전", levels.map(|l| l.voice)))
                 .children(controls.has_aux().then(|| {
