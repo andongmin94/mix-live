@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **Call/Broadcast 가상 오디오 드라이버 개발 소스 구현 · WDK 검증 대기**
+단계: **가상 드라이버 패키지·개발 장치 등록 경계 구현 · WDK 재검증 대기**
 
 ## 현재 구현
 
@@ -46,6 +46,9 @@
   48 kHz stereo PCM32, 96-frame 고정 FIFO, QPC 기반 clock, RUN 경계 초기화와 부재 시 무음/폐기를
   제공한다. Rust 오디오/DSP/VST3/Scene schema 8은 변경하지 않았다. 설치된 render ID만 기존 WASAPI에서
   선택할 수 있으며 실제 endpoint 노출은 아직 미검증이다.
+  개발용 manage-devices.ps1은 SignTool kernel-policy 및 catalog의 INF/SYS 검증 후에만
+  명시적 관리자 승인으로 WDK DevGen/PnPUtil 등록을 수행한다. 고정 ID만 조회·제거하고
+  중복 장치·자동 재시작·보안 우회를 허용하지 않는다. 제품 설치기는 별도 미구현이다.
 
 ## 검증
 
@@ -69,8 +72,13 @@ PDC 및 stereo 송출 지연·mute 검사를 포함한 Windows 검사 103개, na
 가상 장치 개발은 staged Git blob과 SHA가 동일한 실제 core.hpp/tests.cpp를 로컬 g++ C++17
 -Wall -Wextra -Werror로 컴파일·실행했다. PCM32 stereo 데이터, 두 케이블 격리, 링 wrap,
 RUN reset, 양쪽 부재 처리, 큰 clock gap과 QPC fractional carry/24시간 누적 계산 검사 성공.
-WDK 26100 기반 unsigned 커널 빌드 및 InfVerif /w, /h는 새 Virtual Audio CI에서 검증 대기.
-기존 Audio CI와 별도 변경 범위이며 설치·서명·카탈로그 생성은 하지 않는다.
+[Virtual Audio #1](https://github.com/andongmin94/mix-live/actions/runs/45568185125)은
+windows-2025가 VS 2026 이미지를 제공하여 VS 2022 CMake generator 구성 단계에서 실패했다.
+드라이버 컴파일 전 실패이므로 기존 transport C++ 자체의 실패로 판단하지 않는다.
+windows-2022의 설치된 VS 2022 + WDK/SDK 26100으로 수정했다. 기존 Audio CI는 변경하지 않는다.
+이번 변경은 InfVerif 및 Inf2Cat의 unsigned catalog 생성, 서명·catalog membership 검사,
+두 고정 ID의 read-only 상태 조회와 명시적 개발용 등록/제거 명령을 추가했다.
+새 Windows 검사는 대기 중이다. 실제 장치 등록·제거·서명은 실행하지 않았다.
 
 ## 남은 작업과 제한
 
@@ -79,7 +87,7 @@ WDK 26100 기반 unsigned 커널 빌드 및 InfVerif /w, /h는 새 Virtual Audio
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
 - 탭 선택·자체 Return 장치·ASIO·실행 중
   소스/체인 삽입/삭제·내장 음정 보정·CLI 전체 Scene snapshot 출력은 미구현이다.
-  Call/Broadcast driver의 WDK 빌드·실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 수신은 미검증이다.
+  Call/Broadcast driver의 WDK 빌드·카탈로그 생성·실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 수신은 미검증이다.
   실행 중 프리셋/pre-delay 변경은 미구현이다. 리버브/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.

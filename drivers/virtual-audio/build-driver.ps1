@@ -29,6 +29,9 @@ foreach ($line in $environment) {
 }
 New-Item -ItemType Directory -Path $Output -Force | Out-Null
 $Output = (Resolve-Path -LiteralPath $Output).Path
+if (Test-Path -LiteralPath (Join-Path $Output 'mixlive-virtual-audio.cat')) {
+    throw 'Use a fresh output directory; rebuilding would invalidate an existing catalog.'
+}
 $common = @('/nologo','/c','/std:c++17','/utf-8','/kernel','/GR-','/EHs-c-','/Zl','/Zc:throwingNew-','/Zc:threadSafeInit-',
     '/W4','/GS','/Oi','/O2','/Zi','/D_AMD64_','/DAMD64','/D_WIN64',
     '/DNTDDI_VERSION=0x0A000008','/D_WIN32_WINNT=0x0A00','/DWINVER=0x0A00',
@@ -46,4 +49,4 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'mixlive-virtual-audio.inf') -De
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'LICENSE') -Destination $Output
 # Object files are build intermediates, not part of the unsigned package.
 foreach ($object in $objects) { Remove-Item -LiteralPath $object }
-Write-Output "Unsigned driver built in $Output. Run InfVerif, generate a catalog, sign and verify the package before installation."
+Write-Output "Unsigned driver built in $Output. Run prepare-package.ps1 before submitting for Microsoft signing."

@@ -149,8 +149,9 @@ DEALINGS IN THE SOFTWARE.
   `drivers/virtual-audio/LICENSE`에 보존하며 unsigned 개발 artifact에도 포함한다.
   원본의 실제 driver load와 Windows 장치 연결은 미검증으로 명시되어 있다.
   이 도입은 MixLive 전체에 MIT 라이선스를 부여하거나 Windows 인증을 주장하지 않는다.
-- Microsoft WDK: `Microsoft.Windows.WDK.x64` 10.0.26100.6584, SDK build 26100,
-  Microsoft Visual C++ 2022 toolset을 빌드 시 사용한다. WDK 자체 파일을 저장소나
-  배포물에 포함하지 않는다.
-  https://www.nuget.org/packages/Microsoft.Windows.WDK.x64/10.0.26100.6584
+- Microsoft WDK/SDK build 26100 및 Visual C++ 2022 toolset을 사용한다.
+  현재 CI는 해당 키트가 설치된 windows-2022 이미지를 이용한다.
+  InfVerif/Inf2Cat/SignTool은 설치된 WDK/SDK 도구를 호출하며 바이너리를 배포하지 않는다.
+  개발용 장치 등록은 DevGen(재배포 불가, 제품 설치용 사용 불가)과 OS의 PnPUtil을 이용한다.
+  https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/devgen-command-syntax
   드라이버 서명/인증은 별도 요구사항이며 Microsoft 서명·인증서 구매·설치는 수행하지 않는다.

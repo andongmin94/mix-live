@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 jobs:
   windows:
-    # The WDK/SDK 26100 build uses the VS 2022 image, not a floating VS major.
-    runs-on: windows-2025
+    # windows-2025 now resolves to VS 2026; windows-2022 includes VS 2022 + WDK 26100.
+    runs-on: windows-2022
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -27,33 +27,34 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ctest --test-dir "$env:RUNNER_TEMP/mixlive-transport" -C Release --output-on-failure
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Acquire the pinned Microsoft WDK build files (no driver installation)
-        shell: pwsh
-        run: |
-          $kits = Join-Path $env:RUNNER_TEMP 'mixlive-wdk'
-          nuget install Microsoft.Windows.WDK.x64 -Version 10.0.26100.6584 -ExcludeVersion -DependencyVersion Ignore -NonInteractive -OutputDirectory $kits -Source https://api.nuget.org/v3/index.json
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $headers = @(Get-ChildItem -LiteralPath $kits -Recurse -File -Filter portcls.h | Where-Object FullName -like '*\Include\10.0.26100.0\km\portcls.h')
-          if ($headers.Count -ne 1) { throw 'Expected one WDK 26100 PortCls header' }
-          $root = $headers[0].Directory.Parent.Parent.Parent.FullName
-          "MIXLIVE_WDK_ROOT=$root" >> $env:GITHUB_ENV
-          $infverif = @(Get-ChildItem -LiteralPath $kits -Recurse -File -Filter infverif.exe | Where-Object { $_.Directory.Name -eq 'x64' })
-          if ($infverif.Count -ne 1) { throw 'Expected one x64 WDK InfVerif executable' }
-          "MIXLIVE_INFVERIF=$($infverif[0].FullName)" >> $env:GITHUB_ENV
       - name: Compile and link the unsigned x64 driver
         shell: pwsh
         run: |
-          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
-          ./drivers/virtual-audio/build-driver.ps1 -WdkRoot $env:MIXLIVE_WDK_ROOT -WdkVersion '10.0.26100.0' -SdkRoot $sdk -SdkVersion '10.0.26100.0' -Output "$env:RUNNER_TEMP/mixlive-driver"
-      - name: Validate the INF (no signing or installation)
+          ./drivers/virtual-audio/build-driver.ps1 -WdkVersion '10.0.26100.0' -Output "$env:RUNNER_TEMP/mixlive-driver"
+      - name: Validate INF and generate the unsigned catalog
         shell: pwsh
         run: |
-          $inf = Join-Path $env:RUNNER_TEMP 'mixlive-driver\mixlive-virtual-audio.inf'
-          & $env:MIXLIVE_INFVERIF /w $inf
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & $env:MIXLIVE_INFVERIF /h $inf
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Keep unsigned build for driver development only
+          ./drivers/virtual-audio/prepare-package.ps1 -PackageDirectory "$env:RUNNER_TEMP/mixlive-driver"
+      - name: Check development package boundary without changing devices
+        shell: pwsh
+        run: |
+          $package = "$env:RUNNER_TEMP/mixlive-driver"
+          $rejected = $false
+          try {
+            ./drivers/virtual-audio/manage-devices.ps1 -Action Verify -PackageDirectory $package
+          } catch {
+            if ($_.Exception.Message -notlike 'Kernel-policy signature verification failed:*') { throw }
+            $rejected = $true
+          }
+          if (!$rejected) { throw 'Unsigned catalog was not rejected' }
+          Write-Output 'Unsigned package cannot pass the signed-package preflight.'
+          # PnP discovery is read-only. Print only the result count, not runner hardware IDs.
+          $rows = @(./drivers/virtual-audio/manage-devices.ps1 -Action Status)
+          if ($rows.Count -ne 2 -or @($rows | Where-Object { $_.State -ne 'Absent' }).Count -ne 0) {
+            throw 'The clean runner should contain neither MixLive cable'
+          }
+          Write-Output 'Both MixLive device IDs are absent; no device state was modified.'
+      - name: Keep unsigned package for driver development only
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: virtual-audio-unsigned-${{ github.sha }}

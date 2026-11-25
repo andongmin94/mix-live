@@ -9,8 +9,9 @@ The Rust app retains all mixing, DSP, VST3 processing, and device selection.
 | Root\MixLive_Call | MixLive Call Send | MixLive Call |
 | Root\MixLive_Broadcast | MixLive Broadcast Send | MixLive Broadcast |
 
-The INF declares two fixed hardware IDs. A separately approved provisioning step
-must create one root-enumerated device for each ID using a correctly signed package.
+The INF declares two fixed hardware IDs. The development provisioning script can
+create one root-enumerated device for each ID only after a signed-package preflight
+and explicit administrator confirmation.
 Actual Windows endpoint names and enumeration still need confirmation on a test
 machine. The existing WASAPI device catalog selects the installed render ID; it
 does not synthesize IDs or select devices by their friendly names. Use the
@@ -34,24 +35,50 @@ is changed. The Return cable is outside this slice.
 ## Build and verify
 
 Use a matching Windows SDK/WDK build 26100 and Visual Studio 2022 x64 C++ tools.
-The path-scoped **Virtual Audio** CI downloads the pinned Microsoft WDK package
-10.0.26100.6584 and checks the actual transport, compiles the driver, and checks
-the INF with InfVerif. It does not load or install a driver. Local build:
+The path-scoped **Virtual Audio** CI uses the Windows Server 2022 runner's installed
+VS 2022 and WDK/SDK build 26100 (the windows-2025 label now selects VS 2026).
+It tests the transport, links the driver, runs InfVerif and generates an unsigned
+catalog with Inf2Cat. It also checks that the unsigned package is rejected and that
+both cable IDs are absent. It never creates, loads or removes a device. Local build:
 
 ```powershell
 cmake -S drivers/virtual-audio -B drivers/virtual-audio/build/transport
 cmake --build drivers/virtual-audio/build/transport --config Release
 ctest --test-dir drivers/virtual-audio/build/transport -C Release --output-on-failure
 .\drivers\virtual-audio\build-driver.ps1 -WdkVersion 10.0.26100.0
+.\drivers\virtual-audio\prepare-package.ps1 -PackageDirectory drivers\virtual-audio\build\package
 ```
 
 The script also accepts explicit WdkRoot and SdkRoot when using extracted kits.
-It outputs the unsigned .sys, .inf, .pdb and MIT notice. It does not generate a
-catalog or sign, stage, install or remove a device. WDK tools must validate the
-INF and generate a catalog before a signing submission. Windows 11 requires
-trusted driver signing; Microsoft attestation is for testing scenarios and
-HLK/WHCP is the production certification route. Do not disable security features.
-No signing account, certificate or installation has been authorized in this work.
+The build outputs the unsigned .sys, .inf, .pdb and MIT notice; the separate
+package step creates the .cat. Use a fresh directory for each build that needs
+a new catalog. Neither step signs, stages or installs anything. The generated
+catalog is not a signed driver package. Windows 11 requires trusted driver signing;
+Microsoft attestation is for testing scenarios and HLK/WHCP is the production
+certification route. Do not disable security features. No signing account,
+certificate or installation has been authorized in this work.
+
+## Development device provisioning (not a production installer)
+
+Once an approved Microsoft-signed package is available, use
+`manage-devices.ps1 -Action Verify -PackageDirectory <signed-directory>` on the
+test machine. SignTool checks the kernel policy and INF/SYS membership in the
+catalog. A successful check is not proof that Windows will load the driver.
+
+The default `-Action Status` is read-only. It checks only the two fixed hardware
+IDs and reports absent, duplicate, started (matching service, present and no
+PnP problem), or not ready. It does not assert that audio endpoints are present.
+The `Register` action requires `-Cable Call` or `-Cable Broadcast`,
+`-PackageDirectory <signed-directory>`, and `-DevGen <installed-WDK-devgen.exe>`.
+Use `-WhatIf` before an explicit confirmed action on an elevated Windows 11 x64
+test machine. DevGen is a Microsoft development-only tool, cannot be redistributed,
+and is not included in the package. PnPUtil stages the verified package and
+installs the matching driver. The script checks actual PnP state afterwards;
+errors or required restarts stop the operation without retrying or changing
+system security. Existing/duplicate instances are rejected rather than replaced.
+`Remove` requires the selected cable and removes only its exact discovered
+instance ID after confirmation. The staged driver package remains in the driver
+store; package removal/upgrade and a production installer are not implemented.
 
 ## Acceptance not yet met
 
