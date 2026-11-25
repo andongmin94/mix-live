@@ -10,7 +10,7 @@ OBS 전용 플러그인이 아니다. 현재는 **GPUI Scene 실행 화면과 �
 ## 현재 처리 경로
 
 ```text
-마이크 → 입력 trim → 내장 보컬 보정 → 순차 stereo VST3 체인 → 목적지별 보내기 ─┐
+마이크 → 입력 trim → 내장 EQ/다이내믹스 → stereo 리버브 → 순차 stereo VST3 체인 → 목적지별 보내기 ─┐
 AUX/MR → 필요 시 입력 clock bridge → AUX trim → 목적지별 보내기 ─────────┤
 앱 1..8 → 각각의 입력 clock bridge → 앱별 trim → 목적지별 보내기 ───────────┴→ 믹스
 믹스 → 출력 clock bridge → master/믹스별 음량·mute → sample clipping guard → 출력 장치
@@ -50,8 +50,8 @@ AUX를 통화 또는 방송으로 보내려면 해당 출력 장치도 선택해
 
 내장 보정 `off/natural/warm/bright`를 고를 수 있으며, 새 Scene의 초기값은 출력 −18 dB,
 AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. 전체/모니터/통화/방송/AUX 시작 음량과
-queue 목표, 입력 trim, 보정 비율, 컴프레서/디에서 threshold와 VST3 순서를 저장 전에 바꿀 수 있다.
-저장은 기존 schema 7의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
+queue 목표, 입력 trim, 보정 비율, 컴프레서/디에서 threshold, 리버브 비율/잔향/pre-delay와 VST3 순서를 저장 전에 바꿀 수 있다.
+저장은 기존 schema 8의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
 이전 Scene 선택을 유지한다. 장치와 현재 설정은 실제 시작 때 다시 검사한다.
 
 기존 체인은 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작**으로 실행한다.
@@ -94,7 +94,7 @@ VST3는 **파일 추가** 또는 Windows bundle용 **폴더 추가**로 선택�
 - 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 모니터/통화/방송 sample peak.
   약 100ms 간격의 최대값을 dBFS로 표시한다. 소스 peak는 mute 전, AUX와 앱은 입력 trim 전이며
   출력 peak는 감쇠·mute·sample guard 후 장치 채널 매핑 전이다. 공유 endpoint의 각 믹스도 독립 계측한다.
-  내장 보정 gain reduction과 초당 갱신되는 진단 수치는 같은 계측값을 사용한다. 가짜 level 애니메이션은 없다.
+  내장 보정 gain reduction과 초당 갱신되는 진단 수치는 같은 계측값을 사용한다. 내장 보정 후 peak는 리버브를 포함한 stereo 최대값이다. 가짜 level 애니메이션은 없다.
 
 **정지** 또는 창 닫기는 기존 장치 중지 → worker 종료 → native plugin 해제 경로를 사용한다.
 장치 시작·종료와 native plugin 수명은 GPUI 메인 스레드에 유지하고, 네이티브 호출 중에는
@@ -135,7 +135,7 @@ sample clipping guard는 전문 리미터·true-peak·음향 피드백 방지·�
 ### 내장 보컬
 
 `--vocal off|natural|warm|bright` (기본 off). HPF/EQ→RMS soft-knee compression→split-band
-디에서→원음/보정 blend다. 내장 reverb/delay/pitch correction은 아직 없다. 프리셋 이름은
+디에서→원음/보정 blend→stereo 리버브다. 독립적인 echo delay/pitch correction은 아직 없다. 프리셋 이름은
 시작 설정이며 실제 청취 수용을 마친 고급 사운드를 의미하지 않는다.
 
 | 옵션 | 적용 위치/범위 |
@@ -144,6 +144,9 @@ sample clipping guard는 전문 리미터·true-peak·음향 피드백 방지·�
 | `--vocal-strength 1` | 원음/보정 blend 0..1. 음량 일치 기능 아님 |
 | `--vocal-threshold-db -24` | 컴프레서 threshold -60..0 dBFS |
 | `--deess-threshold-db -30` | 디에서 고역 threshold -60..0 dBFS |
+| `--reverb-mix 0` | stereo 리버브 wet 비율 0..1 (0은 끄기) |
+| `--reverb-decay-secs 1.2` | 저역 기준 명목 잔향 시간 0.2..5초 |
+| `--reverb-predelay-ms 15` | wet 신호에만 추가 pre-delay 0..80 ms |
 | `--output-gain-db -18` | 두 믹스의 초기 최종 감쇠 -96..0 dB |
 | `--monitor-gain-db 0` | 모니터 초기 추가 감쇠 -96..0 dB |
 | `--send-gain-db 0` | 통화 초기 추가 감쇠 -96..0 dB |
@@ -151,6 +154,16 @@ sample clipping guard는 전문 리미터·true-peak·음향 피드백 방지·�
 
 자동 makeup gain은 없다. A/B 청취의 원본/보정 음량은 따로 맞춘다. 프리셋은 32..192 kHz,
 off는 8..192 kHz를 받는다. 입력 trim/보컬 파라미터는 실행 중 고정이다.
+
+스테레오 리버브는 **보컬 설정**의 별도 ROOM 카드에서 조절한다. 기본값은 꺼짐이며,
+예를 들어 `--reverb-mix 0.15 --reverb-decay-secs 1.2 --reverb-predelay-ms 15`로
+짧은 공간감을 추가할 수 있다. 수치는 청취로 조정하는 시작점이다. EQ/다이내믹스 preset이
+off여도 리버브 비율이 0보다 크면 리버브가 동작한다. 보정 비율과 별도로 linear wet/dry blend를
+적용하고, dry 신호는 추가 지연하지 않는다. 8-line orthogonal FDN과 기존 biquad 고역 감쇠를
+사용하며, 서로 다른 stereo wet 신호를 VST3에 전달한다. 잔향은 예술적 시간 응답으로 PDC의
+고정 신고 지연에 합산하지 않는다. AUX/앱은 공간계를 거치지 않는다. 소스 mute는 잔향을
+포함한 보컬을 차단하며, 내부 잔향 이력은 계속 갱신된다. 설정은 다음 시작부터 적용하고
+종료 시 잔향 샘플을 녹음/저장하지 않는다. 실제 청취·음질 수용은 미검증이다.
 
 ### 출력과 MR/AUX
 
@@ -209,7 +222,7 @@ off는 8..192 kHz를 받는다. 입력 trim/보컬 파라미터는 실행 중 �
 
 ## 장치·보컬·VST3를 Scene 하나로 재실행
 
-**Scene schema 7**는 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
+**Scene schema 8**는 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
 한 파일에 담는다. 기존 체인을 넣으면 상태 바이트를 복사하므로 원래 체인 JSON은 재실행에
 필요하지 않다. 플러그인 DLL과 외부 샘플/라이선스 등은 여전히 설치되어 있어야 한다.
 
@@ -232,7 +245,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. CLI는 실행 중
 GUI의 정지 후 새 Scene 저장에서만 전체 실행 상태를 저장한다. CLI에서 편집한 VST3 상태는 새 체인 파일로 내보낸 뒤 다음 `scene save`에 넣는다.
 
 상대 경로는 들어 있던 chain/scene 파일 기준으로 해석한다. CLI에서 지정한 경로는 현재 작업
-폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~6는 읽지 않으며 현재 옵션으로
+폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~7는 읽지 않으며 현재 옵션으로
 다시 저장한다. 마이그레이션/누락값 복구는 없다. Scene에는 개인 장치 ID와 플러그인 상태가
 포함되므로 공개하지 않는다. `*.mixlive-scene.json`은 Git에서 제외한다.
 

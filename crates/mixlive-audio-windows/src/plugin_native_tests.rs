@@ -92,6 +92,44 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
 
 #[test]
 #[ignore = "requires existing MIXLIVE_GAIN_VST3 fixture; no devices/windows"]
+fn built_in_room_reaches_the_live_native_effect_as_stereo() {
+    use mixlive_effects::ReverbConfig;
+    let config = VocalConfig { reverb: ReverbConfig { mix: 0.5, decay_secs: 1.2, predelay_ms: 0.0 }, ..VocalConfig::default() };
+    let prepare = || {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0).unwrap());
+        let (writer, reader) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
+        let capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+            None, &[], vec![(writer, vec![0])], health.clone(), controls).unwrap();
+        (capture, reader, health)
+    };
+    let (capture, mut reader, health) = prepare();
+    let mut plugin = load_effect(&fixture("MIXLIVE_GAIN_VST3"), 48000).unwrap();
+    plugin.set_parameter(0, 0.5).unwrap();
+    let (mut input, mut worker) = spawn(capture, vec![plugin], 48000, 100, false, health.clone()).unwrap();
+    let mut mic = vec![0.0; 4096];
+    mic[0] = 0.5;
+    for part in mic.chunks(137) { input.push(part, None, &[]); }
+    wait_for(&mut worker, &health, mic.len() as u64);
+    worker.finish(None).unwrap();
+
+    let (mut reference, mut expected_reader, reference_health) = prepare();
+    reference.push_with_effect(&mic, None, &[], &mut |left, right| {
+        for sample in left.iter_mut().chain(right.iter_mut()) { *sample *= 0.5; }
+        true
+    });
+    let mut saw_stereo = false;
+    for _ in 0..3500 {
+        let actual = reader.next_frame([1.0; 3]);
+        let expected = expected_reader.next_frame([1.0; 3]);
+        assert!((actual[0] - expected[0]).abs() < 1e-5 && (actual[1] - expected[1]).abs() < 1e-5);
+        saw_stereo |= (actual[0] - actual[1]).abs() > 0.001;
+    }
+    assert!(saw_stereo && !health.failed() && !reference_health.failed());
+}
+
+#[test]
+#[ignore = "requires existing MIXLIVE_GAIN_VST3 fixture; no devices/windows"]
 fn native_serial_stages_preserve_distinct_stereo_and_partial_blocks() {
     let mut processors = Vec::new();
     for gain in [0.5, 0.25] {

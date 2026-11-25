@@ -29,8 +29,8 @@ fn one_capture_feeds_two_independent_mixes_without_dry_bypass() {
 fn vocal_is_processed_once_before_sends_and_playback_attenuation() {
     let config = VocalConfig { preset: Preset::Bright, ..VocalConfig::default() };
     let input: Vec<f32> = (0..1024).map(|i| (i as f32 * 0.17).sin() * 0.4).collect();
-    let mut expected = input.clone();
-    VocalChain::new(48000, config).unwrap().process(&mut expected).unwrap();
+    let mut expected = vec![0.0; input.len()];
+    VocalChain::new(48000, config).unwrap().process(&input, &mut expected, &mut vec![0.0; input.len()]).unwrap();
     let health = Arc::new(Health::default());
     let controls = Arc::new(LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], false, 0).unwrap());
     let (first, _a) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
@@ -94,8 +94,8 @@ fn aux_is_stereo_selective_and_never_passes_through_vocal_processing() {
         let config = VocalConfig { preset: Preset::Bright, input_gain_db: 6.0, ..VocalConfig::default() };
         let input: Vec<f32> = (0..613).map(|i| (i as f32 * 0.17).sin() * 0.4).collect();
         let aux = vec![[2.0, -1.0]; input.len()];
-        let mut expected = input.clone();
-        VocalChain::new(48000, config).unwrap().process(&mut expected).unwrap();
+        let mut expected = vec![0.0; input.len()];
+        VocalChain::new(48000, config).unwrap().process(&input, &mut expected, &mut vec![0.0; input.len()]).unwrap();
         let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
             Some((-12.0, destination)), &[], vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
         let mut start = 0;
@@ -146,8 +146,8 @@ fn live_routes_keep_call_vocals_while_removing_only_monitor_vocals() {
     controls.apply("route aux output on".parse().unwrap()).unwrap();
     controls.apply("level aux output -6".parse().unwrap()).unwrap();
     let mic: Vec<f32> = (0..613).map(|i| (i as f32 * 0.13).sin() * 0.3).collect();
-    let mut wet = mic.clone();
-    reference.process(&mut wet).unwrap();
+    let mut wet = vec![0.0; mic.len()];
+    reference.process(&mic, &mut wet, &mut vec![0.0; mic.len()]).unwrap();
     let aux = vec![[0.2, -0.1]; 613];
     let mut cursor = 0;
     for count in [1, 137, 256, 219] {
@@ -165,8 +165,8 @@ fn live_routes_keep_call_vocals_while_removing_only_monitor_vocals() {
     }
     controls.apply("route aux send off".parse().unwrap()).unwrap();
     controls.apply("level mic send -9".parse().unwrap()).unwrap();
-    let mut next = [0.1; 256];
-    reference.process(&mut next).unwrap();
+    let mut next = [0.0; 256];
+    reference.process(&[0.1; 256], &mut next, &mut [0.0; 256]).unwrap();
     capture.push(&[0.1; 256], Some(&[[0.2, -0.1]; 256]), &[]);
     let call = capture.engine.output(1).unwrap();
     let expected = next[255] * 10.0_f32.powf(-9.0 / 20.0);
@@ -218,9 +218,9 @@ fn external_effect_preserves_stereo_and_never_processes_aux_or_falls_back_to_dry
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
         Some((0.0, AuxDestination::Send)), &[], vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
     let mut calls = 0;
-    capture.push_with_effect(&[0.4; 613], Some(&[[0.1, -0.2]; 613]), &[], &mut |mic, left, right| {
+    capture.push_with_effect(&[0.4; 613], Some(&[[0.1, -0.2]; 613]), &[], &mut |left, right| {
         calls += 1;
-        for (i, &sample) in mic.iter().enumerate() { left[i] = sample * 0.5; right[i] = -sample * 0.25; }
+        for (left, right) in left.iter_mut().zip(right) { *left *= 0.5; *right *= -0.25; }
         true
     });
     assert_eq!(calls, 3);
@@ -228,7 +228,7 @@ fn external_effect_preserves_stereo_and_never_processes_aux_or_falls_back_to_dry
     let mixed = capture.engine.output(1).unwrap();
     assert_eq!((voice.left[0], voice.right[0]), (0.2, -0.1));
     assert!((mixed.left[0] - 0.3).abs() < 1e-6 && (mixed.right[0] + 0.3).abs() < 1e-6);
-    capture.push_with_effect(&[0.4], Some(&[[0.1, -0.2]]), &[], &mut |_, _, _| false);
+    capture.push_with_effect(&[0.4], Some(&[[0.1, -0.2]]), &[], &mut |_, _| false);
     assert!(health.failed());
     assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
 }
@@ -250,9 +250,9 @@ fn separate_app_sources_keep_stereo_and_mix_minus_with_and_without_physical_aux(
         let browser = [[0.3, -0.1]; 256];
         let call = [[-0.2, 0.4]; 256];
         capture.push_with_effect(&mic, has_aux.then_some(aux.as_slice()), &[&browser, &call],
-            &mut |voice, left, right| {
-                for ((left, right), sample) in left.iter_mut().zip(right).zip(voice) {
-                    *left = *sample * 2.0; *right = *sample * 2.0;
+            &mut |left, right| {
+                for (left, right) in left.iter_mut().zip(right) {
+                    *left *= 2.0; *right *= 2.0;
                 }
                 true
             });
@@ -360,9 +360,9 @@ fn reported_vst3_delay_aligns_stereo_sends_across_blocks_without_delaying_monito
         for count in [13, 113, 256, 129, 129] {
             let end = position + count;
             capture.push_with_effect(&mic[position..end], Some(&aux[position..end]),
-                &[&app1[position..end], &app2[position..end]], &mut |voice, left, right| {
-                    for ((left, right), sample) in left.iter_mut().zip(right).zip(voice) {
-                        let delayed = std::mem::replace(&mut history[cursor], *sample);
+                &[&app1[position..end], &app2[position..end]], &mut |left, right| {
+                    for (left, right) in left.iter_mut().zip(right) {
+                        let delayed = std::mem::replace(&mut history[cursor], *left);
                         cursor = (cursor + 1) % LATENCY;
                         *left = delayed;
                         *right = -0.5 * delayed;
@@ -418,4 +418,45 @@ fn source_mute_applies_after_compensation_and_route_reenable_keeps_current_histo
     assert_eq!([broadcast.left[255], broadcast.right[255]], [0.25, -0.125]);
     assert_eq!(capture.engine.output(0).unwrap().sample_peak(), 0.0);
     assert!(!health.failed());
+}
+
+#[test]
+fn room_is_processed_once_before_vst3_and_never_affects_aux_or_apps() {
+    use mixlive_effects::ReverbConfig;
+    let config = VocalConfig { reverb: ReverbConfig { mix: 0.5, decay_secs: 1.2, predelay_ms: 0.0 }, ..VocalConfig::default() };
+    let mut mic = vec![0.0; 4096];
+    mic[0] = 0.5;
+    let mut expected_left = vec![0.0; mic.len()];
+    let mut expected_right = vec![0.0; mic.len()];
+    VocalChain::new(48000, config).unwrap().process(&mic, &mut expected_left, &mut expected_right).unwrap();
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0); 3], true, 1).unwrap());
+    controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
+    let (writer, _reader) = channel(48000, 48000, 30, 3, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+        Some((0.0, AuxDestination::Send)), &[0.0], vec![(writer, vec![0, 1, 2])], health.clone(), controls).unwrap();
+    let mut position = 0;
+    let mut saw_stereo = false;
+    for block in mic.chunks(137) {
+        let end = position + block.len();
+        let aux = vec![[0.125, -0.25]; block.len()];
+        let app = vec![[-0.0625, 0.25]; block.len()];
+        capture.push_with_effect(block, Some(&aux), &[&app], &mut |left, right| {
+            assert_eq!(&*left, &expected_left[position..end]);
+            assert_eq!(&*right, &expected_right[position..end]);
+            saw_stereo |= left.iter().zip(right.iter()).any(|(l, r)| (l - r).abs() > 0.001);
+            for (l, r) in left.iter_mut().zip(right) { *l *= 0.5; *r *= 0.25; }
+            true
+        });
+        for mix in 0..3 {
+            let output = capture.engine.output(mix).unwrap();
+            let extra = match mix { 1 => aux[0], 2 => app[0], _ => [0.0; 2] };
+            for index in 0..block.len() {
+                assert!((output.left[index] - (expected_left[position + index] * 0.5 + extra[0])).abs() < 1e-6);
+                assert!((output.right[index] - (expected_right[position + index] * 0.25 + extra[1])).abs() < 1e-6);
+            }
+        }
+        position = end;
+    }
+    assert!(saw_stereo && !health.failed());
 }

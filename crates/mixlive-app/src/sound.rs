@@ -7,7 +7,7 @@ use mixlive_audio_windows::{
     plugin::{EffectSpec, PluginArgs},
     scene::AudioScene,
 };
-use mixlive_effects::{Preset, VocalConfig};
+use mixlive_effects::{Preset, ReverbConfig, VocalConfig};
 
 #[derive(Clone, Debug)]
 pub struct SoundDraft {
@@ -16,6 +16,9 @@ pub struct SoundDraft {
     pub strength: String,
     pub compressor_threshold_db: String,
     pub deess_threshold_db: String,
+    pub reverb_mix: String,
+    pub reverb_decay_secs: String,
+    pub reverb_predelay_ms: String,
     pub effects: Vec<EffectSpec>,
 }
 
@@ -37,6 +40,9 @@ impl SoundDraft {
             strength: config.strength.to_string(),
             compressor_threshold_db: config.compressor_threshold_db.to_string(),
             deess_threshold_db: config.deess_threshold_db.to_string(),
+            reverb_mix: config.reverb.mix.to_string(),
+            reverb_decay_secs: config.reverb.decay_secs.to_string(),
+            reverb_predelay_ms: config.reverb.predelay_ms.to_string(),
             effects,
         }
     }
@@ -52,6 +58,11 @@ impl SoundDraft {
             strength: number(&self.strength, "보정 비율")?,
             compressor_threshold_db: number(&self.compressor_threshold_db, "컴프레서 threshold")?,
             deess_threshold_db: number(&self.deess_threshold_db, "디에서 threshold")?,
+            reverb: ReverbConfig {
+                mix: number(&self.reverb_mix, "리버브 비율")?,
+                decay_secs: number(&self.reverb_decay_secs, "잔향 시간")?,
+                predelay_ms: number(&self.reverb_predelay_ms, "pre-delay")?,
+            },
         };
         config.validate().map_err(|error| error.to_string())?;
         Ok(config)
@@ -67,6 +78,9 @@ impl SoundDraft {
         route.vocal_strength = config.strength;
         route.vocal_threshold_db = config.compressor_threshold_db;
         route.deess_threshold_db = config.deess_threshold_db;
+        route.reverb_mix = config.reverb.mix;
+        route.reverb_decay_secs = config.reverb.decay_secs;
+        route.reverb_predelay_ms = config.reverb.predelay_ms;
         AudioScene::new(route, self.effects.clone()).map_err(|error| error.to_string())
     }
 
@@ -163,6 +177,9 @@ mod tests {
             "-23.75",
             "--deess-threshold-db",
             "-29.125",
+            "--reverb-mix", "0.2",
+            "--reverb-decay-secs", "1.75",
+            "--reverb-predelay-ms", "22.5",
             "--queue-ms",
             "47",
         ]);
@@ -200,6 +217,9 @@ mod tests {
         draft.strength = "0.375".into();
         draft.compressor_threshold_db = "-18.5".into();
         draft.deess_threshold_db = "-32.5".into();
+        draft.reverb_mix = "0.375".into();
+        draft.reverb_decay_secs = "2.5".into();
+        draft.reverb_predelay_ms = "7.5".into();
         let changed = draft.apply_to(&original.route).unwrap();
         let mut expected = original.route.clone();
         expected.vocal = Preset::Bright;
@@ -207,6 +227,9 @@ mod tests {
         expected.vocal_strength = 0.375;
         expected.vocal_threshold_db = -18.5;
         expected.deess_threshold_db = -32.5;
+        expected.reverb_mix = 0.375;
+        expected.reverb_decay_secs = 2.5;
+        expected.reverb_predelay_ms = 7.5;
         assert_eq!(changed.route, expected);
         assert_eq!(changed.effects, original.effects);
         assert_eq!(original.route, route());
@@ -308,6 +331,15 @@ mod tests {
         assert!(draft.vocal_config().is_err());
         draft.compressor_threshold_db = "-24".into();
         draft.deess_threshold_db = "1".into();
+        assert!(draft.vocal_config().is_err());
+        draft.deess_threshold_db = "-30".into();
+        draft.reverb_mix = "1.01".into();
+        assert!(draft.vocal_config().is_err());
+        draft.reverb_mix = "0.25".into();
+        draft.reverb_decay_secs = "NaN".into();
+        assert!(draft.vocal_config().is_err());
+        draft.reverb_decay_secs = "1.25".into();
+        draft.reverb_predelay_ms = "81".into();
         assert!(draft.vocal_config().is_err());
         assert_eq!(original.route, route());
     }

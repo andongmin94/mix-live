@@ -182,6 +182,9 @@ impl SceneDraft {
                 vocal_strength: vocal.strength,
                 vocal_threshold_db: vocal.compressor_threshold_db,
                 deess_threshold_db: vocal.deess_threshold_db,
+                reverb_mix: vocal.reverb.mix,
+                reverb_decay_secs: vocal.reverb.decay_secs,
+                reverb_predelay_ms: vocal.reverb.predelay_ms,
                 mix: self.mix,
                 queue_ms: self.queue_ms.trim().parse().map_err(|_| {
                     "Queue 목표에는 10~100 범위의 정수(ms)를 입력하세요.".to_owned()

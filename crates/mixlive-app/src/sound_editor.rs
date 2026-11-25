@@ -27,6 +27,9 @@ pub struct SoundEditor {
     strength: Entity<InputState>,
     compressor: Entity<InputState>,
     deesser: Entity<InputState>,
+    reverb_mix: Entity<InputState>,
+    reverb_decay: Entity<InputState>,
+    reverb_predelay: Entity<InputState>,
     busy: bool,
     picking: bool,
     error: Option<String>,
@@ -38,7 +41,7 @@ impl SoundEditor {
         let preset = cx.new(|cx| {
             SelectState::new(
                 [
-                    SelectItem::new("off", "Off · 내장 보정 끄기"),
+                    SelectItem::new("off", "Off · EQ/다이내믹스 끄기"),
                     SelectItem::new("natural", "Natural · 자연스럽게"),
                     SelectItem::new("warm", "Warm · 따뜻하게"),
                     SelectItem::new("bright", "Bright · 밝게"),
@@ -56,8 +59,11 @@ impl SoundEditor {
             cx,
         );
         let deesser = text_input("디에서 threshold", &draft.deess_threshold_db, window, cx);
+        let reverb_mix = text_input("리버브 비율", &draft.reverb_mix, window, cx);
+        let reverb_decay = text_input("잔향 시간", &draft.reverb_decay_secs, window, cx);
+        let reverb_predelay = text_input("리버브 pre-delay", &draft.reverb_predelay_ms, window, cx);
         let mut subscriptions = vec![cx.observe(&preset, |_, _, cx| cx.notify())];
-        for input in [&input_gain, &strength, &compressor, &deesser] {
+        for input in [&input_gain, &strength, &compressor, &deesser, &reverb_mix, &reverb_decay, &reverb_predelay] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
         }
         Self {
@@ -67,6 +73,9 @@ impl SoundEditor {
             strength,
             compressor,
             deesser,
+            reverb_mix,
+            reverb_decay,
+            reverb_predelay,
             busy: false,
             picking: false,
             error: None,
@@ -81,6 +90,9 @@ impl SoundEditor {
             strength: self.strength.read(cx).value().to_string(),
             compressor_threshold_db: self.compressor.read(cx).value().to_string(),
             deess_threshold_db: self.deesser.read(cx).value().to_string(),
+            reverb_mix: self.reverb_mix.read(cx).value().to_string(),
+            reverb_decay_secs: self.reverb_decay.read(cx).value().to_string(),
+            reverb_predelay_ms: self.reverb_predelay.read(cx).value().to_string(),
             effects: self.draft.effects.clone(),
         }
     }
@@ -103,6 +115,9 @@ impl SoundEditor {
             &self.strength,
             &self.compressor,
             &self.deesser,
+            &self.reverb_mix,
+            &self.reverb_decay,
+            &self.reverb_predelay,
         ] {
             input.update(cx, |state, cx| state.set_disabled(disabled, cx));
         }
@@ -298,11 +313,19 @@ impl Render for SoundEditor {
                     "sound-preset", "내장 보컬 보정", &self.preset, None, window, cx)))
                 .child(div().flex().flex_wrap().gap_5()
                     .child(field("sound-trim", "입력 trim", "−36~18 dB", &self.input_gain, window, cx))
-                    .child(field("sound-strength", "보정 비율", "0~1 · 원음/보정 blend", &self.strength, window, cx))
+                    .child(field("sound-strength", "보정 비율", "0~1 · EQ/다이내믹스 blend", &self.strength, window, cx))
                     .child(field("sound-compressor", "컴프레서 threshold", "−60~0 dBFS", &self.compressor, window, cx))
                     .child(field("sound-deesser", "디에서 threshold", "−60~0 dBFS", &self.deesser, window, cx)))
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child("저장한 값은 다음 오디오 시작부터 적용됩니다. 보정 비율은 음량 일치 기능이 아니며, 자동 makeup gain은 없습니다.")))
+            .child(panel().gap_4()
+                .child(section_title("ROOM", "스테레오 리버브"))
+                .child(div().flex().flex_wrap().gap_5()
+                    .child(field("reverb-mix", "리버브 비율", "0~1 · 0은 끄기", &self.reverb_mix, window, cx))
+                    .child(field("reverb-decay", "잔향 시간", "0.2~5초 · 저역 기준", &self.reverb_decay, window, cx))
+                    .child(field("reverb-predelay", "추가 pre-delay", "0~80 ms · wet만", &self.reverb_predelay, window, cx)))
+                .child(div().text_xs().text_color(rgb(MUTED))
+                    .child("내장 EQ·다이내믹스 뒤, VST3 앞에 적용합니다. 보컬 프리셋과 별개이며 원음 경로는 지연하지 않습니다. 설정은 다음 시작부터 적용됩니다.")))
             .children(self.error.as_ref().map(|error| panel().id("sound-editor-error")
                 .role(Role::Alert).aria_label(error.clone()).gap_2().border_color(rgb(DANGER))
                 .child(div().font_semibold().text_color(rgb(DANGER)).child("플러그인 목록을 변경하지 못했습니다"))

@@ -101,6 +101,9 @@ jobs:
           MIXLIVE_UI_QUEUE: '장치별 queue 목표'
           MIXLIVE_UI_EDIT: '보컬 설정'
           MIXLIVE_UI_TRIM: '마이크 입력 trim'
+          MIXLIVE_UI_REVERB: '리버브 비율'
+          MIXLIVE_UI_REVERB_DECAY: '잔향 시간'
+          MIXLIVE_UI_REVERB_PREDELAY: '리버브 pre-delay'
           MIXLIVE_UI_BLEND: '보컬 보정 비율'
           MIXLIVE_UI_MOVE_SECOND: 'VST3 2 위로'
           MIXLIVE_UI_WORKSPACE: 'Scene 작업 영역'
@@ -232,7 +235,7 @@ jobs:
           $savedPath = Join-Path $sceneDirectory 'Edited scene.mixlive-scene.json'
           $pluginPath = Join-Path $sceneDirectory 'not-installed.vst3'
           $scene = [ordered]@{
-            schema = 7
+            schema = 8
             route = [ordered]@{
               input = 'ci-absent-mic'; input_channel = 2
               aux_input = 'ci-absent-aux'; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
@@ -245,6 +248,7 @@ jobs:
               broadcast = 'ci-absent-broadcast'; broadcast_channels = @(2, 1)
               input_gain_db = 1.25; output_gain_db = -23; monitor_gain_db = -4; send_gain_db = -6; broadcast_gain_db = -11
               vocal = 'warm'; vocal_strength = 0.75; vocal_threshold_db = -20; deess_threshold_db = -28
+              reverb_mix = 0.125; reverb_decay_secs = 1.75; reverb_predelay_ms = 12.5
               queue_ms = 20
               mix = [ordered]@{
                 mute_mic = $true; mute_aux = $false; mute_output = $false; mute_send = $true; mute_broadcast = $false; mute_all = $true
@@ -341,6 +345,8 @@ jobs:
             if ((Wait-UiName $env:MIXLIVE_UI_START).Current.IsEnabled) { throw 'Audio start must be disabled while editing' }
             if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '1.25') { throw 'Saved mic trim was not loaded into the editor' }
             Set-UiValue $env:MIXLIVE_UI_TRIM '3.5'
+            if ((Read-UiValue $env:MIXLIVE_UI_REVERB) -cne '0.125') { throw 'Saved reverb was not loaded' }
+            Set-UiValue $env:MIXLIVE_UI_REVERB '0.25'
             Invoke-UiName $env:MIXLIVE_UI_MOVE_SECOND
             Invoke-UiName $env:MIXLIVE_UI_CANCEL
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
@@ -353,6 +359,10 @@ jobs:
             if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '1.25') { throw 'Cancelled edits changed the selected Scene' }
             Set-UiValue $env:MIXLIVE_UI_TRIM '3.5'
             Set-UiValue $env:MIXLIVE_UI_BLEND '0.5'
+            if ((Read-UiValue $env:MIXLIVE_UI_REVERB) -cne '0.125') { throw 'Cancelled reverb edit changed the selected Scene' }
+            Set-UiValue $env:MIXLIVE_UI_REVERB '0.375'
+            Set-UiValue $env:MIXLIVE_UI_REVERB_DECAY '2.5'
+            Set-UiValue $env:MIXLIVE_UI_REVERB_PREDELAY '25'
             Invoke-UiName $env:MIXLIVE_UI_MOVE_SECOND
             Invoke-UiName $env:MIXLIVE_UI_SAVE
 
@@ -405,11 +415,12 @@ jobs:
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
             if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
             $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json
-            if ($saved.schema -ne 7 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
+            if ($saved.schema -ne 8 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5 -or
+                $saved.route.reverb_mix -ne 0.375 -or $saved.route.reverb_decay_secs -ne 2.5 -or $saved.route.reverb_predelay_ms -ne 25) {
               throw 'The saved Scene did not contain the edited vocal values'
             }
             foreach ($field in $scene.route.Keys) {
-              if ($field -in @('input_gain_db', 'vocal_strength')) { continue }
+              if ($field -in @('input_gain_db', 'vocal_strength', 'reverb_mix', 'reverb_decay_secs', 'reverb_predelay_ms')) { continue }
               $expected = $scene.route[$field]
               $actual = $saved.route.$field
               if ($field -eq 'apps') {
@@ -446,7 +457,9 @@ jobs:
               throw 'Saving sound edits replaced the original Scene file'
             }
             Invoke-UiName $env:MIXLIVE_UI_EDIT
-            if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '3.5' -or (Read-UiValue $env:MIXLIVE_UI_BLEND) -cne '0.5') {
+            if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '3.5' -or (Read-UiValue $env:MIXLIVE_UI_BLEND) -cne '0.5' -or
+                (Read-UiValue $env:MIXLIVE_UI_REVERB) -cne '0.375' -or (Read-UiValue $env:MIXLIVE_UI_REVERB_DECAY) -cne '2.5' -or
+                (Read-UiValue $env:MIXLIVE_UI_REVERB_PREDELAY) -cne '25') {
               throw 'Saving did not select the newly saved Scene'
             }
             Invoke-UiName $env:MIXLIVE_UI_CANCEL

@@ -1,9 +1,13 @@
-//! Streaming mono vocal chain: trim -> HPF/tone -> RMS compression -> split-band de-essing.
+//! Streaming vocal chain: mono trim/EQ/dynamics/de-essing -> stereo room reverb.
 //! No automatic makeup gain, lookahead buffer, audio I/O or UI dependencies.
 //! Filters use biquad's RBJ coefficient implementation; presets are unvalidated starting points,
 //! not a claim of production sound quality. IIR phase/group delay is not zero.
 use std::{fmt, str::FromStr};
 use biquad::{Biquad, Coefficients, DirectForm2Transposed, Type, Q_BUTTERWORTH_F64};
+
+mod reverb;
+pub use reverb::ReverbConfig;
+use reverb::Reverb;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
@@ -38,10 +42,11 @@ pub struct VocalConfig {
     pub strength: f32,
     pub compressor_threshold_db: f32,
     pub deess_threshold_db: f32,
+    pub reverb: ReverbConfig,
 }
 impl Default for VocalConfig {
     fn default() -> Self {
-        Self { preset: Preset::Off, input_gain_db: 0.0, strength: 1.0, compressor_threshold_db: -24.0, deess_threshold_db: -30.0 }
+        Self { preset: Preset::Off, input_gain_db: 0.0, strength: 1.0, compressor_threshold_db: -24.0, deess_threshold_db: -30.0, reverb: ReverbConfig::default() }
     }
 }
 impl VocalConfig {
@@ -51,12 +56,13 @@ impl VocalConfig {
         if [self.compressor_threshold_db, self.deess_threshold_db].iter().any(|v| !v.is_finite() || !(-60.0..=0.0).contains(v)) {
             return Err(DspError::Threshold);
         }
+        self.reverb.validate()?;
         Ok(())
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DspError { Preset, InputGain, Strength, Threshold, SampleRate, Filter, NonFiniteAudio }
+pub enum DspError { Preset, InputGain, Strength, Threshold, ReverbMix, ReverbDecay, ReverbPredelay, SampleRate, Filter, BlockLength, NonFiniteAudio }
 impl fmt::Display for DspError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -64,8 +70,12 @@ impl fmt::Display for DspError {
             Self::InputGain => "input-gain-db must be finite and in -36..=18",
             Self::Strength => "vocal-strength must be finite and in 0..=1",
             Self::Threshold => "vocal thresholds must be finite and in -60..=0 dBFS",
+            Self::ReverbMix => "reverb-mix must be finite and in 0..=1",
+            Self::ReverbDecay => "reverb-decay-secs must be finite and in 0.2..=5",
+            Self::ReverbPredelay => "reverb-predelay-ms must be finite and in 0..=80",
             Self::SampleRate => "vocal presets require 32000..=192000 Hz; off supports 8000..=192000 Hz",
             Self::Filter => "could not prepare vocal filter coefficients",
+            Self::BlockLength => "vocal input and stereo output lengths must match",
             Self::NonFiniteAudio => "non-finite audio in vocal processing; block silenced",
         })
     }
@@ -190,6 +200,7 @@ pub struct VocalChain {
     config: VocalConfig,
     input_gain: f64,
     processing: Option<Processing>,
+    reverb: Option<Reverb>,
 }
 impl VocalChain {
     /// Construct on the control thread, before opening audio streams.
@@ -199,21 +210,28 @@ impl VocalChain {
         if !(minimum..=192_000).contains(&sample_rate) { return Err(DspError::SampleRate); }
         let processing = if config.preset == Preset::Off || config.strength == 0.0 { None }
             else { Some(Processing::new(f64::from(sample_rate), config)?) };
-        Ok(Self { config, input_gain: gain(f64::from(config.input_gain_db)), processing })
+        let reverb = if config.reverb.mix == 0.0 { None } else { Some(Reverb::new(sample_rate, config.reverb)?) };
+        Ok(Self { config, input_gain: gain(f64::from(config.input_gain_db)), processing, reverb })
     }
     pub fn config(&self) -> VocalConfig { self.config }
-    pub fn reset(&mut self) { if let Some(processing) = &mut self.processing { processing.reset(); } }
+    pub fn reset(&mut self) {
+        if let Some(processing) = &mut self.processing { processing.reset(); }
+        if let Some(reverb) = &mut self.reverb { reverb.reset(); }
+    }
 
-    /// Process any block length without allocation, locks, logging, or I/O.
-    /// Input/output remain mono; routing duplicates the processed source, not the DSP state.
-    /// An invalid block is silenced in full and returns an error; callers must stop that route.
-    pub fn process(&mut self, samples: &mut [f32]) -> Result<Meters, DspError> {
+    /// Process mono input into stereo output without allocation, locks, logging or I/O.
+    /// Zero reverb duplicates the processed mono signal exactly. Reverb is independent of EQ strength.
+    /// An invalid block silences both outputs and resets state; callers must stop that route.
+    pub fn process(&mut self, samples: &[f32], left: &mut [f32], right: &mut [f32]) -> Result<Meters, DspError> {
+        if left.len() != samples.len() || right.len() != samples.len() {
+            left.fill(0.0); right.fill(0.0); self.reset(); return Err(DspError::BlockLength);
+        }
         if samples.iter().any(|sample| !sample.is_finite()) {
-            samples.fill(0.0); self.reset(); return Err(DspError::NonFiniteAudio);
+            left.fill(0.0); right.fill(0.0); self.reset(); return Err(DspError::NonFiniteAudio);
         }
         let mut meters = Meters::default();
-        for sample in samples.iter_mut() {
-            let dry = f64::from(*sample) * self.input_gain;
+        for ((&sample, left), right) in samples.iter().zip(left.iter_mut()).zip(right.iter_mut()) {
+            let dry = f64::from(sample) * self.input_gain;
             let value = if let Some(processing) = &mut self.processing {
                 let mut wet = dry;
                 for filter in &mut processing.filters { wet = filter.run(wet); }
@@ -223,11 +241,13 @@ impl VocalChain {
                 meters.deessing_db = meters.deessing_db.max(processing.deesser.reduction as f32);
                 dry + f64::from(self.config.strength) * (wet - dry)
             } else { dry };
-            *sample = value as f32;
-            meters.output_peak = meters.output_peak.max(sample.abs());
+            let stereo = self.reverb.as_mut().map_or_else(|| [value; 2], |reverb| reverb.run(value));
+            *left = stereo[0] as f32;
+            *right = stereo[1] as f32;
+            meters.output_peak = meters.output_peak.max(left.abs()).max(right.abs());
         }
-        if samples.iter().any(|sample| !sample.is_finite()) {
-            samples.fill(0.0); self.reset(); return Err(DspError::NonFiniteAudio);
+        if left.iter().chain(right.iter()).any(|sample| !sample.is_finite()) {
+            left.fill(0.0); right.fill(0.0); self.reset(); return Err(DspError::NonFiniteAudio);
         }
         Ok(meters)
     }

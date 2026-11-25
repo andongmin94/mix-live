@@ -28,16 +28,20 @@ fn off_and_zero_strength_preserve_dry_audio_and_float_headroom() {
     let input = [0.0, -0.0, 0.25, -0.5, 1.5, -1.5];
     for config in [VocalConfig::default(), VocalConfig { preset: Preset::Bright, strength: 0.0, ..VocalConfig::default() }] {
         let mut chain = VocalChain::new(48000, config).unwrap();
-        let mut output = input;
-        let meters = chain.process(&mut output).unwrap();
+        let mut output = [0.0; 6];
+        let mut right = [0.0; 6];
+        let meters = chain.process(&input, &mut output, &mut right).unwrap();
         assert_eq!(input, output);
+        assert_eq!(input, right);
         assert_eq!(meters.compression_db, 0.0);
         assert_eq!(meters.deessing_db, 0.0);
         assert_eq!(meters.output_peak, 1.5);
     }
     let mut chain = VocalChain::new(8000, VocalConfig { input_gain_db: -6.0, ..VocalConfig::default() }).unwrap();
-    let mut output = input;
-    chain.process(&mut output).unwrap();
+    let mut output = [0.0; 6];
+    let mut right = [0.0; 6];
+    chain.process(&input, &mut output, &mut right).unwrap();
+    assert_eq!(output, right);
     for (a, b) in input.iter().zip(output) { assert!((f64::from(*a) * gain(-6.0) - f64::from(b)).abs() < 1e-7); }
 }
 
@@ -88,13 +92,19 @@ fn processing_is_invariant_to_callback_block_boundaries() {
     }
     for preset in [Preset::Natural, Preset::Warm, Preset::Bright] {
         let config = VocalConfig { preset, ..VocalConfig::default() };
-        let mut whole = input.clone();
-        VocalChain::new(48000, config).unwrap().process(&mut whole).unwrap();
+        let mut whole = vec![0.0; input.len()];
+        let mut whole_right = vec![0.0; input.len()];
+        VocalChain::new(48000, config).unwrap().process(&input, &mut whole, &mut whole_right).unwrap();
+        assert_eq!(whole, whole_right);
         for size in [1, 17, 256, 1024] {
-            let mut blocks = input.clone();
+            let mut blocks = vec![0.0; input.len()];
+            let mut right = vec![0.0; input.len()];
             let mut chain = VocalChain::new(48000, config).unwrap();
-            for part in blocks.chunks_mut(size) { chain.process(part).unwrap(); }
+            for ((part, left), right) in input.chunks(size).zip(blocks.chunks_mut(size)).zip(right.chunks_mut(size)) {
+                chain.process(part, left, right).unwrap();
+            }
             assert_eq!(whole, blocks, "preset {preset}, block {size}");
+            assert_eq!(whole_right, right);
         }
     }
 }
@@ -103,14 +113,110 @@ fn processing_is_invariant_to_callback_block_boundaries() {
 fn invalid_audio_silences_the_whole_block_and_resets_state() {
     let config = VocalConfig { preset: Preset::Natural, ..VocalConfig::default() };
     let mut chain = VocalChain::new(48000, config).unwrap();
-    chain.process(&mut [0.2; 128]).unwrap();
+    chain.process(&[0.2; 128], &mut [0.0; 128], &mut [0.0; 128]).unwrap();
     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        let mut block = [0.1, invalid, 0.2];
-        assert_eq!(chain.process(&mut block).unwrap_err(), DspError::NonFiniteAudio);
-        assert_eq!(block, [0.0; 3]);
-        let mut silence = [0.0; 256];
-        chain.process(&mut silence).unwrap();
-        assert_eq!(silence, [0.0; 256]);
+        let mut left = [1.0; 3];
+        let mut right = [1.0; 3];
+        assert_eq!(chain.process(&[0.1, invalid, 0.2], &mut left, &mut right).unwrap_err(), DspError::NonFiniteAudio);
+        assert_eq!(left, [0.0; 3]);
+        assert_eq!(right, [0.0; 3]);
+        let mut left = [1.0; 256];
+        let mut right = [1.0; 256];
+        chain.process(&[0.0; 256], &mut left, &mut right).unwrap();
+        assert_eq!(left, [0.0; 256]);
+        assert_eq!(right, [0.0; 256]);
     }
-    assert_eq!(chain.process(&mut []).unwrap().output_peak, 0.0);
+    assert_eq!(chain.process(&[], &mut [], &mut []).unwrap().output_peak, 0.0);
+}
+
+#[test]
+fn reverb_settings_are_validated_even_when_room_is_disabled() {
+    let valid = ReverbConfig { mix: 0.35, decay_secs: 1.5, predelay_ms: 25.0 };
+    for rate in [8000, 16000, 32000, 44100, 48000, 96000, 192000] {
+        assert!(VocalChain::new(rate, VocalConfig { reverb: valid, ..VocalConfig::default() }).is_ok());
+    }
+    for value in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+        let config = VocalConfig { reverb: ReverbConfig { mix: value, ..valid }, ..VocalConfig::default() };
+        assert_eq!(config.validate(), Err(DspError::ReverbMix));
+    }
+    for value in [f32::NAN, f32::INFINITY, 0.19, 5.01] {
+        let config = VocalConfig { reverb: ReverbConfig { mix: 0.0, decay_secs: value, ..valid }, ..VocalConfig::default() };
+        assert_eq!(config.validate(), Err(DspError::ReverbDecay));
+    }
+    for value in [f32::NAN, f32::INFINITY, -0.01, 80.01] {
+        let config = VocalConfig { reverb: ReverbConfig { predelay_ms: value, ..valid }, ..VocalConfig::default() };
+        assert_eq!(config.validate(), Err(DspError::ReverbPredelay));
+    }
+}
+
+#[test]
+fn stereo_room_keeps_dry_onset_and_predelay_shifts_only_the_wet_tail() {
+    let mut input = vec![0.0; 48000];
+    input[0] = 0.5;
+    let render = |mix, predelay_ms| {
+        let config = VocalConfig { reverb: ReverbConfig { mix, decay_secs: 1.2, predelay_ms }, ..VocalConfig::default() };
+        let mut left = vec![0.0; input.len()];
+        let mut right = vec![0.0; input.len()];
+        let meters = VocalChain::new(48000, config).unwrap().process(&input, &mut left, &mut right).unwrap();
+        let peak = left.iter().chain(&right).fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        assert_eq!(meters.output_peak, peak);
+        (left, right)
+    };
+    let (dry_left, dry_right) = render(0.0, 80.0);
+    assert_eq!(dry_left, input);
+    assert_eq!(dry_right, input);
+    let (wet_left, wet_right) = render(1.0, 0.0);
+    let (later_left, later_right) = render(1.0, 20.0);
+    let delay = 960;
+    assert!(later_left[..delay].iter().chain(&later_right[..delay]).all(|&sample| sample == 0.0));
+    assert_eq!(&later_left[delay..], &wet_left[..input.len() - delay]);
+    assert_eq!(&later_right[delay..], &wet_right[..input.len() - delay]);
+    assert!(wet_left.iter().zip(&wet_right).any(|(a, b)| (a - b).abs() > 0.001));
+    let (mixed_left, mixed_right) = render(0.25, 20.0);
+    assert_eq!([mixed_left[0], mixed_right[0]], [0.375; 2]);
+    for (mixed, wet) in mixed_left[1..].iter().zip(&later_left[1..]) {
+        assert!((mixed - wet * 0.25).abs() < 1e-7);
+    }
+    for (mixed, wet) in mixed_right[1..].iter().zip(&later_right[1..]) {
+        assert!((mixed - wet * 0.25).abs() < 1e-7);
+    }
+}
+
+#[test]
+fn room_decay_and_reset_are_finite_and_independent_of_block_size() {
+    let mut input = vec![0.0; 96_000];
+    input[0] = 0.5;
+    let render = |decay_secs| {
+        let config = VocalConfig { reverb: ReverbConfig { mix: 1.0, decay_secs, predelay_ms: 0.0 }, ..VocalConfig::default() };
+        let mut left = vec![0.0; input.len()];
+        let mut right = vec![0.0; input.len()];
+        let mut chain = VocalChain::new(48000, config).unwrap();
+        chain.process(&input, &mut left, &mut right).unwrap();
+        assert!(left.iter().chain(&right).all(|sample| sample.is_finite() && sample.abs() < 1.0));
+        (left, right)
+    };
+    let (short, _) = render(0.35);
+    let (long, long_right) = render(2.0);
+    assert!(rms(&long[38_400..48_000]) > 10.0 * rms(&short[38_400..48_000]));
+    assert!(rms(&long[86_400..]) < 0.05 * rms(&long[4800..14_400]));
+    let config = VocalConfig { reverb: ReverbConfig { mix: 1.0, decay_secs: 2.0, predelay_ms: 0.0 }, ..VocalConfig::default() };
+    let mut chain = VocalChain::new(48000, config).unwrap();
+    let mut left = vec![0.0; input.len()];
+    let mut right = vec![0.0; input.len()];
+    for ((part, left), right) in input.chunks(137).zip(left.chunks_mut(137)).zip(right.chunks_mut(137)) {
+        chain.process(part, left, right).unwrap();
+    }
+    assert_eq!(left, long);
+    assert_eq!(right, long_right);
+    // A nonfinite input must not leave a tail in a reused state.
+    assert_eq!(chain.process(&[f32::NAN], &mut [1.0], &mut [1.0]).unwrap_err(), DspError::NonFiniteAudio);
+    let silence = vec![0.0; 12_000];
+    chain.process(&silence, &mut left[..silence.len()], &mut right[..silence.len()]).unwrap();
+    assert_eq!(&left[..silence.len()], silence.as_slice());
+    assert_eq!(&right[..silence.len()], silence.as_slice());
+    let mut left = [1.0; 2];
+    let mut right = [1.0; 1];
+    assert_eq!(chain.process(&[0.1; 2], &mut left, &mut right).unwrap_err(), DspError::BlockLength);
+    assert_eq!(left, [0.0; 2]);
+    assert_eq!(right, [0.0; 1]);
 }

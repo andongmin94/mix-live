@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::control::MixSettings;
-use mixlive_effects::{Preset, VocalConfig};
+use mixlive_effects::{Preset, ReverbConfig, VocalConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -201,7 +201,7 @@ pub struct RouteOptions {
     /// Additional attenuation on the broadcast mix.
     #[arg(long, default_value = "0", allow_hyphen_values = true)]
     pub broadcast_gain_db: f32,
-    /// Vocal starting point: off, natural, warm or bright. No pitch correction or reverb yet.
+    /// Vocal starting point: off, natural, warm or bright. Reverb is configured separately; no pitch correction yet.
     #[arg(long, default_value_t = Preset::Off)]
     #[serde(with = "preset_serde")]
     pub vocal: Preset,
@@ -214,6 +214,15 @@ pub struct RouteOptions {
     /// High-band de-esser threshold (-60..0 dBFS).
     #[arg(long, default_value = "-30", allow_hyphen_values = true)]
     pub deess_threshold_db: f32,
+    /// Independent stereo room blend (0..1); zero bypasses the room entirely.
+    #[arg(long, default_value = "0")]
+    pub reverb_mix: f32,
+    /// Nominal low-frequency room decay (0.2..5 seconds).
+    #[arg(long, default_value = "1.2")]
+    pub reverb_decay_secs: f32,
+    /// Wet-only extra pre-delay (0..80 ms); does not delay dry voice.
+    #[arg(long, default_value = "15")]
+    pub reverb_predelay_ms: f32,
     /// Target per-endpoint queue depth, not round-trip latency or a hardware buffer size.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(10..=100))]
     pub queue_ms: u32,
@@ -235,7 +244,8 @@ impl RouteOptions {
 
     pub fn vocal_config(&self) -> VocalConfig {
         VocalConfig { preset: self.vocal, input_gain_db: self.input_gain_db, strength: self.vocal_strength,
-            compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db }
+            compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db,
+            reverb: ReverbConfig { mix: self.reverb_mix, decay_secs: self.reverb_decay_secs, predelay_ms: self.reverb_predelay_ms } }
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.input.trim().is_empty() || self.output.trim().is_empty() || self.input_channel == 0 {

@@ -175,11 +175,7 @@ fn spawn(mut capture: Capture, plugins: Vec<Plugin>, rate: u32, queue_ms: u32, h
                 for (buffer, sample) in app_buffers.iter_mut().zip(frame.apps).take(app_count) { buffer[i] = sample; }
             }
             let apps: [&[[f32; 2]]; MAX_APPS] = std::array::from_fn(|slot| &app_buffers[slot][..count]);
-            capture.push_with_effect(&mic[..count], has_aux.then_some(&aux[..count]), &apps[..app_count], &mut |voice, left, right| {
-                left.copy_from_slice(voice);
-                right.copy_from_slice(voice);
-                process_chain(&mut processors, left, right)
-            });
+            capture.push_with_effect(&mic[..count], has_aux.then_some(&aux[..count]), &apps[..app_count], &mut |left, right| process_chain(&mut processors, left, right));
         }
     }).map_err(|e| e.to_string())?);
     Ok((QueuedInput { writer, has_aux, app_count, health }, owner))

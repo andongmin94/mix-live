@@ -23,7 +23,7 @@ impl AudioScene {
         // CLI paths refer to the current working directory, not a future scene directory.
         // absolute() does not require the plugin to be present or execute its native code.
         for effect in &mut effects { effect.plugin = std::path::absolute(&effect.plugin)?; }
-        Ok(Self { schema: 7, route, effects })
+        Ok(Self { schema: 8, route, effects })
     }
 
     /// Relative paths in a hand-authored scene are anchored to that scene, never the caller's cwd.
@@ -39,7 +39,7 @@ impl AudioScene {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != 7 { return Err("unsupported MixLive scene schema; create a schema 7 scene".into()); }
+        if self.schema != 8 { return Err("unsupported MixLive scene schema; create a schema 8 scene".into()); }
         self.route.validate()?;
         validate_effects(&self.effects)?;
         Ok(())
@@ -74,7 +74,8 @@ mod tests {
             "--send", "test-cable", "--send-channels", "1", "--send-gain-db", "-6",
             "--input-gain-db", "3", "--output-gain-db", "-12", "--vocal", "warm",
             "--vocal-strength", "0.75", "--vocal-threshold-db", "-20",
-            "--deess-threshold-db", "-28", "--queue-ms", "20",
+            "--deess-threshold-db", "-28", "--reverb-mix", "0.18", "--reverb-decay-secs", "1.75",
+            "--reverb-predelay-ms", "22.5", "--queue-ms", "20",
         ]).unwrap();
         let Command::Check(route) = cli.command else { panic!("expected check") };
         route
@@ -190,7 +191,7 @@ mod tests {
         let path = directory.path().join("invalid.mixlive-scene.json");
         let original = serde_json::to_value(AudioScene::new(route(), vec![]).unwrap()).unwrap();
         let mut cases = Vec::new();
-        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("unknown", json!(true))] {
+        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("schema", json!(7)), ("unknown", json!(true))] {
             let mut document = original.clone();
             document[key] = value;
             cases.push(document);
@@ -203,6 +204,7 @@ mod tests {
             ("input_gain_db", json!(100)), ("output_gain_db", json!(1)),
             ("vocal_strength", json!(2)), ("vocal", json!("magic")),
             ("vocal_threshold_db", json!(-100)), ("deess_threshold_db", json!(1)),
+            ("reverb_mix", json!(1.1)), ("reverb_decay_secs", json!(0.1)), ("reverb_predelay_ms", json!(81)),
             ("aux_input", json!(" ")), ("apps", json!([{"path":" "}])) , ("aux_channels", json!([0])),
             ("aux_gain_db", json!(1)), ("aux_to", json!("magic")),
             ("unknown", json!(true)),
@@ -217,6 +219,9 @@ mod tests {
             document["effects"] = effects;
             cases.push(document);
         }
+        let mut missing_reverb = original.clone();
+        missing_reverb["route"].as_object_mut().unwrap().remove("reverb_mix");
+        cases.push(missing_reverb);
         let mut missing_mix = original.clone();
         missing_mix["route"].as_object_mut().unwrap().remove("mix");
         cases.push(missing_mix);

@@ -29,7 +29,6 @@ impl VocalStats {
 pub struct Capture {
     engine: Engine,
     vocal: VocalChain,
-    scratch: [f32; CAPTURE_BLOCK],
     voice_left: [f32; CAPTURE_BLOCK],
     voice_right: [f32; CAPTURE_BLOCK],
     aux_enabled: bool,
@@ -67,7 +66,7 @@ impl Capture {
             }
         }
         let mut scene = Scene {
-            // Mono voice is duplicated after native DSP; a VST3 may produce different L/R.
+            // The built-in chain produces stereo, and VST3 preserves both channels.
             sources: vec![Source { name: "Processed mic".into(), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false }],
             mixes: (0..mix_count).map(|index| Mix {
                 name: format!("Output {index}"), gain_db: 0.0, muted: false, excluded_sources: vec![],
@@ -98,7 +97,7 @@ impl Capture {
         let route_ramps = std::array::from_fn(|index| GainRamp::new(sample_rate,
             if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
         let source_mutes = controls.source_targets().map(|gain| GainRamp::new(sample_rate, gain));
-        Ok(Self { engine, vocal, scratch: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
+        Ok(Self { engine, vocal, voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
             aux_enabled: aux.is_some(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
             app_count: app_gains.len(), app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
             controls, source_slots, mix_slots, source_mutes, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
@@ -134,14 +133,12 @@ impl Capture {
 
     /// Built-in-only route. All supplemental sources are converted to the mic clock.
     pub fn push(&mut self, samples: &[f32], aux: Option<&[[f32; 2]]>, apps: &[&[[f32; 2]]]) {
-        self.push_with_effect(samples, aux, apps, &mut |voice, left, right| {
-            left.copy_from_slice(voice); right.copy_from_slice(voice); true
-        });
+        self.push_with_effect(samples, aux, apps, &mut |_, _| true);
     }
     /// External effect seam used by the dedicated VST3 worker, never by a device callback.
-    /// The effect receives only processed voice. False/nonfinite output latches a fault; no dry fallback.
+    /// The effect transforms the built-in stereo voice in place. False/nonfinite output latches a fault.
     pub(crate) fn push_with_effect(&mut self, samples: &[f32], aux: Option<&[[f32; 2]]>, apps: &[&[[f32; 2]]],
-        effect: &mut impl FnMut(&[f32], &mut [f32], &mut [f32]) -> bool) {
+        effect: &mut impl FnMut(&mut [f32], &mut [f32]) -> bool) {
         if self.health.failed() { return; }
         if aux.is_some() != self.aux_enabled || aux.is_some_and(|frames| frames.len() != samples.len())
             || apps.len() != self.app_count || apps.iter().any(|frames| frames.len() != samples.len()) {
@@ -169,13 +166,10 @@ impl Capture {
             }
             let envelopes: [&[f32]; MAX_ROUTES] = std::array::from_fn(|index| &self.route_envelopes[index][..block.len()]);
             let envelopes = &envelopes[..self.route_count];
-            let processed = &mut self.scratch[..block.len()];
-            processed.copy_from_slice(block);
-            let Ok(meters) = self.vocal.process(processed) else { self.health.fail(Fault::Input); return; };
             let left = &mut self.voice_left[..block.len()];
             let right = &mut self.voice_right[..block.len()];
-            left.fill(0.0); right.fill(0.0);
-            if !effect(processed, left, right) || left.iter().chain(right.iter()).any(|s| !s.is_finite()) {
+            let Ok(meters) = self.vocal.process(block, left, right) else { self.health.fail(Fault::Input); return; };
+            if !effect(left, right) || left.iter().chain(right.iter()).any(|s| !s.is_finite()) {
                 self.health.fail(Fault::Routing); return;
             }
             // Keep both DSP stages running while source-muted, including their tail/history.

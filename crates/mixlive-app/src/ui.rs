@@ -756,7 +756,13 @@ impl MixLive {
                         "보정 비율 {:.0}% · 이후 VST3 {}개",
                         route.vocal_strength * 100.0,
                         scene.effects.len()
-                    ))),
+                    )))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(if route.reverb_mix == 0.0 {
+                        "스테레오 리버브 · 꺼짐".to_owned()
+                    } else {
+                        format!("리버브 {:.0}% · {:.2} s · pre-delay {:.1} ms", route.reverb_mix * 100.0,
+                            route.reverb_decay_secs, route.reverb_predelay_ms)
+                    })),
             );
         if scene.effects.is_empty() {
             sound = sound.child(
@@ -818,7 +824,7 @@ impl MixLive {
                 div()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child("AUX / MR은 보컬 체인을 거치지 않습니다."),
+                    .child("AUX / MR과 앱 소스는 보컬 체인을 거치지 않습니다."),
             )
             .child(
                 button("edit-sound", "보컬 설정", false)
