@@ -1,14 +1,14 @@
 //! Bounded SPSC clock transport. Output mixes share a bridge; AUX uses one at its input boundary.
 //! Rubato owns the anti-alias filter; we only steer its ratio from queue occupancy.
 use std::sync::{Arc, atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering}};
-use crate::config::MAX_APPS;
+use crate::config::{MAX_APPS, MAX_MIXES};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 
 pub const QUANTUM: usize = 128;
-/// At most two stereo mixes, packed in the endpoint's route order. Unused lanes stay zero.
-pub type OutputFrame = [f32; 4];
+/// At most three stereo mixes, packed in the endpoint's route order. Unused lanes stay zero.
+pub type OutputFrame = [f32; MAX_MIXES * 2];
 const MAX_CORRECTION: f64 = 0.001; // +/- 1000 ppm. This is not an audio device latency claim.
 const CEILING: f32 = 0.98; // Sample clipping guard, NOT a transparent or true-peak limiter.
 
@@ -49,12 +49,12 @@ pub struct OutputStats {
     pub clipped_frames: AtomicU64,
     pub queue_frames: AtomicU64,
     pub correction_ppm: AtomicI32,
-    peaks: [AtomicU32; 2],
+    peaks: [AtomicU32; MAX_MIXES],
 }
 impl OutputStats {
     /// One peak per stereo mix in endpoint lane order, after playback gain and clipping.
     /// Only the control thread consumes these interval maxima.
-    pub fn take_peaks(&self) -> [f32; 2] {
+    pub fn take_peaks(&self) -> [f32; MAX_MIXES] {
         std::array::from_fn(|lane| f32::from_bits(self.peaks[lane].swap(0, Ordering::Relaxed)))
     }
 }
@@ -99,7 +99,7 @@ pub fn channel(input_rate: u32, output_rate: u32, queue_ms: u32, mixes: usize, h
     if !(8_000..=192_000).contains(&input_rate) || !(8_000..=192_000).contains(&output_rate) || !(10..=100).contains(&queue_ms) {
         return Err("rates must be 8000..=192000 Hz and queue depth 10..=100 ms".into());
     }
-    if !(1..=2).contains(&mixes) { return Err("an endpoint carries one or two stereo mixes".into()); }
+    if !(1..=MAX_MIXES).contains(&mixes) { return Err("an endpoint carries one to three stereo mixes".into()); }
     let channels = mixes * 2;
     let resampler = Async::<f32>::new_sinc(
         f64::from(output_rate) / f64::from(input_rate), 1.002,
@@ -127,7 +127,7 @@ pub fn channel(input_rate: u32, output_rate: u32, queue_ms: u32, mixes: usize, h
 impl OutputReader {
     /// All mixes for ONE output frame. Validated linear playback gains (0..=1) are
     /// applied after resampling and before the final sample clipping guard and peak meter.
-    pub(crate) fn next_frame(&mut self, gains: [f32; 2]) -> OutputFrame {
+    pub(crate) fn next_frame(&mut self, gains: [f32; MAX_MIXES]) -> OutputFrame {
         let mut frame = self.read_frame();
         for (lane, stereo) in frame.chunks_exact_mut(2).enumerate() {
             for sample in stereo { *sample *= gains[lane]; }
@@ -151,14 +151,14 @@ impl OutputReader {
     }
 
     fn read_frame(&mut self) -> OutputFrame {
-        if self.health.failed() || (self.cursor == self.valid && !self.refill()) { return [0.0; 4]; }
-        let mut frame = [0.0; 4];
+        if self.health.failed() || (self.cursor == self.valid && !self.refill()) { return [0.0; 6]; }
+        let mut frame = [0.0; 6];
         let start = self.cursor * self.channels;
         frame[..self.channels].copy_from_slice(&self.output[start..start + self.channels]);
         self.cursor += 1;
         if !frame.iter().all(|x| x.is_finite()) {
             self.health.fail(Fault::Resampler);
-            return [0.0; 4];
+            return [0.0; 6];
         }
         frame
     }
@@ -216,16 +216,16 @@ mod tests {
     fn rate_conversion_keeps_stereo_and_faults_silence_pending_audio() {
         let health = Arc::new(Health::default());
         let (mut writer, mut reader) = channel(44_100, 48_000, 30, 1, health.clone()).unwrap();
-        for _ in 0..reader.target { writer.push([0.2, -0.1, 0.0, 0.0]); }
+        for _ in 0..reader.target { writer.push([0.2, -0.1, 0.0, 0.0, 0.0, 0.0]); }
         for _ in 0..100 {
-            for _ in 0..reader.resampler.input_frames_next() { writer.push([0.2, -0.1, 0.0, 0.0]); }
-            for _ in 0..QUANTUM { let _ = reader.next_frame([1.0; 2]); }
+            for _ in 0..reader.resampler.input_frames_next() { writer.push([0.2, -0.1, 0.0, 0.0, 0.0, 0.0]); }
+            for _ in 0..QUANTUM { let _ = reader.next_frame([1.0; 3]); }
         }
-        let frame = reader.next_frame([1.0; 2]);
+        let frame = reader.next_frame([1.0; 3]);
         assert!((frame[0] - 0.2).abs() < 0.001 && (frame[1] + 0.1).abs() < 0.001);
-        assert_eq!(&frame[2..], &[0.0; 2]);
+        assert_eq!(&frame[2..], &[0.0; 4]);
         health.fail(Fault::Device);
-        assert_eq!(reader.next_frame([1.0; 2]), [0.0; 4]);
+        assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
     }
 
     #[test]
@@ -233,12 +233,12 @@ mod tests {
         for ppm in [-500.0, 500.0] {
             let health = Arc::new(Health::default());
             let (mut writer, mut reader) = channel(16_000, 16_000, 30, 1, health.clone()).unwrap();
-            for _ in 0..reader.target { writer.push([0.1, 0.1, 0.0, 0.0]); }
+            for _ in 0..reader.target { writer.push([0.1, 0.1, 0.0, 0.0, 0.0, 0.0]); }
             let mut fraction = 0.0;
             for _ in 0..3750 { // 30 simulated seconds, no wall-clock sleeps.
                 fraction += QUANTUM as f64 * (1.0 + ppm / 1_000_000.0);
-                while fraction >= 1.0 { writer.push([0.1, 0.1, 0.0, 0.0]); fraction -= 1.0; }
-                for _ in 0..QUANTUM { let _ = reader.next_frame([1.0; 2]); }
+                while fraction >= 1.0 { writer.push([0.1, 0.1, 0.0, 0.0, 0.0, 0.0]); fraction -= 1.0; }
+                for _ in 0..QUANTUM { let _ = reader.next_frame([1.0; 3]); }
             }
             assert!(!health.failed(), "{ppm}: {:?}", health.error());
             assert_eq!(reader.stats.underruns.load(Ordering::Relaxed), 0);
@@ -251,30 +251,30 @@ mod tests {
     fn starvation_overflow_and_clip_guard_are_explicit() {
         let health = Arc::new(Health::default());
         let (mut writer, mut reader) = channel(48_000, 48_000, 30, 1, health.clone()).unwrap();
-        assert_eq!(reader.next_frame([1.0; 2]), [0.0; 4]);
-        for _ in 0..reader.target { writer.push([2.0, -2.0, 0.0, 0.0]); }
-        for _ in 0..reader.target * 2 { assert!(reader.next_frame([1.0; 2]).iter().all(|x| x.abs() <= CEILING)); }
+        assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
+        for _ in 0..reader.target { writer.push([2.0, -2.0, 0.0, 0.0, 0.0, 0.0]); }
+        for _ in 0..reader.target * 2 { assert!(reader.next_frame([1.0; 3]).iter().all(|x| x.abs() <= CEILING)); }
         assert!(reader.stats.clipped_frames.load(Ordering::Relaxed) > 0);
         assert!(reader.stats.underruns.load(Ordering::Relaxed) > 0);
-        assert_eq!(reader.next_frame([1.0; 2]), [0.0; 4]);
-        for _ in 0..reader.target * 4 + 1 { writer.push([0.2, 0.2, 0.0, 0.0]); }
+        assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
+        for _ in 0..reader.target * 4 + 1 { writer.push([0.2, 0.2, 0.0, 0.0, 0.0, 0.0]); }
         assert!(health.failed());
-        assert_eq!(reader.next_frame([1.0; 2]), [0.0; 4]);
+        assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
         assert!(channel(0, 48_000, 30, 1, health.clone()).is_err());
         assert!(channel(48_000, 48_000, 0, 1, health.clone()).is_err());
-        for mixes in [0, 3] { assert!(channel(48_000, 48_000, 30, mixes, health.clone()).is_err()); }
+        for mixes in [0, 4] { assert!(channel(48_000, 48_000, 30, mixes, health.clone()).is_err()); }
     }
 
     #[test]
     fn shared_mixes_keep_sample_alignment_and_silence_together() {
         let health = Arc::new(Health::default());
-        let (mut writer, mut reader) = channel(44_100, 48_000, 10, 2, health.clone()).unwrap();
+        let (mut writer, mut reader) = channel(44_100, 48_000, 10, 3, health.clone()).unwrap();
         let mut position = 0;
         let mut push = |count: usize| {
             for _ in 0..count {
                 let a = (position as f32 * 0.07).sin() * 0.3;
                 let b = (position as f32 * 0.13).cos() * 0.2;
-                writer.push([a, b, a * 0.25, b * -0.5]);
+                writer.push([a, b, a * 0.25, b * -0.5, -a * 0.125, b * 0.75]);
                 position += 1;
             }
         };
@@ -283,29 +283,31 @@ mod tests {
         for _ in 0..50 {
             push(reader.resampler.input_frames_next());
             for _ in 0..QUANTUM {
-                let frame = reader.next_frame([1.0; 2]);
+                let frame = reader.next_frame([1.0; 3]);
                 assert!((frame[2] - frame[0] * 0.25).abs() < 1e-6);
                 assert!((frame[3] + frame[1] * 0.5).abs() < 1e-6);
+                assert!((frame[4] + frame[0] * 0.125).abs() < 1e-6);
+                assert!((frame[5] - frame[1] * 0.75).abs() < 1e-6);
                 peak = peak.max(frame[0].abs());
             }
         }
         assert!(peak > 0.2);
         assert!(!health.failed());
-        for _ in 0..reader.target * 3 { reader.next_frame([1.0; 2]); }
+        for _ in 0..reader.target * 3 { reader.next_frame([1.0; 3]); }
         assert!(reader.stats.underruns.load(Ordering::Relaxed) > 0);
-        assert_eq!(reader.next_frame([1.0; 2]), [0.0; 4]);
+        assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
         health.fail(Fault::Device);
-        assert_eq!(reader.next_frame([1.0; 2]), [0.0; 4]);
+        assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
     }
     #[test]
     fn aux_clock_conversion_preserves_headroom_before_source_attenuation() {
         let health = Arc::new(Health::default());
         let (mut writer, mut reader) = channel(44_100, 48_000, 10, 1, health.clone()).unwrap();
         assert_eq!(reader.next_source_frame(), [0.0; 2]);
-        for _ in 0..reader.target { writer.push([2.0, -1.5, 0.0, 0.0]); }
+        for _ in 0..reader.target { writer.push([2.0, -1.5, 0.0, 0.0, 0.0, 0.0]); }
         let mut sample = [0.0; 2];
         for _ in 0..12 {
-            for _ in 0..reader.resampler.input_frames_next() { writer.push([2.0, -1.5, 0.0, 0.0]); }
+            for _ in 0..reader.resampler.input_frames_next() { writer.push([2.0, -1.5, 0.0, 0.0, 0.0, 0.0]); }
             for _ in 0..QUANTUM { sample = reader.next_source_frame(); }
         }
         assert!((sample[0] - 2.0).abs() < 0.001 && (sample[1] + 1.5).abs() < 0.001);
@@ -313,7 +315,7 @@ mod tests {
         for _ in 0..reader.target * 3 { reader.next_source_frame(); }
         assert!(reader.stats.underruns.load(Ordering::Relaxed) > 0);
         assert_eq!(reader.next_source_frame(), [0.0; 2]);
-        writer.push([f32::NAN, 0.0, 0.0, 0.0]);
+        writer.push([f32::NAN, 0.0, 0.0, 0.0, 0.0, 0.0]);
         assert!(health.failed());
         assert_eq!(reader.next_source_frame(), [0.0; 2]);
     }

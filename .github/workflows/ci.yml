@@ -83,6 +83,7 @@ jobs:
           MIXLIVE_UI_OUTPUT: '주 출력 · 필수'
           MIXLIVE_UI_AUX: 'AUX / MR · 선택'
           MIXLIVE_UI_SEND: '추가 송출 · 선택'
+          MIXLIVE_UI_BROADCAST: '방송 송출 · 선택'
           MIXLIVE_UI_REQUIRED: '내 목소리 입력 장치를 선택하세요.'
           MIXLIVE_UI_DEVICES: '장치·출력 설정'
           MIXLIVE_UI_MISSING_PREFIX: '현재 없는 장치 · '
@@ -91,8 +92,11 @@ jobs:
           MIXLIVE_UI_AUX_CHANNELS: 'AUX 채널'
           MIXLIVE_UI_OUTPUT_CHANNELS: '주 출력 채널'
           MIXLIVE_UI_SEND_CHANNELS: '추가 송출 채널'
+          MIXLIVE_UI_BROADCAST_CHANNELS: '방송 송출 채널'
           MIXLIVE_UI_OUTPUT_GAIN: '전체 시작 음량'
           MIXLIVE_UI_SEND_GAIN: '추가 송출 시작 음량'
+          MIXLIVE_UI_MONITOR_GAIN: '모니터 시작 음량'
+          MIXLIVE_UI_BROADCAST_GAIN: '방송 송출 시작 음량'
           MIXLIVE_UI_AUX_GAIN: 'AUX 입력 음량'
           MIXLIVE_UI_QUEUE: '장치별 queue 목표'
           MIXLIVE_UI_EDIT: '보컬 설정'
@@ -228,23 +232,24 @@ jobs:
           $savedPath = Join-Path $sceneDirectory 'Edited scene.mixlive-scene.json'
           $pluginPath = Join-Path $sceneDirectory 'not-installed.vst3'
           $scene = [ordered]@{
-            schema = 6
+            schema = 7
             route = [ordered]@{
               input = 'ci-absent-mic'; input_channel = 2
               aux_input = 'ci-absent-aux'; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
               apps = @(
-                [ordered]@{ path = 'C:\ci-fixtures\missing-browser.exe'; channels = @(1, 2); gain_db = -12; to = 'send'; muted = $false; output_gain_db = -7; send_gain_db = -3 },
-                [ordered]@{ path = 'C:\ci-fixtures\missing-call.exe'; channels = @(2, 1); gain_db = -9; to = 'output'; muted = $true; output_gain_db = -5; send_gain_db = -11 }
+                [ordered]@{ path = 'C:\ci-fixtures\missing-browser.exe'; channels = @(1, 2); gain_db = -12; to = 'send'; muted = $false; output_gain_db = -7; send_gain_db = -3; broadcast_gain_db = -13 },
+                [ordered]@{ path = 'C:\ci-fixtures\missing-call.exe'; channels = @(2, 1); gain_db = -9; to = 'output'; muted = $true; output_gain_db = -5; send_gain_db = -11; broadcast_gain_db = -2 }
               )
               output = 'ci-absent-output'; output_channels = @(4, 3)
               send = 'ci-absent-send'; send_channels = @(1)
-              input_gain_db = 1.25; output_gain_db = -23; send_gain_db = -6
+              broadcast = 'ci-absent-broadcast'; broadcast_channels = @(2, 1)
+              input_gain_db = 1.25; output_gain_db = -23; monitor_gain_db = -4; send_gain_db = -6; broadcast_gain_db = -11
               vocal = 'warm'; vocal_strength = 0.75; vocal_threshold_db = -20; deess_threshold_db = -28
               queue_ms = 20
               mix = [ordered]@{
-                mute_mic = $true; mute_aux = $false; mute_output = $false; mute_send = $true; mute_all = $true
-                mic_output_enabled = $false; mic_send_enabled = $true
-                mic_output_gain_db = -13; mic_send_gain_db = -7; aux_output_gain_db = -11; aux_send_gain_db = -12
+                mute_mic = $true; mute_aux = $false; mute_output = $false; mute_send = $true; mute_broadcast = $false; mute_all = $true
+                mic_output_enabled = $false; mic_send_enabled = $true; mic_broadcast_enabled = $false
+                mic_output_gain_db = -13; mic_send_gain_db = -7; mic_broadcast_gain_db = -3; aux_output_gain_db = -11; aux_send_gain_db = -12; aux_broadcast_gain_db = -5
               }
             }
             effects = @(
@@ -270,11 +275,14 @@ jobs:
               @($env:MIXLIVE_UI_MIC, 'ci-absent-mic', $env:MIXLIVE_UI_MIC_CHANNEL, '2'),
               @($env:MIXLIVE_UI_AUX, 'ci-absent-aux', $env:MIXLIVE_UI_AUX_CHANNELS, '4,3'),
               @($env:MIXLIVE_UI_OUTPUT, 'ci-absent-output', $env:MIXLIVE_UI_OUTPUT_CHANNELS, '4,3'),
-              @($env:MIXLIVE_UI_SEND, 'ci-absent-send', $env:MIXLIVE_UI_SEND_CHANNELS, '1')
+              @($env:MIXLIVE_UI_SEND, 'ci-absent-send', $env:MIXLIVE_UI_SEND_CHANNELS, '1'),
+              @($env:MIXLIVE_UI_BROADCAST, 'ci-absent-broadcast', $env:MIXLIVE_UI_BROADCAST_CHANNELS, '2,1')
             )
             $startupValues = @(
               @($env:MIXLIVE_UI_OUTPUT_GAIN, '-23'),
               @($env:MIXLIVE_UI_SEND_GAIN, '-6'),
+              @($env:MIXLIVE_UI_MONITOR_GAIN, '-4'),
+              @($env:MIXLIVE_UI_BROADCAST_GAIN, '-11'),
               @($env:MIXLIVE_UI_AUX_GAIN, '-9'),
               @($env:MIXLIVE_UI_QUEUE, '20')
             )
@@ -315,6 +323,8 @@ jobs:
                 }
                 Set-UiValue $env:MIXLIVE_UI_OUTPUT_GAIN '-31'
                 Set-UiValue $env:MIXLIVE_UI_SEND_GAIN '-14'
+                Set-UiValue $env:MIXLIVE_UI_MONITOR_GAIN '-9'
+                Set-UiValue $env:MIXLIVE_UI_BROADCAST_GAIN '-17'
                 Set-UiValue $env:MIXLIVE_UI_AUX_GAIN '-15'
                 Set-UiValue $env:MIXLIVE_UI_QUEUE '40'
               }
@@ -395,7 +405,7 @@ jobs:
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
             if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
             $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json
-            if ($saved.schema -ne 6 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
+            if ($saved.schema -ne 7 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
               throw 'The saved Scene did not contain the edited vocal values'
             }
             foreach ($field in $scene.route.Keys) {

@@ -5,7 +5,7 @@ use mixlive_effects::{Preset, VocalConfig};
 #[test]
 fn one_capture_feeds_two_independent_mixes_without_dry_bypass() {
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, Some(-6.0), false, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(-6.0), None], false, 0).unwrap());
     let (first, mut monitor) = channel(48_000, 48_000, 10, 1, health.clone()).unwrap();
     let (second, mut send) = channel(48_000, 48_000, 10, 1, health.clone()).unwrap();
     let mut a_gain = PlaybackGains::new(48000, &[0], controls.clone()).unwrap();
@@ -21,8 +21,8 @@ fn one_capture_feeds_two_independent_mixes_without_dry_bypass() {
     assert!((b / a - 10.0_f32.powf(-6.0 / 20.0)).abs() < 0.001);
     capture.push(&[f32::NAN], None, &[]);
     assert!(health.failed());
-    assert_eq!(monitor.next_frame(a_gain.next_gains()), [0.0; 4]);
-    assert_eq!(send.next_frame(b_gain.next_gains()), [0.0; 4]);
+    assert_eq!(monitor.next_frame(a_gain.next_gains()), [0.0; 6]);
+    assert_eq!(send.next_frame(b_gain.next_gains()), [0.0; 6]);
 }
 
 #[test]
@@ -32,7 +32,7 @@ fn vocal_is_processed_once_before_sends_and_playback_attenuation() {
     let mut expected = input.clone();
     VocalChain::new(48000, config).unwrap().process(&mut expected).unwrap();
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(-18.0, Some(-6.0), false, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], false, 0).unwrap());
     let (first, _a) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let (second, _b) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000, None, &[],
@@ -59,7 +59,7 @@ fn vocal_is_processed_once_before_sends_and_playback_attenuation() {
 fn shared_endpoint_applies_independent_gains_after_one_resampler() {
     use crate::config::{OutputMap, output_sample};
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(-6.0, Some(-12.0), false, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(-6.0, [Some(0.0), Some(-12.0), None], false, 0).unwrap());
     let (writer, mut reader) = channel(48_000, 48_000, 10, 2, health.clone()).unwrap();
     let mut gains = PlaybackGains::new(48000, &[0, 1], controls.clone()).unwrap();
     let vocal = VocalChain::new(48000, VocalConfig::default()).unwrap();
@@ -78,18 +78,18 @@ fn shared_endpoint_applies_independent_gains_after_one_resampler() {
     let peaks = reader.stats.take_peaks();
     assert!(peaks[0] > 0.0 && peaks[1] > 0.0);
     assert!((peaks[1] / peaks[0] - 10.0_f32.powf(-12.0 / 20.0)).abs() < 1e-5);
-    assert_eq!(reader.stats.take_peaks(), [0.0; 2]);
+    assert_eq!(reader.stats.take_peaks(), [0.0; 3]);
     assert_eq!(health.captured_frames.load(Ordering::Relaxed), prime as u64);
     capture.push(&[f32::NAN], None, &[]);
     assert!(health.failed());
-    assert_eq!(reader.next_frame(gains.next_gains()), [0.0; 4]);
+    assert_eq!(reader.next_frame(gains.next_gains()), [0.0; 6]);
 }
 
 #[test]
 fn aux_is_stereo_selective_and_never_passes_through_vocal_processing() {
     for destination in [AuxDestination::Output, AuxDestination::Send, AuxDestination::Both] {
         let health = Arc::new(Health::default());
-        let controls = Arc::new(LiveControls::new(-18.0, Some(-6.0), true, 0).unwrap());
+        let controls = Arc::new(LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], true, 0).unwrap());
         let (writer, _reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
         let config = VocalConfig { preset: Preset::Bright, input_gain_db: 6.0, ..VocalConfig::default() };
         let input: Vec<f32> = (0..613).map(|i| (i as f32 * 0.17).sin() * 0.4).collect();
@@ -135,13 +135,13 @@ fn aux_is_stereo_selective_and_never_passes_through_vocal_processing() {
 #[test]
 fn live_routes_keep_call_vocals_while_removing_only_monitor_vocals() {
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, Some(0.0), true, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0).unwrap());
     let (writer, _reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
     let config = VocalConfig { preset: Preset::Natural, ..VocalConfig::default() };
     let mut reference = VocalChain::new(48000, config).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
         Some((0.0, AuxDestination::Send)), &[], vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
-    assert_eq!(controls.route_targets()[..4], [1.0, 1.0, 0.0, 1.0]);
+    assert_eq!(controls.route_targets()[..6], [1.0, 1.0, 0.0, 0.0, 1.0, 0.0]);
     controls.apply("route mic output off".parse().unwrap()).unwrap();
     controls.apply("route aux output on".parse().unwrap()).unwrap();
     controls.apply("level aux output -6".parse().unwrap()).unwrap();
@@ -181,7 +181,7 @@ fn single_output_route_fades_are_block_invariant_and_keep_inactive_routes_off() 
     for has_aux in [false, true] {
         let run = |chunks: &[usize]| {
             let health = Arc::new(Health::default());
-            let controls = Arc::new(LiveControls::new(0.0, None, has_aux, 0).unwrap());
+            let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], has_aux, 0).unwrap());
             let (writer, _reader) = channel(48_000, 48_000, 30, 1, health.clone()).unwrap();
             let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
                 has_aux.then_some((0.0, AuxDestination::Output)), &[], vec![(writer, vec![0])], health.clone(), controls.clone()).unwrap();
@@ -213,7 +213,7 @@ fn single_output_route_fades_are_block_invariant_and_keep_inactive_routes_off() 
 #[test]
 fn external_effect_preserves_stereo_and_never_processes_aux_or_falls_back_to_dry() {
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, Some(0.0), true, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0).unwrap());
     let (writer, mut reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
         Some((0.0, AuxDestination::Send)), &[], vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
@@ -230,14 +230,14 @@ fn external_effect_preserves_stereo_and_never_processes_aux_or_falls_back_to_dry
     assert!((mixed.left[0] - 0.3).abs() < 1e-6 && (mixed.right[0] + 0.3).abs() < 1e-6);
     capture.push_with_effect(&[0.4], Some(&[[0.1, -0.2]]), &[], &mut |_, _, _| false);
     assert!(health.failed());
-    assert_eq!(reader.next_frame([1.0; 2]), [0.0; 4]);
+    assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
 }
 
 #[test]
 fn separate_app_sources_keep_stereo_and_mix_minus_with_and_without_physical_aux() {
     for has_aux in [false, true] {
         let health = Arc::new(Health::default());
-        let controls = Arc::new(LiveControls::new(0.0, Some(0.0), has_aux, 2).unwrap());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], has_aux, 2).unwrap());
         controls.apply("route app1 send on".parse().unwrap()).unwrap();
         controls.apply("route app2 output on".parse().unwrap()).unwrap();
         controls.apply("level app2 output -6".parse().unwrap()).unwrap();
@@ -275,6 +275,52 @@ fn separate_app_sources_keep_stereo_and_mix_minus_with_and_without_physical_aux(
             assert!((output.left[255] - (0.1 + aux[0])).abs() < 1e-6);
             assert!((output.right[255] - (0.1 + aux[1])).abs() < 1e-6);
         }
+        assert!(!health.failed());
+    }
+}
+
+#[test]
+fn broadcast_and_monitor_route_independently_with_or_without_call() {
+    for call in [false, true] {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), call.then_some(0.0), Some(0.0)], false, 2).unwrap());
+        controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
+        controls.apply("route app2 output on".parse().unwrap()).unwrap();
+        if call { controls.apply("route app1 send on".parse().unwrap()).unwrap(); }
+        controls.apply("level app1 broadcast -6".parse().unwrap()).unwrap();
+        let bindings: Vec<_> = controls.mixes().map(RouteMix::index).collect();
+        let (writer, mut reader) = channel(48000, 48000, 10, bindings.len(), health.clone()).unwrap();
+        let mut gains = PlaybackGains::new(48000, &bindings, controls.clone()).unwrap();
+        let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+            None, &[0.0, 0.0], vec![(writer, bindings)], health.clone(), controls.clone()).unwrap();
+        let mic = vec![0.1; 1536];
+        let music = vec![[0.2, -0.1]; 1536];
+        let return_audio = vec![[-0.05, 0.3]; 1536];
+        capture.push(&mic, None, &[&music, &return_audio]);
+        let expected_monitor = [0.05, 0.4];
+        let attenuation = 10.0_f32.powf(-6.0 / 20.0);
+        let expected_broadcast = [0.1 + 0.2 * attenuation, 0.1 - 0.1 * attenuation];
+        let broadcast_lane = if call { 2 } else { 1 };
+        for _ in 0..512 { reader.next_frame(gains.next_gains()); }
+        let frame = reader.next_frame(gains.next_gains());
+        for (actual, expected) in frame[..2].iter().zip(expected_monitor) {
+            assert!((*actual - expected).abs() < 0.001);
+        }
+        if call {
+            assert!((frame[2] - 0.3).abs() < 0.001 && frame[3].abs() < 0.001);
+        }
+        for (actual, expected) in frame[broadcast_lane * 2..broadcast_lane * 2 + 2].iter().zip(expected_broadcast) {
+            assert!((*actual - expected).abs() < 0.001);
+        }
+        controls.apply("mute broadcast".parse().unwrap()).unwrap();
+        gains.update();
+        let _ = reader.stats.take_peaks();
+        for _ in 0..240 { reader.next_frame(gains.next_gains()); }
+        let _ = reader.stats.take_peaks();
+        let frame = reader.next_frame(gains.next_gains());
+        assert_eq!(&frame[broadcast_lane * 2..broadcast_lane * 2 + 2], &[0.0; 2]);
+        assert!((frame[1] - 0.4).abs() < 0.001);
+        assert_eq!(reader.stats.take_peaks()[broadcast_lane], 0.0);
         assert!(!health.failed());
     }
 }

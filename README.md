@@ -13,10 +13,10 @@ OBS 전용 플러그인이 아니다. 현재는 **GPUI Scene 실행 화면과 �
 마이크 → 입력 trim → 내장 보컬 보정 → 순차 stereo VST3 체인 → 목적지별 보내기 ─┐
 AUX/MR → 필요 시 입력 clock bridge → AUX trim → 목적지별 보내기 ─────────┤
 앱 1..8 → 각각의 입력 clock bridge → 앱별 trim → 목적지별 보내기 ───────────┴→ 믹스
-믹스 → 출력 clock bridge → master/send 음량·mute → sample clipping guard → 출력 장치
+믹스 → 출력 clock bridge → master/믹스별 음량·mute → sample clipping guard → 출력 장치
 ```
 
-보컬은 한 번만 처리하고 AUX와 앱 소스에는 보컬 DSP/VST3를 걸지 않는다. 출력 믹스는 최대 두 개다.
+보컬은 한 번만 처리하고 AUX와 앱 소스에는 보컬 DSP/VST3를 걸지 않는다. 출력 믹스는 모니터·통화·방송의 최대 세 개다.
 동일 endpoint의 분리 채널은 하나의 스트림/클럭을 공유하며 별도 장치는 bounded queue와
 Rubato sinc resampler로 연결한다. 오류 시 임의 장치 선택이나 원음 마이크 우회는 하지 않는다.
 
@@ -38,20 +38,20 @@ cargo build --release -p mixlive-app -p mixlive-audio-windows -p mixlive-vst3 --
 ### 네이티브 Scene 화면
 
 `mixlive.exe`에서 **새 Scene → 장치·보컬·VST3 선택 → 새 파일로 저장 → 오디오 시작** 순서로 시작할 수 있다.
-마이크와 주 출력은 직접 선택하며, AUX/MR 녹음 장치, 최대 8개의 실행 중인 앱, 추가 송출 재생 장치는 선택 사항이다. 앱 소스는 물리 AUX와 함께 사용할 수 있다.
+마이크와 주 출력은 직접 선택하며, AUX/MR 녹음 장치, 최대 8개의 실행 중인 앱, 통화(추가 송출)·방송 송출 재생 장치는 선택 사항이다. 앱 소스는 물리 AUX와 함께 사용할 수 있다.
 목록은 실제 WASAPI endpoint 이름·ID·기본 채널/샘플레이트/형식을 표시한다. 같은 이름이어도
 ID로 구분하며, 사용할 수 없는 설정은 이유를 표시한다. 장치를 연결한 뒤에는 새 Scene이나
 **장치·출력 설정**을 다시 열어 목록을 조회한다. 조회는 스트림을 만들지 않고 시스템 기본 장치를 바꾸지 않는다.
 
 채널 입력은 마이크 한 개, 나머지는 mono 한 개 또는 좌/우 두 개(`1` 또는 `1,2`)다.
 선택한 장치가 mono이면 `1`, 그 외 출력/AUX에는 `1,2`를 제안한다. 실제 endpoint 범위를 넘거나
-같은 endpoint의 mic/AUX 또는 output/send 채널이 겹치면 저장 전에 거절한다.
-AUX를 추가 송출로 보내려면 해당 출력 장치도 선택해야 한다.
+같은 endpoint의 mic/AUX 또는 모니터·통화·방송 채널이 겹치면 저장 전에 거절한다.
+AUX를 통화 또는 방송으로 보내려면 해당 출력 장치도 선택해야 한다.
 
 내장 보정 `off/natural/warm/bright`를 고를 수 있으며, 새 Scene의 초기값은 출력 −18 dB,
-AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. 전체/추가 송출/AUX 시작 음량과
+AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. 전체/모니터/통화/방송/AUX 시작 음량과
 queue 목표, 입력 trim, 보정 비율, 컴프레서/디에서 threshold와 VST3 순서를 저장 전에 바꿀 수 있다.
-저장은 기존 schema 6의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
+저장은 기존 schema 7의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
 이전 Scene 선택을 유지한다. 장치와 현재 설정은 실제 시작 때 다시 검사한다.
 
 기존 체인은 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작**으로 실행한다.
@@ -64,18 +64,18 @@ queue 목표, 입력 trim, 보정 비율, 컴프레서/디에서 threshold와 VS
 편집 취소는 현재 Scene과 파일을 바꾸지 않는다. 저장한 설정은 다음 명시적 시작부터 적용된다.
 
 장치나 목적지를 바꾸려면 정지한 Scene의 **장치·출력 설정**을 연다. 현재 WASAPI 목록을 조회하고
-저장된 mic/AUX/주 출력/추가 송출 ID·채널·AUX 목적지·시작 음량·queue 값을 불러온다.
-보컬과 VST3 체인도 유지하며 같은 화면에서 편집할 수 있다. 사용하지 않는 AUX/추가 송출의
+저장된 mic/AUX/모니터/통화/방송 ID·채널·AUX 목적지·시작 음량·queue 값을 불러온다.
+보컬과 VST3 체인도 유지하며 같은 화면에서 편집할 수 있다. 사용하지 않는 AUX/통화/방송의
 저장 채널과 음량도 폼을 열었다는 이유로 초기화하지 않는다.
 
 저장된 장치가 연결되지 않았거나 지원되지 않으면 해당 ID와 채널을 유지하고 이유를 표시한다.
 다른 장치나 “사용 안 함”으로 자동 전환하지 않는다. 사용 가능한 장치를 직접 선택해야 하며,
-optional AUX/추가 송출은 “사용 안 함”으로 명시적으로 제거할 수 있다. 장치를 바꿀 때만 현재
+optional AUX/통화/방송은 “사용 안 함”으로 명시적으로 제거할 수 있다. 장치를 바꿀 때만 현재
 채널 수에 맞는 mono/stereo 시작값을 제안하고, 저장 전 채널 범위·겹침·AUX 목적지를 검사한다.
 누락/지원 불가 장치가 남으면 저장을 거절한다. 저장·취소는 보컬 편집과 같은 새 파일 계약을 따른다.
 
-전체 시작 음량은 두 출력에 공통 적용되고 추가 송출 시작 음량은 두 번째 출력의 추가 감쇠다.
-AUX 입력 음량은 합산 전 trim이다. 세 값은 −96~0 dB, 장치별 queue 목표는 10~100 ms이며,
+전체 시작 음량은 모든 출력에 공통 적용되고 모니터/통화/방송 시작 음량은 각 믹스의 추가 감쇠다.
+AUX 입력 음량은 합산 전 trim이다. 음량 값은 −96~0 dB, 장치별 queue 목표는 10~100 ms이며,
 queue 목표는 하드웨어 버퍼나 실측 왕복 지연이 아니다. 이 화면은 **파일의 시작 설정**을 편집하며
 저장된 mixer mute/경로별 gain·mic 연결값을 유지한다. AUX 목적지는 모든 경로 끄기도 선택할 수 있다. 장치 목록은 시작 때 다시 검사한다.
 
@@ -89,11 +89,11 @@ VST3는 **파일 추가** 또는 Windows bundle용 **폴더 추가**로 선택�
 실행 중에는 다음을 화면에서 조절한다.
 
 - 고정 상단의 전체 출력 음소거, 소스별 mic/AUX/앱 음소거, 출력별 음소거.
-- 두 출력에 공통으로 적용되는 전체 음량과 추가 송출의 추가 감쇠.
+- 모든 출력에 공통으로 적용되는 master와 모니터/통화/방송의 독립 감쇠.
 - 각 소스를 어느 출력에 보낼지 선택하는 스위치와 경로별 음량.
-- 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 주 출력/추가 송출 sample peak.
+- 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 모니터/통화/방송 sample peak.
   약 100ms 간격의 최대값을 dBFS로 표시한다. 소스 peak는 mute 전, AUX와 앱은 입력 trim 전이며
-  출력 peak는 감쇠·mute·sample guard 후 장치 채널 매핑 전이다. 공유 endpoint의 두 믹스도 독립 계측한다.
+  출력 peak는 감쇠·mute·sample guard 후 장치 채널 매핑 전이다. 공유 endpoint의 각 믹스도 독립 계측한다.
   내장 보정 gain reduction과 초당 갱신되는 진단 수치는 같은 계측값을 사용한다. 가짜 level 애니메이션은 없다.
 
 **정지** 또는 창 닫기는 기존 장치 중지 → worker 종료 → native plugin 해제 경로를 사용한다.
@@ -103,7 +103,7 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 
 실행 중 **정지 후 새 Scene 저장**을 선택하면 파일명 선택을 취소할 때는 오디오를 계속 실행하고,
 확정하면 장치 중지 → worker join → 모든 VST3 슬롯 상태 수집 → 새 Scene 저장을 수행한다.
-저장된 전체/추가 음량, 소스·출력·전체 mute, 모든 경로의 연결·gain과 VST3 상태는 다음 명시적 시작부터
+저장된 전체/믹스별 음량, 소스·출력·전체 mute, 모든 경로의 연결·gain과 VST3 상태는 다음 명시적 시작부터
 적용된다. 초기 mute는 스트림 시작 전에 복원한다. 오류·상태 수집 실패·기존 파일 충돌 시 이전 Scene 선택을
 유지하고 새 파일을 게시하지 않는다. 일반 정지/창 닫기는 저장하지 않는다.
 장치·출력 및 보컬·VST3 시작 설정 편집은 정지 상태에서만 제공한다.
@@ -145,22 +145,25 @@ sample clipping guard는 전문 리미터·true-peak·음향 피드백 방지·�
 | `--vocal-threshold-db -24` | 컴프레서 threshold -60..0 dBFS |
 | `--deess-threshold-db -30` | 디에서 고역 threshold -60..0 dBFS |
 | `--output-gain-db -18` | 두 믹스의 초기 최종 감쇠 -96..0 dB |
-| `--send-gain-db 0` | 두 번째 믹스의 초기 추가 감쇠 -96..0 dB |
+| `--monitor-gain-db 0` | 모니터 초기 추가 감쇠 -96..0 dB |
+| `--send-gain-db 0` | 통화 초기 추가 감쇠 -96..0 dB |
+| `--broadcast-gain-db 0` | 방송 초기 추가 감쇠 -96..0 dB |
 
 자동 makeup gain은 없다. A/B 청취의 원본/보정 음량은 따로 맞춘다. 프리셋은 32..192 kHz,
 off는 8..192 kHz를 받는다. 입력 trim/보컬 파라미터는 실행 중 고정이다.
 
 ### 출력과 MR/AUX
 
-두 번째 믹스는 `--send "<OUTPUT ID>" --send-channels 1,2`다. 기존 가상 케이블의 재생
-endpoint로 보내고 Discord/OBS에서 대응 녹음 endpoint를 선택한다. 자동 연결/설치는 없다.
-`output`/`send`는 지정한 믹스이지 헤드폰/Discord를 자동 인식하는 이름이 아니다.
+모니터는 `--output "<OUTPUT ID>"`, 통화는 `--send "<OUTPUT ID>"`, 방송은
+`--broadcast "<OUTPUT ID>"`로 선택한다. 통화/방송은 각각 선택 사항이므로 통화 없이
+방송만 추가해도 된다. 기존에 설치된 가상 케이블의 재생 endpoint로 연결하고 Discord/OBS에서
+대응 녹음 endpoint를 직접 선택한다. MixLive가 자체 가상 장치를 설치하거나 자동 연결하지 않는다.
 
-동일 endpoint가 실제로 4채널 이상을 노출하면 `--output-channels 1,2`와
-`--send "<같은 OUTPUT ID>" --send-channels 3,4`를 함께 사용할 수 있다. `check`는
-`playback streams: 1`과 두 매핑을 표시한다. 공유 queue/다채널 리샘플러를 사용한다.
-겹치는 채널은 거절하며 mono(`1`)·역순 stereo(`2,1`)를 지원하고 미지정 채널은 무음이다.
-Windows가 stereo만 노출하면 ASIO 3/4를 만들어 주지 않는다.
+같은 endpoint가 실제로 6채널 이상을 노출하면 모니터 1,2 / 통화 3,4 / 방송 5,6을
+한 스트림의 서로 다른 채널로 사용할 수 있다. `--output-channels`, `--send-channels`,
+`--broadcast-channels`를 지정하며 겹치는 채널을 거절한다. 하나의 shared clock/resampler를
+유지하고 각 믹스의 gain/mute/peak는 독립적이다. mono·역순 stereo·미지정 채널 무음을 지원한다.
+장치가 stereo만 노출하면 임의 ASIO 채널을 만들어 주지 않는다.
 
 ```powershell
 .\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --aux-input "<MR CAPTURE ID>" --aux-channels 1,2 --aux-gain-db -12 --aux-to send --vocal natural --seconds 30
@@ -169,8 +172,8 @@ Windows가 stereo만 노출하면 ASIO 3/4를 만들어 주지 않는다.
 `--aux-input`은 **INPUT 목록의 캡처 endpoint**다. 분리된 루프백/라인 입력 또는 기존 가상
 케이블의 녹음 쪽을 받는다. 앱 직접 캡처는 별도의 `--app` 옵션을 사용한다. 의도한 MR만 선택하고 MixLive 출력·
 통화 수신음이 포함된 전체 루프백을 다시 넣지 않는다. 외부 피드백 자동 검출은 없다.
-`--aux-to off|send|output|both`의 기본 send-only는 이미 듣는 MR의 이중 모니터를 피한다.
-send/both에는 `--send`가 필요하다. AUX gain은 -96..0 dB, mono 복제·stereo·역순을 지원한다.
+`--aux-to off|send|output|both|broadcast|output-broadcast|send-broadcast|all`의 기본 send-only는 이미 듣는 MR의 이중 모니터를 피한다.
+`both`는 모니터+통화, `all`은 세 출력이다. 통화/방송을 포함하려면 각각의 장치가 필요하다. AUX gain은 -96..0 dB, mono 복제·stereo·역순을 지원한다.
 같은 INPUT ID의 mic 1/AUX 3,4는 한 스트림으로 추출하고 겹치는 채널은 거절한다.
 
 별도 AUX 장치는 먼저 마이크 클럭으로 변환하므로 입력 queue/리샘플러 지연이 추가된다.
@@ -182,8 +185,8 @@ send/both에는 `--send`가 필요하다. AUX gain은 -96..0 dB, mono 복제·st
 
 실행 중인 앱을 장치·출력 설정의 **앱 소스** 목록에서 하나씩 추가한다. 최대 8개이며
 물리 AUX와 동시에 사용할 수 있다. 각 앱의 채널(1, 2 또는 stereo 순서), 입력 trim,
-시작 mute, 주 출력·추가 송출 연결 및 경로별 gain을 독립적으로 지정한다.
-새 앱의 두 경로는 모두 꺼져 있다. 통화 수신음을 통화 송출로 되돌리지 않도록 직접 연결한다.
+시작 mute, 모니터·통화·방송 연결 및 경로별 gain을 독립적으로 지정한다.
+새 앱의 모든 경로는 꺼져 있다. 통화 수신음을 통화 송출로 되돌리지 않도록 직접 연결한다.
 앱은 기존 장치로 계속 재생하므로 주 출력에 다시 보내면 이중 모니터링될 수 있다.
 
 ```powershell
@@ -206,7 +209,7 @@ send/both에는 `--send`가 필요하다. AUX gain은 -96..0 dB, mono 복제·st
 
 ## 장치·보컬·VST3를 Scene 하나로 재실행
 
-**Scene schema 6**는 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
+**Scene schema 7**는 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
 한 파일에 담는다. 기존 체인을 넣으면 상태 바이트를 복사하므로 원래 체인 JSON은 재실행에
 필요하지 않다. 플러그인 DLL과 외부 샘플/라이선스 등은 여전히 설치되어 있어야 한다.
 
@@ -229,7 +232,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. CLI는 실행 중
 GUI의 정지 후 새 Scene 저장에서만 전체 실행 상태를 저장한다. CLI에서 편집한 VST3 상태는 새 체인 파일로 내보낸 뒤 다음 `scene save`에 넣는다.
 
 상대 경로는 들어 있던 chain/scene 파일 기준으로 해석한다. CLI에서 지정한 경로는 현재 작업
-폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~5는 읽지 않으며 현재 옵션으로
+폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~6는 읽지 않으며 현재 옵션으로
 다시 저장한다. 마이그레이션/누락값 복구는 없다. Scene에는 개인 장치 ID와 플러그인 상태가
 포함되므로 공개하지 않는다. `*.mixlive-scene.json`은 Git에서 제외한다.
 
@@ -239,17 +242,17 @@ GUI의 정지 후 새 Scene 저장에서만 전체 실행 상태를 저장한다
 
 | 명령 | 동작 |
 |---|---|
-| `mute/unmute mic|aux|appN|output|send|all` | 소스·출력·전체 음소거 |
-| `gain master -18`, `gain send -6` | 공통 출력/두 번째 믹스 추가 감쇠 |
+| `mute/unmute mic|aux|appN|output|send|broadcast|all` | 소스·출력·전체 음소거 |
+| `gain master -18`, `gain monitor -3`, `gain send -6`, `gain broadcast -9` | 공통/각 믹스 추가 감쇠 |
 | `route mic output off`, `route mic output on` | 내 목소리의 첫 믹스 포함 여부 |
 | `route aux send off` | 두 번째 믹스의 MR만 제외 |
 | `level aux send -6`, `level mic output -9` | 지정 경로만 추가 감쇠 -96..0 dB |
 | `status`, `stop` | 요청된 제어 상태 / 장치 해제 후 종료 |
 
-일반형은 `route mic|aux|appN output|send on|off`, `level mic|aux|appN output|send <dB>`다. `appN`은 1부터 시작하는 현재 앱 슬롯이다.
+일반형은 `route mic|aux|appN output|send|broadcast on|off`, `level mic|aux|appN output|send|broadcast <dB>`다. `appN`은 1부터 시작하는 현재 앱 슬롯이다.
 꺼둔 경로의 level 변경은 켜짐이 아니고 전체 unmute도 개별 mute를 풀지 않는다.
 source/route 제어는 합산 전이어서 출력 queue 지연이 남는다. 급한 송출 중단은 queue 뒤의
-`mute send`/`mute all`을 사용한다. mute 중에도 queue를 소비해 오래된 소리를 재생하지 않는다.
+`mute send`/`mute broadcast`/`mute all`을 사용한다. mute 중에도 queue를 소비해 오래된 소리를 재생하지 않는다.
 이미 OS에 보낸 소리/Direct Monitor는 제어하지 않는다. gain/route 전환은 약 5 ms sample ramp이며
 전체 응답시간 보장이 아니다. mic mute는 장치의 마이크 접근 자체를 종료하지 않는다.
 

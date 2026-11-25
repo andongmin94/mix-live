@@ -23,7 +23,7 @@ mod ui;
     about = "MixLive native Scene runner. Opening a Scene never starts audio; press Start in the window."
 )]
 struct Args {
-    /// Optional schema 6 Scene to open. Devices and plugins are opened only after Start.
+    /// Optional schema 7 Scene to open. Devices and plugins are opened only after Start.
     scene: Option<PathBuf>,
 }
 

@@ -16,9 +16,13 @@ pub struct SceneDraft {
     pub output: Option<String>,
     pub output_channels: String,
     pub output_gain_db: String,
+    pub monitor_gain_db: String,
     pub send: Option<String>,
     pub send_channels: String,
     pub send_gain_db: String,
+    pub broadcast: Option<String>,
+    pub broadcast_channels: String,
+    pub broadcast_gain_db: String,
     pub aux_input: Option<String>,
     pub apps: Vec<AppSource>,
     pub aux_channels: String,
@@ -37,9 +41,13 @@ impl Default for SceneDraft {
             output: None,
             output_channels: "1,2".into(),
             output_gain_db: "-18".into(),
+            monitor_gain_db: "0".into(),
             send: None,
             send_channels: "1,2".into(),
             send_gain_db: "0".into(),
+            broadcast: None,
+            broadcast_channels: "1,2".into(),
+            broadcast_gain_db: "0".into(),
             aux_input: None,
             apps: Vec::new(),
             aux_channels: "1,2".into(),
@@ -70,9 +78,13 @@ impl SceneDraft {
             output: Some(route.output.clone()),
             output_channels: channel_text(&route.output_channels),
             output_gain_db: route.output_gain_db.to_string(),
+            monitor_gain_db: route.monitor_gain_db.to_string(),
             send: route.send.clone(),
             send_channels: channel_text(&route.send_channels),
             send_gain_db: route.send_gain_db.to_string(),
+            broadcast: route.broadcast.clone(),
+            broadcast_channels: channel_text(&route.broadcast_channels),
+            broadcast_gain_db: route.broadcast_gain_db.to_string(),
             aux_input: route.aux_input.clone(),
             apps: route.apps.clone(),
             aux_channels: channel_text(&route.aux_channels),
@@ -82,6 +94,10 @@ impl SceneDraft {
                 AuxDestination::Output => "output",
                 AuxDestination::Send => "send",
                 AuxDestination::Both => "both",
+                AuxDestination::Broadcast => "broadcast",
+                AuxDestination::OutputBroadcast => "output-broadcast",
+                AuxDestination::SendBroadcast => "send-broadcast",
+                AuxDestination::All => "all",
             }
             .into(),
             queue_ms: route.queue_ms.to_string(),
@@ -113,6 +129,11 @@ impl SceneDraft {
             let send = selected(&self.send, &catalog.outputs, "추가 송출")?;
             OutputMap::new(&send_channels, configuration(send)?.channels)?;
         }
+        let broadcast_channels = channels(&self.broadcast_channels)?;
+        if self.broadcast.is_some() {
+            let broadcast = selected(&self.broadcast, &catalog.outputs, "방송 송출")?;
+            OutputMap::new(&broadcast_channels, configuration(broadcast)?.channels)?;
+        }
         let aux_channels = channels(&self.aux_channels)?;
         if self.aux_input.is_some() {
             let aux = selected(&self.aux_input, &catalog.inputs, "AUX / MR 입력")?;
@@ -124,10 +145,17 @@ impl SceneDraft {
             "output" => AuxDestination::Output,
             "send" => AuxDestination::Send,
             "both" => AuxDestination::Both,
+            "broadcast" => AuxDestination::Broadcast,
+            "output-broadcast" => AuxDestination::OutputBroadcast,
+            "send-broadcast" => AuxDestination::SendBroadcast,
+            "all" => AuxDestination::All,
             _ => return Err("AUX를 보낼 목적지를 선택하세요.".into()),
         };
         if self.aux_input.is_some() && aux_to.includes(1) && self.send.is_none() {
             return Err("AUX를 추가 송출로 보내려면 추가 송출 장치를 선택하세요. 주 출력만 사용하려면 AUX 목적지를 주 출력으로 바꾸세요.".into());
+        }
+        if self.aux_input.is_some() && aux_to.includes(2) && self.broadcast.is_none() {
+            return Err("AUX를 방송에 보내려면 방송 송출 장치를 선택하세요.".into());
         }
         let vocal = self.sound.vocal_config()?;
         let route =
@@ -143,9 +171,13 @@ impl SceneDraft {
                 output_channels,
                 send: self.send.clone(),
                 send_channels,
+                broadcast: self.broadcast.clone(),
+                broadcast_channels,
                 input_gain_db: vocal.input_gain_db,
                 output_gain_db: number(&self.output_gain_db, "전체 출력 음량")?,
+                monitor_gain_db: number(&self.monitor_gain_db, "모니터 감쇠")?,
                 send_gain_db: number(&self.send_gain_db, "추가 송출 감쇠")?,
+                broadcast_gain_db: number(&self.broadcast_gain_db, "방송 송출 감쇠")?,
                 vocal: vocal.preset,
                 vocal_strength: vocal.strength,
                 vocal_threshold_db: vocal.compressor_threshold_db,
@@ -353,6 +385,7 @@ mod tests {
         draft.apps[1].muted = true;
         draft.apps[1].channels = vec![2, 1];
         draft.send = Some("output-b".into());
+        draft.send_channels = "1".into();
         let mut devices = catalog();
         devices.apps.push(mixlive_audio_windows::devices::AppInfo {
             path: draft.apps[1].path.clone(),
@@ -371,6 +404,29 @@ mod tests {
         assert!(restored.build(&devices).unwrap_err().contains("ambiguous"));
         devices.apps.clear();
         assert!(restored.build(&devices).is_err());
+    }
+
+    #[test]
+    fn broadcast_settings_roundtrip_without_call_and_reject_overlapping_output_channels() {
+        let mut draft = draft();
+        draft.broadcast = draft.output.clone();
+        draft.broadcast_channels = "4,3".into();
+        draft.broadcast_gain_db = "-7.25".into();
+        draft.monitor_gain_db = "-3.5".into();
+        draft.mix.mute_broadcast = true;
+        draft.mix.mic_broadcast_gain_db = -11.0;
+        draft.apps.push(AppSource::new("C:\\Apps\\browser.exe".into()));
+        draft.apps[0].to = AuxDestination::Broadcast;
+        draft.apps[0].broadcast_gain_db = -4.0;
+        let scene = draft.build(&catalog()).unwrap();
+        assert!(scene.route.send.is_none());
+        assert_eq!(scene.route.broadcast_channels, [4, 3]);
+        assert_eq!(SceneDraft::from_scene(&scene).build(&catalog()).unwrap().route, scene.route);
+        draft.broadcast_channels = "2,3".into();
+        assert!(draft.build(&catalog()).unwrap_err().contains("overlap"));
+        draft.broadcast_channels = "4,3".into();
+        draft.broadcast = Some("missing-broadcast".into());
+        assert!(draft.build(&catalog()).unwrap_err().contains("방송 송출"));
     }
 
     #[test]

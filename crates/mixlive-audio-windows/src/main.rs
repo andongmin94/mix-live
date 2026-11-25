@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn terminal_commands_apply_without_hardware_reject_bad_input_and_stop_on_eof() {
-        let controls = LiveControls::new(-18.0, None, false, 0).unwrap();
+        let controls = LiveControls::new(-18.0, [Some(0.0), None, None], false, 0).unwrap();
         let mut feedback = Vec::new();
         read_commands(Cursor::new(b"\nmute output\ngain master NaN\nmute aux\ngain master -12\nstatus\nstop\ngain master 0\n"),
             &mut feedback, &controls).unwrap();
@@ -196,7 +196,7 @@ mod tests {
         assert!(text.contains("Control rejected:"));
         assert!(controls.describe().contains("master_gain=-12.0dB"));
         assert!(controls.describe().contains("output=true"));
-        let controls = LiveControls::new(-18.0, None, false, 0).unwrap();
+        let controls = LiveControls::new(-18.0, [Some(0.0), None, None], false, 0).unwrap();
         read_commands(Cursor::new(b"status\n"), Vec::new(), &controls).unwrap();
         assert!(controls.stop_requested());
     }

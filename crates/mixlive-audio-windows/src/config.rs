@@ -60,13 +60,27 @@ pub enum SceneCommand {
     },
 }
 
-/// Which existing mix receives AUX. Send-only avoids replaying MR already heard elsewhere.
+/// Three fixed logical destinations, independent of selected physical endpoints.
+pub const MAX_MIXES: usize = 3;
+
+/// Explicit connections. Both means monitor + call; All also includes broadcast.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum AuxDestination { Off, Output, Send, Both }
+#[repr(u8)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuxDestination { Off = 0, Output = 1, Send = 2, Both = 3,
+    Broadcast = 4, OutputBroadcast = 5, SendBroadcast = 6, All = 7 }
 impl AuxDestination {
     pub fn includes(self, mix: usize) -> bool {
-        match self { Self::Off => false, Self::Output => mix == 0, Self::Send => mix == 1, Self::Both => mix < 2 }
+        mix < MAX_MIXES && self as u8 & (1 << mix) != 0
+    }
+
+    pub fn from_enabled(enabled: [bool; MAX_MIXES]) -> Self {
+        match enabled {
+            [false, false, false] => Self::Off, [true, false, false] => Self::Output,
+            [false, true, false] => Self::Send, [true, true, false] => Self::Both,
+            [false, false, true] => Self::Broadcast, [true, false, true] => Self::OutputBroadcast,
+            [false, true, true] => Self::SendBroadcast, [true, true, true] => Self::All,
+        }
     }
 }
 
@@ -84,19 +98,21 @@ pub struct AppSource {
     pub muted: bool,
     pub output_gain_db: f32,
     pub send_gain_db: f32,
+    pub broadcast_gain_db: f32,
 }
 
 impl AppSource {
     pub fn new(path: String) -> Self {
         Self { path, channels: vec![1, 2], gain_db: -12.0, to: AuxDestination::Off,
-            muted: false, output_gain_db: 0.0, send_gain_db: 0.0 }
+            muted: false, output_gain_db: 0.0, send_gain_db: 0.0, broadcast_gain_db: 0.0 }
     }
 
-    fn validate(&self, has_send: bool) -> Result<(), String> {
+    fn validate(&self, has_send: bool, has_broadcast: bool) -> Result<(), String> {
         if self.path.trim().is_empty() { return Err("application executable path must not be blank".into()); }
         InputMap::new(&self.channels, 2)?;
         if self.to.includes(1) && !has_send { return Err("application send destination requires --send".into()); }
-        for db in [self.gain_db, self.output_gain_db, self.send_gain_db] {
+        if self.to.includes(2) && !has_broadcast { return Err("application broadcast destination requires --broadcast".into()); }
+        for db in [self.gain_db, self.output_gain_db, self.send_gain_db, self.broadcast_gain_db] {
             if !db.is_finite() || !(-96.0..=0.0).contains(&db) {
                 return Err("application trim/route gain must be finite and between -96 and 0 dB".into());
             }
@@ -107,7 +123,7 @@ impl AppSource {
 
 fn parse_app(path: &str) -> Result<AppSource, String> {
     let app = AppSource::new(path.to_owned());
-    app.validate(true)?;
+    app.validate(true, true)?;
     Ok(app)
 }
 
@@ -165,15 +181,26 @@ pub struct RouteOptions {
     pub send: Option<String>,
     #[arg(long, value_delimiter = ',', default_value = "1,2")]
     pub send_channels: Vec<u16>,
+    /// Broadcast playback endpoint, independently optional.
+    #[arg(long)]
+    pub broadcast: Option<String>,
+    #[arg(long, value_delimiter = ',', default_value = "1,2")]
+    pub broadcast_channels: Vec<u16>,
     /// Digital mic trim BEFORE vocal processing (-36..18 dB). Cannot fix input clipping.
     #[arg(long, default_value = "0", allow_hyphen_values = true)]
     pub input_gain_db: f32,
-    /// Initial final attenuation on BOTH mixes, after output resampling (-96..0 dB).
+    /// Initial master attenuation on every mix, after output resampling (-96..0 dB).
     #[arg(long, default_value = "-18", allow_hyphen_values = true)]
     pub output_gain_db: f32,
-    /// Initial additional attenuation on the second mix.
+    /// Additional attenuation on the monitor mix only.
+    #[arg(long, default_value = "0", allow_hyphen_values = true)]
+    pub monitor_gain_db: f32,
+    /// Additional attenuation on the call mix.
     #[arg(long, default_value = "0", allow_hyphen_values = true)]
     pub send_gain_db: f32,
+    /// Additional attenuation on the broadcast mix.
+    #[arg(long, default_value = "0", allow_hyphen_values = true)]
+    pub broadcast_gain_db: f32,
     /// Vocal starting point: off, natural, warm or bright. No pitch correction or reverb yet.
     #[arg(long, default_value_t = Preset::Off)]
     #[serde(with = "preset_serde")]
@@ -198,6 +225,14 @@ pub struct RouteOptions {
 impl RouteOptions {
     pub fn has_aux(&self) -> bool { self.aux_input.is_some() }
 
+    /// Logical indices are stable even when the optional call mix is absent.
+    pub fn playback_bindings(&self) -> impl Iterator<Item = (usize, &str, &[u16])> {
+        [(Some(self.output.as_str()), self.output_channels.as_slice()),
+            (self.send.as_deref(), self.send_channels.as_slice()),
+            (self.broadcast.as_deref(), self.broadcast_channels.as_slice())]
+            .into_iter().enumerate().filter_map(|(index, (id, channels))| id.map(|id| (index, id, channels)))
+    }
+
     pub fn vocal_config(&self) -> VocalConfig {
         VocalConfig { preset: self.vocal, input_gain_db: self.input_gain_db, strength: self.vocal_strength,
             compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db }
@@ -206,26 +241,32 @@ impl RouteOptions {
         if self.input.trim().is_empty() || self.output.trim().is_empty() || self.input_channel == 0 {
             return Err("explicit endpoint IDs and a one-based input channel are required".into());
         }
-        if self.send.as_ref().is_some_and(|id| id.trim().is_empty()) {
-            return Err("send endpoint ID must not be blank".into());
+        // Validate inactive saved channel shapes too; preparation checks actual channel counts.
+        for channels in [&self.output_channels, &self.send_channels, &self.broadcast_channels] {
+            OutputMap::new(channels, u16::MAX)?;
         }
-        // File-based settings do not pass through clap. Check channel shape here;
-        // Prepared::new checks the actual device's channel count before opening streams.
-        let output = OutputMap::new(&self.output_channels, u16::MAX)?;
-        let send = OutputMap::new(&self.send_channels, u16::MAX)?;
-        if self.send.as_deref() == Some(self.output.as_str()) && output.overlaps(send) {
-            return Err("output and send channels must not overlap on the same endpoint".into());
+        let mut bindings: Vec<(&str, OutputMap)> = Vec::with_capacity(MAX_MIXES);
+        for (_, id, channels) in self.playback_bindings() {
+            if id.trim().is_empty() { return Err("playback endpoint ID must not be blank".into()); }
+            let map = OutputMap::new(channels, u16::MAX)?;
+            if bindings.iter().any(|&(other_id, other_map)| id == other_id && map.overlaps(other_map)) {
+                return Err("output mix channels must not overlap on the same endpoint".into());
+            }
+            bindings.push((id, map));
         }
         let aux = InputMap::new(&self.aux_channels, u16::MAX)?;
         if self.apps.len() > MAX_APPS { return Err(format!("at most {MAX_APPS} application sources are supported")); }
         for (index, app) in self.apps.iter().enumerate() {
-            app.validate(self.send.is_some())?;
+            app.validate(self.send.is_some(), self.broadcast.is_some())?;
             if self.apps[..index].iter().any(|other| other.path.eq_ignore_ascii_case(&app.path)) {
                 return Err(format!("duplicate application source: {}", app.path));
             }
         }
         if self.has_aux() && self.aux_to.includes(1) && self.send.is_none() {
             return Err("AUX destination send/both requires --send; use --aux-to output for one mix".into());
+        }
+        if self.has_aux() && self.aux_to.includes(2) && self.broadcast.is_none() {
+            return Err("AUX broadcast destination requires --broadcast".into());
         }
         if let Some(id) = &self.aux_input {
             if id.trim().is_empty() { return Err("AUX endpoint ID must not be blank".into()); }
@@ -238,7 +279,7 @@ impl RouteOptions {
         }
         self.vocal_config().validate().map_err(|e| e.to_string())?;
         self.mix.validate()?;
-        for db in [self.output_gain_db, self.send_gain_db] {
+        for db in [self.output_gain_db, self.monitor_gain_db, self.send_gain_db, self.broadcast_gain_db] {
             if !db.is_finite() || !(-96.0..=0.0).contains(&db) {
                 return Err("output/send gain must be finite and between -96 and 0 dB".into());
             }
@@ -290,8 +331,8 @@ impl OutputMap {
     }
 }
 
-/// Map one packed endpoint frame. Preparation guarantees one/two disjoint maps in lane order.
-pub fn output_sample(maps: &[OutputMap], channel: usize, frame: &[f32; 4]) -> f32 {
+/// Map one packed endpoint frame. Preparation guarantees disjoint maps in lane order.
+pub fn output_sample(maps: &[OutputMap], channel: usize, frame: &[f32; MAX_MIXES * 2]) -> f32 {
     maps.iter().zip(frame.chunks_exact(2))
         .map(|(map, stereo)| map.sample(channel, [stereo[0], stereo[1]])).sum()
 }
@@ -335,12 +376,15 @@ mod tests {
     fn shared_endpoint_maps_preserve_stereo_mono_and_unassigned_channels() {
         let maps = [OutputMap::new(&[2, 1], 6).unwrap(), OutputMap::new(&[4, 3], 6).unwrap()];
         assert!(!maps[0].overlaps(maps[1]));
-        let packed = [0.1, 0.2, -0.3, 0.4];
+        let packed = [0.1, 0.2, -0.3, 0.4, 0.6, -0.5];
         assert_eq!((0..6).map(|channel| output_sample(&maps, channel, &packed)).collect::<Vec<_>>(),
             [0.2, 0.1, 0.4, -0.3, 0.0, 0.0]);
+        let all = [maps[0], maps[1], OutputMap::Stereo(5, 4)];
+        assert_eq!((0..8).map(|channel| output_sample(&all, channel, &packed)).collect::<Vec<_>>(),
+            [0.2, 0.1, 0.4, -0.3, -0.5, 0.6, 0.0, 0.0]);
         let mono = [OutputMap::Mono(0), OutputMap::Mono(2)];
         assert!(!mono[0].overlaps(mono[1]));
-        let result: Vec<f32> = (0..4).map(|c| output_sample(&mono, c, &[0.2, 0.4, -0.1, 0.3])).collect();
+        let result: Vec<f32> = (0..4).map(|c| output_sample(&mono, c, &[0.2, 0.4, -0.1, 0.3, 0.0, 0.0])).collect();
         assert!((result[0] - 0.3).abs() < 1e-6 && (result[2] - 0.1).abs() < 1e-6);
         assert_eq!((result[1], result[3]), (0.0, 0.0));
         for (a, b) in [(OutputMap::Mono(1), maps[0]), (maps[0], OutputMap::Stereo(3, 1)), (mono[0], mono[0])] {
@@ -348,6 +392,28 @@ mod tests {
         }
         assert!(OutputMap::new(&[3, 4], 2).is_err());
     }
+    #[test]
+    fn broadcast_can_exist_without_call_and_shared_channels_must_be_disjoint() {
+        let Command::Check(mut route) = Cli::parse_from(["audio", "check", "--input", "mic", "--output", "phones",
+            "--broadcast", "phones", "--broadcast-channels", "5,6", "--app", "browser.exe"]).command else { panic!("expected check") };
+        route.apps[0].to = AuxDestination::OutputBroadcast;
+        assert!(route.validate().is_ok());
+        assert_eq!(route.playback_bindings().map(|(mix, _, _)| mix).collect::<Vec<_>>(), [0, 2]);
+        route.send = Some("phones".into());
+        route.send_channels = vec![3, 4];
+        assert!(route.validate().is_ok());
+        route.broadcast_channels = vec![4, 6];
+        assert!(route.validate().unwrap_err().contains("overlap"));
+        route.broadcast_channels = vec![5, 6];
+        route.broadcast = None;
+        assert!(route.validate().unwrap_err().contains("requires --broadcast"));
+        for bits in 0..8 {
+            let enabled = std::array::from_fn(|mix| bits & (1 << mix) != 0);
+            let destination = AuxDestination::from_enabled(enabled);
+            assert_eq!(std::array::from_fn::<_, MAX_MIXES, _>(|mix| destination.includes(mix)), enabled);
+        }
+    }
+
     #[test]
     fn aux_selection_is_explicit_and_shared_capture_cannot_duplicate_the_mic() {
         let cli = Cli::try_parse_from(["mixlive-audio", "check", "--input", "mic", "--output", "phones", "--aux-input", "mr"]).unwrap();

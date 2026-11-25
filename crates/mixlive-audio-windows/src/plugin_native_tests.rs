@@ -41,12 +41,14 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
         plugins.push(plugin);
     }
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, Some(0.0), true, 2).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), Some(0.0)], true, 2).unwrap());
     controls.apply("route app1 send on".parse().unwrap()).unwrap();
     controls.apply("route app2 output on".parse().unwrap()).unwrap();
-    let (writer, mut reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
+    controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
+    controls.apply("route app2 broadcast on".parse().unwrap()).unwrap();
+    let (writer, mut reader) = channel(48000, 48000, 10, 3, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        Some((0.0, AuxDestination::Send)), &[0.0, 0.0], vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
+        Some((0.0, AuxDestination::Send)), &[0.0, 0.0], vec![(writer, vec![0, 1, 2])], health.clone(), controls).unwrap();
     let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, true, health.clone()).unwrap();
     assert!(worker.description.contains("Serial chain: 2 effects"));
     assert!(worker.set_editor_open(0, true).unwrap_err().contains("no native editor"));
@@ -58,26 +60,26 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
             &[&vec![[0.1, -0.05]; count], &vec![[0.04, 0.02]; count]]);
     }
     wait_for(&mut worker, &health, 1536);
-    for _ in 0..512 { reader.next_frame([1.0; 2]); }
-    for (actual, expected) in reader.next_frame([1.0; 2]).into_iter().zip([0.09, 0.07, 0.25, -0.20]) {
+    for _ in 0..512 { reader.next_frame([1.0; 3]); }
+    for (actual, expected) in reader.next_frame([1.0; 3]).into_iter().zip([0.09, 0.07, 0.25, -0.20, 0.19, 0.02]) {
         assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
     }
-    for _ in 0..4096 { reader.next_frame([1.0; 2]); }
+    for _ in 0..4096 { reader.next_frame([1.0; 3]); }
     // Editing the SECOND instance cannot alter the first or create another copy per output.
     worker.slots[1].plugin.lock().unwrap().set_parameter(0, 0.75).unwrap();
     assert!((worker.slots[0].plugin.lock().unwrap().get_parameter(0).unwrap() - 0.5).abs() < 1e-6);
     input.push(&[0.4; 1536], Some(&[[0.1, -0.2]; 1536]),
         &[&[[0.1, -0.05]; 1536], &[[0.04, 0.02]; 1536]]);
     wait_for(&mut worker, &health, 3072);
-    for _ in 0..512 { reader.next_frame([1.0; 2]); }
-    for (actual, expected) in reader.next_frame([1.0; 2]).into_iter().zip([0.19, 0.17, 0.35, -0.10]) {
+    for _ in 0..512 { reader.next_frame([1.0; 3]); }
+    for (actual, expected) in reader.next_frame([1.0; 3]).into_iter().zip([0.19, 0.17, 0.35, -0.10, 0.29, 0.12]) {
         assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
     }
     worker.finish(None).unwrap();
     assert!(!health.failed());
 
     let health = Arc::new(Health::default());
-    let controls = Arc::new(LiveControls::new(0.0, None, false, 0).unwrap());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0).unwrap());
     let (writer, _reader) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
         None, &[], vec![(writer, vec![0])], health.clone(), controls).unwrap();

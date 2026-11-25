@@ -4,7 +4,7 @@ use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, 
 use mixlive_effects::VocalChain;
 use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget, resolve_apps};
 use crate::process_capture::{self, ProcessCapture};
-use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, MAX_APPS, output_sample}, control::{LiveControls, PlaybackGains}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
+use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{LiveControls, PlaybackGains}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -74,7 +74,7 @@ pub struct Prepared {
     aux_mix: Option<(f32, AuxDestination)>,
     vocal: VocalChain,
     output_gain_db: f32,
-    send_gain_db: Option<f32>,
+    mix_gains_db: [f32; MAX_MIXES],
     queue_ms: u32,
     controls: Arc<LiveControls>,
     outputs: Vec<OutputEndpoint>,
@@ -151,11 +151,10 @@ impl Prepared {
             outputs.push(OutputEndpoint { device, config, routes: vec![(mix, map)] });
             Ok(())
         };
-        add(&options.output, &options.output_channels, 0)?;
-        if let Some(id) = &options.send { add(id, &options.send_channels, 1)?; }
+        for (mix, id, channels) in options.playback_bindings() { add(id, channels, mix)?; }
         Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal,
             auxiliary, apps, aux_mix: options.has_aux().then_some((options.aux_gain_db, options.aux_to)),
-            output_gain_db: options.output_gain_db, send_gain_db: options.send.as_ref().map(|_| options.send_gain_db),
+            output_gain_db: options.output_gain_db, mix_gains_db: [options.monitor_gain_db, options.send_gain_db, options.broadcast_gain_db],
             queue_ms: options.queue_ms, controls: Arc::new(LiveControls::from_route(options)?), outputs })
     }
 
@@ -164,8 +163,8 @@ impl Prepared {
         for (index, endpoint) in self.outputs.iter().enumerate() {
             text.push_str(&format!("stream {index}: {}\n  {:?}; one queue/resampler for {} mix(es)\n", endpoint.device, endpoint.config, endpoint.routes.len()));
             for (mix, map) in &endpoint.routes {
-                let gain = if *mix == 0 { 0.0 } else { self.send_gain_db.unwrap_or(0.0) };
-                text.push_str(&format!("  mix {mix}: map {map:?} (zero-based); initial additional send gain {gain} dB\n"));
+                let gain = self.mix_gains_db[*mix];
+                text.push_str(&format!("  mix {mix}: map {map:?} (zero-based); initial mix attenuation {gain} dB\n"));
             }
         }
         if let Some(aux) = &self.auxiliary {
@@ -289,7 +288,7 @@ pub struct LevelReadings {
     pub app_inputs: [Option<f32>; MAX_APPS],
     pub vocal: mixlive_effects::Meters,
     pub voice: f32,
-    pub outputs: [Option<f32>; 2],
+    pub outputs: [Option<f32>; MAX_MIXES],
 }
 
 pub struct Active {
@@ -356,7 +355,7 @@ where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
         if data.len() % channels != 0 { health.fail(Fault::Input); return; }
         for frame in data.chunks_exact(channels) {
             let [left, right] = map.read(frame).map(f32::from_sample);
-            writer.push([left, right, 0.0, 0.0]);
+            writer.push([left, right, 0.0, 0.0, 0.0, 0.0]);
         }
     }, move |_| error_health.fail(Fault::Device), None)?)
 }
@@ -435,7 +434,7 @@ impl Active {
 
     /// Single consumer on the control thread. Peak intervals are independent of callback blocks.
     pub fn take_levels(&self) -> LevelReadings {
-        let mut outputs = [None; 2];
+        let mut outputs = [None; MAX_MIXES];
         for endpoint in &self.outputs {
             for (&mix, peak) in endpoint.mixes.iter().zip(endpoint.stats.take_peaks()) {
                 outputs[mix] = Some(peak);

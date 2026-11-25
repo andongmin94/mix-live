@@ -170,7 +170,7 @@ fn capture(binding: (&str, ProcessTarget, InputMap), mut writer: OutputWriter,
                 // The library zeroes silent packets. Only read the returned frames.
                 for frame in packet[..frames as usize * FRAME_BYTES].chunks_exact(FRAME_BYTES) {
                     let [left, right] = decode_frame(frame, map);
-                    writer.push([left, right, 0.0, 0.0]);
+                    writer.push([left, right, 0.0, 0.0, 0.0, 0.0]);
                     if health.failed() { break; }
                 }
             }

@@ -23,7 +23,7 @@ impl AudioScene {
         // CLI paths refer to the current working directory, not a future scene directory.
         // absolute() does not require the plugin to be present or execute its native code.
         for effect in &mut effects { effect.plugin = std::path::absolute(&effect.plugin)?; }
-        Ok(Self { schema: 6, route, effects })
+        Ok(Self { schema: 7, route, effects })
     }
 
     /// Relative paths in a hand-authored scene are anchored to that scene, never the caller's cwd.
@@ -39,7 +39,7 @@ impl AudioScene {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != 6 { return Err("unsupported MixLive scene schema; create a schema 6 scene".into()); }
+        if self.schema != 7 { return Err("unsupported MixLive scene schema; create a schema 7 scene".into()); }
         self.route.validate()?;
         validate_effects(&self.effects)?;
         Ok(())
@@ -125,7 +125,7 @@ mod tests {
         let live = Arc::new(LiveControls::from_route(&restored.route).unwrap());
         assert_eq!(live.describe(), controls.describe());
         let mut playback = PlaybackGains::new(48000, &[0, 1], live.clone()).unwrap();
-        assert_eq!(playback.next_gains(), [0.0, 0.0]);
+        assert_eq!(playback.next_gains(), [0.0; 3]);
         live.apply("unmute all".parse().unwrap()).unwrap();
         assert!(live.is_muted(MuteTarget::Mic));
         assert!(live.is_muted(MuteTarget::Send));
@@ -190,7 +190,7 @@ mod tests {
         let path = directory.path().join("invalid.mixlive-scene.json");
         let original = serde_json::to_value(AudioScene::new(route(), vec![]).unwrap()).unwrap();
         let mut cases = Vec::new();
-        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("unknown", json!(true))] {
+        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("unknown", json!(true))] {
             let mut document = original.clone();
             document[key] = value;
             cases.push(document);
@@ -199,7 +199,7 @@ mod tests {
             ("input", json!(" ")), ("output", json!("")), ("send", json!(" ")),
             ("input_channel", json!(0)),
             ("output_channels", json!([])), ("output_channels", json!([1, 1])),
-            ("send_channels", json!([0])), ("queue_ms", json!(0)),
+            ("send_channels", json!([0])), ("broadcast_channels", json!([0])), ("queue_ms", json!(0)),
             ("input_gain_db", json!(100)), ("output_gain_db", json!(1)),
             ("vocal_strength", json!(2)), ("vocal", json!("magic")),
             ("vocal_threshold_db", json!(-100)), ("deess_threshold_db", json!(1)),

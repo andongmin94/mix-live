@@ -11,7 +11,7 @@ use gpui_deck::{
 };
 use mixlive_audio_windows::{
     config::{AppSource, AuxDestination, RouteOptions, MAX_APPS},
-    control::MixSettings,
+    control::{MixSettings, RouteMix},
     devices::{DeviceCatalog, DeviceInfo, resolve_apps},
     scene::AudioScene,
 };
@@ -41,6 +41,7 @@ enum Endpoint {
     Mic,
     Output,
     Send,
+    Broadcast,
     Aux,
 }
 
@@ -50,6 +51,7 @@ struct AppField {
     trim: Entity<InputState>,
     output_gain: Entity<InputState>,
     send_gain: Entity<InputState>,
+    broadcast_gain: Entity<InputState>,
 }
 
 impl AppField {
@@ -59,7 +61,8 @@ impl AppField {
         let trim = text_input(&label("입력 trim"), &source.gain_db.to_string(), window, cx);
         let output_gain = text_input(&label("주 출력 음량"), &source.output_gain_db.to_string(), window, cx);
         let send_gain = text_input(&label("추가 송출 음량"), &source.send_gain_db.to_string(), window, cx);
-        Self { source, channels, trim, output_gain, send_gain }
+        let broadcast_gain = text_input(&label("방송 송출 음량"), &source.broadcast_gain_db.to_string(), window, cx);
+        Self { source, channels, trim, output_gain, send_gain, broadcast_gain }
     }
 
     fn build(&self, cx: &App) -> Result<AppSource, String> {
@@ -68,31 +71,36 @@ impl AppField {
         source.gain_db = number(self.trim.read(cx).value().as_ref(), "앱 입력 trim")?;
         source.output_gain_db = number(self.output_gain.read(cx).value().as_ref(), "앱 주 출력 음량")?;
         source.send_gain_db = number(self.send_gain.read(cx).value().as_ref(), "앱 추가 송출 음량")?;
+        source.broadcast_gain_db = number(self.broadcast_gain.read(cx).value().as_ref(), "앱 방송 송출 음량")?;
         Ok(source)
     }
 
-    fn set_busy(&self, busy: bool, has_send: bool, cx: &mut App) {
+    fn set_busy(&self, busy: bool, has_send: bool, has_broadcast: bool, cx: &mut App) {
         for input in [&self.channels, &self.trim, &self.output_gain] {
             input.update(cx, |input, cx| input.set_disabled(busy, cx));
         }
         self.send_gain.update(cx, |input, cx| input.set_disabled(busy || !has_send, cx));
+        self.broadcast_gain.update(cx, |input, cx| input.set_disabled(busy || !has_broadcast, cx));
     }
 }
 
 #[derive(Clone, Copy)]
-enum AppAction { Remove, Mute, Output, Send }
+enum AppAction { Remove, Mute, Route(RouteMix) }
 
 struct DeviceSetup {
     catalog: DeviceCatalog,
     mic: EndpointField,
     output: EndpointField,
     send: EndpointField,
+    broadcast: EndpointField,
     aux: EndpointField,
     app_picker: Entity<SelectState>,
     apps: Vec<AppField>,
     aux_to: Entity<SelectState>,
     output_gain: Entity<InputState>,
+    monitor_gain: Entity<InputState>,
     send_gain: Entity<InputState>,
+    broadcast_gain: Entity<InputState>,
     aux_gain: Entity<InputState>,
     queue_ms: Entity<InputState>,
     mix: MixSettings,
@@ -164,6 +172,10 @@ impl SceneForm {
             window,
             cx,
         );
+        let broadcast = endpoint_field(
+            &catalog.outputs, true, "방송 송출 채널",
+            draft.broadcast.as_deref(), &draft.broadcast_channels, window, cx,
+        );
         let aux = endpoint_field(
             &catalog.inputs,
             true,
@@ -190,7 +202,11 @@ impl SceneForm {
                 [
                     SelectItem::new("send", "추가 송출에만"),
                     SelectItem::new("output", "주 출력에만"),
-                    SelectItem::new("both", "두 출력 모두"),
+                    SelectItem::new("both", "모니터와 통화"),
+                    SelectItem::new("broadcast", "방송 송출에만"),
+                    SelectItem::new("output-broadcast", "모니터와 방송"),
+                    SelectItem::new("send-broadcast", "통화와 방송"),
+                    SelectItem::new("all", "세 출력 모두"),
                     SelectItem::new("off", "어느 출력에도 보내지 않음"),
                 ],
                 cx,
@@ -198,7 +214,9 @@ impl SceneForm {
             .default_value(&draft.aux_to)
         });
         let output_gain = text_input("전체 시작 음량", &draft.output_gain_db, window, cx);
+        let monitor_gain = text_input("모니터 시작 음량", &draft.monitor_gain_db, window, cx);
         let send_gain = text_input("추가 송출 시작 음량", &draft.send_gain_db, window, cx);
+        let broadcast_gain = text_input("방송 송출 시작 음량", &draft.broadcast_gain_db, window, cx);
         let aux_gain = text_input("AUX 입력 음량", &draft.aux_gain_db, window, cx);
         let queue_ms = text_input("장치별 queue 목표", &draft.queue_ms, window, cx);
         let sound = cx.new(|cx| SoundEditor::new(draft.sound, window, cx));
@@ -207,6 +225,7 @@ impl SceneForm {
             (Endpoint::Mic, &mic),
             (Endpoint::Output, &output),
             (Endpoint::Send, &send),
+            (Endpoint::Broadcast, &broadcast),
             (Endpoint::Aux, &aux),
         ] {
             subscriptions.push(cx.observe(&field.select, |_, _, cx| cx.notify()));
@@ -246,7 +265,7 @@ impl SceneForm {
         }
         subscriptions.push(cx.observe(&app_picker, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&aux_to, |_, _, cx| cx.notify()));
-        for input in [&output_gain, &send_gain, &aux_gain, &queue_ms] {
+        for input in [&output_gain, &monitor_gain, &send_gain, &broadcast_gain, &aux_gain, &queue_ms] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
         }
         let fields = DeviceSetup {
@@ -254,12 +273,15 @@ impl SceneForm {
             mic,
             output,
             send,
+            broadcast,
             aux,
             app_picker,
             apps,
             aux_to,
             output_gain,
+            monitor_gain,
             send_gain,
+            broadcast_gain,
             aux_gain,
             queue_ms,
             mix: draft.mix,
@@ -329,7 +351,8 @@ impl SceneForm {
             self.error = Some(error);
         } else {
             let field = AppField::new(source, window, cx);
-            field.set_busy(false, selected(&fields.send.select, cx).is_some(), cx);
+            field.set_busy(false, selected(&fields.send.select, cx).is_some(),
+                selected(&fields.broadcast.select, cx).is_some(), cx);
             fields.apps.push(field);
             self.error = None;
         }
@@ -343,15 +366,10 @@ impl SceneForm {
         match action {
             AppAction::Remove => { fields.apps.remove(index); }
             AppAction::Mute => { app.source.muted = !app.source.muted; }
-            AppAction::Output | AppAction::Send => {
-                let mut output = app.source.to.includes(0);
-                let mut send = app.source.to.includes(1);
-                if matches!(action, AppAction::Output) { output = !output; }
-                else { send = !send; }
-                app.source.to = match (output, send) {
-                    (false, false) => AuxDestination::Off, (true, false) => AuxDestination::Output,
-                    (false, true) => AuxDestination::Send, (true, true) => AuxDestination::Both,
-                };
+            AppAction::Route(mix) => {
+                let mut enabled = std::array::from_fn(|index| app.source.to.includes(index));
+                enabled[mix.index()] = !enabled[mix.index()];
+                app.source.to = AuxDestination::from_enabled(enabled);
             }
         }
         self.error = None;
@@ -361,6 +379,7 @@ impl SceneForm {
     fn app_sources(&self, fields: &DeviceSetup, window: &Window, cx: &Context<Self>) -> Div {
         let busy = self.is_busy(cx);
         let has_send = selected(&fields.send.select, cx).is_some();
+        let has_broadcast = selected(&fields.broadcast.select, cx).is_some();
         let can_add = selected(&fields.app_picker, cx).is_some_and(|path| {
             fields.catalog.apps.iter().any(|app| app.path == path && app.target.is_ok())
                 && !fields.apps.iter().any(|app| app.source.path.eq_ignore_ascii_case(&path))
@@ -379,6 +398,7 @@ impl SceneForm {
             let source = &app.source;
             let output_on = source.to.includes(0);
             let send_on = source.to.includes(1);
+            let broadcast_on = source.to.includes(2);
             let problem = match fields.catalog.apps.iter().find(|candidate| candidate.path == source.path) {
                 Some(candidate) => candidate.target.as_ref().err().cloned(),
                 None => Some("저장된 앱이 현재 실행 목록에 없습니다. 앱을 실행하고 설정을 다시 열거나 슬롯을 삭제하세요.".into()),
@@ -397,21 +417,25 @@ impl SceneForm {
                         .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Mute, cx))))
                     .child(button("app-output", if output_on { "주 출력 연결됨" } else { "주 출력 꺼짐" }, output_on)
                         .accessibility_label(format!("앱 {slot} 주 출력")).disabled(busy)
-                        .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Output, cx))))
+                        .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Route(RouteMix::Output), cx))))
                     .child(button("app-send", if send_on { "추가 송출 연결됨" } else { "추가 송출 꺼짐" }, send_on)
                         .accessibility_label(format!("앱 {slot} 추가 송출")).disabled(busy || (!has_send && !send_on))
-                        .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Send, cx)))))
+                        .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Route(RouteMix::Send), cx))))
+                    .child(button("app-broadcast", if broadcast_on { "방송 송출 연결됨" } else { "방송 송출 꺼짐" }, broadcast_on)
+                        .accessibility_label(format!("앱 {slot} 방송 송출")).disabled(busy || (!has_broadcast && !broadcast_on))
+                        .on_click(cx.listener(move |this, _, _, cx| this.edit_app(index, AppAction::Route(RouteMix::Broadcast), cx)))))
                 .child(div().flex().flex_wrap().gap_4()
                     .children([("app-channels", "채널 1 또는 1,2", &app.channels),
                         ("app-trim", "입력 trim (dB)", &app.trim),
                         ("app-output-gain", "주 출력 (dB)", &app.output_gain),
-                        ("app-send-gain", "추가 송출 (dB)", &app.send_gain)].into_iter().map(|(id, label, input)| {
+                        ("app-send-gain", "통화 송출 (dB)", &app.send_gain),
+                        ("app-broadcast-gain", "방송 송출 (dB)", &app.broadcast_gain)].into_iter().map(|(id, label, input)| {
                         div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child(label))
                             .child(number_input(id, input, window, cx))
                     }))));
         }
         rack.child(div().text_xs().text_color(rgb(MUTED))
-            .child("새 앱은 두 경로가 모두 꺼져 있습니다. 통화 수신 앱을 통화 송출로 보내지 않도록 직접 지정하세요."))
+            .child("새 앱은 모든 경로가 꺼져 있습니다. 통화 수신 앱을 통화 송출로 보내지 않도록 직접 지정하세요."))
     }
 
     pub fn show_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
@@ -427,6 +451,7 @@ impl DeviceSetup {
             Endpoint::Aux => (&self.catalog.inputs, &self.aux),
             Endpoint::Output => (&self.catalog.outputs, &self.output),
             Endpoint::Send => (&self.catalog.outputs, &self.send),
+            Endpoint::Broadcast => (&self.catalog.outputs, &self.broadcast),
         }
     }
 
@@ -438,12 +463,16 @@ impl DeviceSetup {
             output_channels: self.output.channels.read(cx).value().to_string(),
             send: selected(&self.send.select, cx),
             send_channels: self.send.channels.read(cx).value().to_string(),
+            broadcast: selected(&self.broadcast.select, cx),
+            broadcast_channels: self.broadcast.channels.read(cx).value().to_string(),
             aux_input: selected(&self.aux.select, cx),
             apps: self.apps.iter().map(|app| app.build(cx)).collect::<Result<Vec<_>, _>>()?,
             aux_channels: self.aux.channels.read(cx).value().to_string(),
             aux_to: selected(&self.aux_to, cx).unwrap_or_default(),
             output_gain_db: self.output_gain.read(cx).value().to_string(),
+            monitor_gain_db: self.monitor_gain.read(cx).value().to_string(),
             send_gain_db: self.send_gain.read(cx).value().to_string(),
+            broadcast_gain_db: self.broadcast_gain.read(cx).value().to_string(),
             aux_gain_db: self.aux_gain.read(cx).value().to_string(),
             queue_ms: self.queue_ms.read(cx).value().to_string(),
             mix: self.mix,
@@ -457,6 +486,7 @@ impl DeviceSetup {
             Endpoint::Mic,
             Endpoint::Output,
             Endpoint::Send,
+            Endpoint::Broadcast,
             Endpoint::Aux,
         ] {
             let (devices, field) = self.endpoint(endpoint);
@@ -474,7 +504,8 @@ impl DeviceSetup {
         }
         self.app_picker.update(cx, |state, cx| state.set_disabled(busy, window, cx));
         let has_send = selected(&self.send.select, cx).is_some();
-        for app in &self.apps { app.set_busy(busy, has_send, cx); }
+        let has_broadcast = selected(&self.broadcast.select, cx).is_some();
+        for app in &self.apps { app.set_busy(busy, has_send, has_broadcast, cx); }
         let aux_disabled = busy || selected(&self.aux.select, cx).is_none();
         self.aux_to
             .update(cx, |state, cx| state.set_disabled(aux_disabled, window, cx));
@@ -483,7 +514,8 @@ impl DeviceSetup {
         let send_disabled = busy || selected(&self.send.select, cx).is_none();
         self.send_gain
             .update(cx, |input, cx| input.set_disabled(send_disabled, cx));
-        for input in [&self.output_gain, &self.queue_ms] {
+        self.broadcast_gain.update(cx, |input, cx| input.set_disabled(busy || !has_broadcast, cx));
+        for input in [&self.output_gain, &self.monitor_gain, &self.queue_ms] {
             input.update(cx, |input, cx| input.set_disabled(busy, cx));
         }
     }
@@ -531,6 +563,7 @@ impl DeviceSetup {
             .child(section_title("02", "목적지 선택"))
             .child(self.device_field(Endpoint::Output, "new-output", "주 출력 · 필수", window, cx))
             .child(self.device_field(Endpoint::Send, "new-send", "추가 송출 · 선택", window, cx))
+            .child(self.device_field(Endpoint::Broadcast, "new-broadcast", "방송 송출 · 선택", window, cx))
             .child(
                 div()
                     .text_xs()
@@ -548,8 +581,10 @@ impl DeviceSetup {
                     .child(section_title("03", "시작 음량과 queue"))
                     .child(
                         div().flex().flex_wrap().gap_5()
-                            .child(self.setting("initial-output-gain", "전체 시작 음량", &self.output_gain, "−96~0 dB · 두 출력에 공통 적용", window, cx))
-                            .child(self.setting("initial-send-gain", "추가 송출 시작 음량", &self.send_gain, "−96~0 dB · 추가 송출에 더해지는 감쇠", window, cx))
+                            .child(self.setting("initial-output-gain", "전체 시작 음량", &self.output_gain, "−96~0 dB · 모든 출력에 공통 적용", window, cx))
+                            .child(self.setting("initial-monitor-gain", "모니터 시작 음량", &self.monitor_gain, "−96~0 dB · 주 출력 추가 감쇠", window, cx))
+                            .child(self.setting("initial-send-gain", "추가 송출 시작 음량", &self.send_gain, "−96~0 dB · 통화 송출 추가 감쇠", window, cx))
+                            .child(self.setting("initial-broadcast-gain", "방송 송출 시작 음량", &self.broadcast_gain, "−96~0 dB · 방송 송출 추가 감쇠", window, cx))
                             .child(self.setting("initial-aux-gain", "AUX 입력 음량", &self.aux_gain, "−96~0 dB · AUX를 섞기 전 감쇠", window, cx))
                             .child(self.setting("initial-queue", "장치별 queue 목표", &self.queue_ms, "10~100 ms · 하드웨어 버퍼나 실측 왕복 지연이 아닙니다", window, cx)),
                     )

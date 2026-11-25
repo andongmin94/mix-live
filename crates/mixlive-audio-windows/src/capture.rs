@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, Source};
 use mixlive_effects::{Meters, VocalChain};
-use crate::{bridge::{Fault, Health, OutputWriter}, config::{AuxDestination, MAX_APPS}, control::{GainRamp, LiveCommand, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
+use crate::{bridge::{Fault, Health, OutputWriter}, config::{AuxDestination, MAX_APPS, MAX_MIXES}, control::{GainRamp, LiveCommand, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
 
 pub const CAPTURE_BLOCK: usize = 256;
 
@@ -40,6 +40,7 @@ pub struct Capture {
     controls: Arc<LiveControls>,
     // Core indices are compact; control slots retain mic/AUX/app identity.
     source_slots: Vec<usize>,
+    mix_slots: Vec<usize>,
     source_mutes: [GainRamp; MAX_SOURCES],
     route_count: usize,
     route_ramps: [GainRamp; MAX_ROUTES],
@@ -49,15 +50,22 @@ pub struct Capture {
     pub vocal_stats: Arc<VocalStats>,
 }
 impl Capture {
-    pub fn new(vocal: VocalChain, sample_rate: u32, aux: Option<(f32, AuxDestination)>, app_gains: &[f32], outputs: Vec<(OutputWriter, Vec<usize>)>, health: Arc<Health>, controls: Arc<LiveControls>) -> Result<Self, String> {
-        let mix_count = controls.mix_count();
+    pub fn new(vocal: VocalChain, sample_rate: u32, aux: Option<(f32, AuxDestination)>, app_gains: &[f32], mut outputs: Vec<(OutputWriter, Vec<usize>)>, health: Arc<Health>, controls: Arc<LiveControls>) -> Result<Self, String> {
+        let mix_slots: Vec<_> = controls.mixes().map(RouteMix::index).collect();
+        let mix_count = mix_slots.len();
         if !(8_000..=192_000).contains(&sample_rate) || aux.is_some() != controls.has_aux()
             || app_gains.len() != controls.app_count() {
             return Err("source controls do not match the capture configuration".into());
         }
         if outputs.is_empty() || outputs.iter().any(|(writer, mixes)| {
-            mixes.len() != writer.mix_count() || mixes.iter().any(|&mix| mix >= mix_count)
+            mixes.len() != writer.mix_count() || mixes.iter().any(|mix| !mix_slots.contains(mix))
         }) { return Err("endpoint mix bindings do not match their clock bridges".into()); }
+        // Map stable logical output slots to the compact core indices once, before callbacks.
+        for (_, bindings) in &mut outputs {
+            for mix in bindings {
+                *mix = mix_slots.iter().position(|slot| *slot == *mix).expect("validated output mix");
+            }
+        }
         let mut scene = Scene {
             // Mono voice is duplicated after native DSP; a VST3 may produce different L/R.
             sources: vec![Source { name: "Processed mic".into(), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false }],
@@ -67,8 +75,8 @@ impl Capture {
             sends: (0..mix_count).map(|mix| Send { source: 0, mix, gain_db: 0.0, enabled: true }).collect(),
         };
         if let Some((gain_db, destination)) = aux {
-            if destination.includes(1) && mix_count != 2 {
-                return Err("AUX send destination needs a second mix".into());
+            if RouteMix::ALL.into_iter().any(|mix| destination.includes(mix.index()) && !controls.has_mix(mix)) {
+                return Err("AUX destination is not configured".into());
             }
             scene.sources.push(Source { name: "AUX".into(), channels: ChannelLayout::Stereo, gain_db, muted: false });
             scene.sends.extend((0..mix_count).map(|mix| Send { source: 1, mix, gain_db: 0.0, enabled: true }));
@@ -80,20 +88,20 @@ impl Capture {
         }
         let engine = Engine::new(&scene, CAPTURE_BLOCK).map_err(|e| e.to_string())?;
         if let Some((_, destination)) = aux {
-            for (mix, target) in [RouteMix::Output, RouteMix::Send].into_iter().take(mix_count).enumerate() {
-                controls.apply(LiveCommand::Route { source: RouteSource::Aux, mix: target, enabled: destination.includes(mix) })?;
+            for mix in controls.mixes() {
+                controls.apply(LiveCommand::Route { source: RouteSource::Aux, mix, enabled: destination.includes(mix.index()) })?;
             }
         }
         let source_slots: Vec<_> = controls.sources().map(RouteSource::index).collect();
         let route_count = scene.sends.len();
         let targets = controls.route_targets();
         let route_ramps = std::array::from_fn(|index| GainRamp::new(sample_rate,
-            if index < route_count { targets[source_slots[index / mix_count] * 2 + index % mix_count] } else { 0.0 }));
+            if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
         let source_mutes = controls.source_targets().map(|gain| GainRamp::new(sample_rate, gain));
         Ok(Self { engine, vocal, scratch: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
             aux_enabled: aux.is_some(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
             app_count: app_gains.len(), app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
-            controls, source_slots, source_mutes, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
+            controls, source_slots, mix_slots, source_mutes, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
             vocal_stats: Arc::new(VocalStats::default()) })
     }
     #[cfg(windows)]
@@ -117,9 +125,9 @@ impl Capture {
         for (block_index, block) in samples.chunks(CAPTURE_BLOCK).enumerate() {
             for (ramp, target) in self.source_mutes.iter_mut().zip(self.controls.source_targets()) { ramp.set(target); }
             let targets = self.controls.route_targets();
-            let mix_count = self.controls.mix_count();
+            let mix_count = self.mix_slots.len();
             for (index, ramp) in self.route_ramps[..self.route_count].iter_mut().enumerate() {
-                ramp.set(targets[self.source_slots[index / mix_count] * 2 + index % mix_count]);
+                ramp.set(targets[self.source_slots[index / mix_count] * MAX_MIXES + self.mix_slots[index % mix_count]]);
                 for gain in &mut self.route_envelopes[index][..block.len()] { *gain = ramp.next_gain(); }
             }
             let envelopes: [&[f32]; MAX_ROUTES] = std::array::from_fn(|index| &self.route_envelopes[index][..block.len()]);
@@ -179,7 +187,7 @@ impl Capture {
             self.vocal_stats.record(meters);
             for (writer, mixes) in &mut self.outputs {
                 for frame in 0..block.len() {
-                    let mut packed = [0.0; 4];
+                    let mut packed = [0.0; MAX_MIXES * 2];
                     for (lane, mix) in mixes.iter().enumerate() {
                         let Some(output) = self.engine.output(*mix) else { self.health.fail(Fault::Routing); return; };
                         packed[lane * 2] = output.left[frame]; packed[lane * 2 + 1] = output.right[frame];

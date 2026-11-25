@@ -437,17 +437,12 @@ impl MixLive {
             FaderTarget::Gain(GainTarget::Master),
             controls.gain_db(GainTarget::Master).expect("master exists"),
         )];
-        if controls.mix_count() == 2 {
-            values.push((
-                FaderTarget::Gain(GainTarget::Send),
-                controls.gain_db(GainTarget::Send).expect("send exists"),
-            ));
+        for mix in controls.mixes() {
+            let target = mix.gain_target();
+            values.push((FaderTarget::Gain(target), controls.gain_db(target).expect("configured mix")));
         }
         for source in controls.sources() {
-            for mix in [RouteMix::Output, RouteMix::Send]
-                .into_iter()
-                .take(controls.mix_count())
-            {
+            for mix in controls.mixes() {
                 let (_, db) = controls
                     .route_state(source, mix)
                     .expect("configured route exists");
@@ -860,6 +855,12 @@ impl MixLive {
                     .child("추가 송출 미선택"),
             );
         }
+        if let Some(broadcast) = &route.broadcast {
+            destinations = destinations.child(device("방송 송출", broadcast,
+                format!("출력 채널 {}", channels(&route.broadcast_channels))));
+        } else {
+            destinations = destinations.child(div().text_sm().text_color(rgb(MUTED)).child("방송 송출 미선택"));
+        }
         destinations = destinations.child(
             button("edit-devices", "장치·출력 설정", false)
                 .disabled(
@@ -978,11 +979,7 @@ impl MixLive {
                 .child(peak_meter("앱 입력 · trim/mute 전", levels.and_then(|l| l.app_inputs[index])))
                 .child(div().text_xs().text_color(rgb(MUTED)).truncate().child(app.path.clone())));
         }
-        for (mix_index, mix) in [RouteMix::Output, RouteMix::Send]
-            .into_iter()
-            .take(controls.mix_count())
-            .enumerate()
-        {
+        for mix in controls.mixes() {
             let destination = mix_name(mix);
             let mut group = div()
                 .flex()
@@ -1003,7 +1000,7 @@ impl MixLive {
                 let (enabled, db) = controls
                     .route_state(source, mix)
                     .expect("configured route exists");
-                let key = source_index * 2 + mix_index;
+                let key = source_index * RouteMix::ALL.len() + mix.index();
                 let owner = cx.entity();
                 group = group.child(
                     div()
@@ -1051,81 +1048,33 @@ impl MixLive {
         }
 
         let master_db = controls.gain_db(GainTarget::Master).expect("master exists");
-        let mut output = panel()
-            .w(px(330.))
-            .flex_shrink_0()
-            .gap_4()
+        let mut output = panel().w(px(330.)).flex_shrink_0().gap_4()
             .child(div().font_semibold().child("최종 출력 음량"))
-            .child(peak_meter("주 출력 믹스 peak", levels.and_then(|l| l.outputs[0])))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(div().text_sm().child("전체 음량"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("주 출력과 추가 송출에 함께 적용됩니다."),
-                    )
-                    .child(self.fader(
-                        "master-level",
-                        "전체 출력 음량",
-                        FaderTarget::Gain(GainTarget::Master),
-                        master_db,
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .text_sm()
-                    .child("주 출력 음소거")
-                    .child(self.mute("mute-output", "주 출력 음소거", MuteTarget::Output, cx)),
-            );
-        if controls.mix_count() == 2 {
-            let send_db = controls.gain_db(GainTarget::Send).expect("send exists");
-            output = output.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .pt_4()
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .child(peak_meter("추가 송출 믹스 peak", levels.and_then(|l| l.outputs[1])))
-                    .child(div().text_sm().child("송출 추가 감쇠"))
-                    .child(self.fader(
-                        "send-level",
-                        "추가 송출 감쇠",
-                        FaderTarget::Gain(GainTarget::Send),
-                        send_db,
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(format!("송출 최종 감쇠: {:.1} dB", master_db + send_db)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_sm()
-                            .child("추가 송출 음소거")
-                            .child(self.mute(
-                                "mute-send",
-                                "추가 송출 음소거",
-                                MuteTarget::Send,
-                                cx,
-                            )),
-                    ),
-            );
+            .child(div().flex().flex_col().gap_1()
+                .child(div().text_sm().child("전체 음량"))
+                .child(div().text_xs().text_color(rgb(MUTED)).child("모든 출력에 공통 적용됩니다."))
+                .child(self.fader("master-level", "전체 출력 음량",
+                    FaderTarget::Gain(GainTarget::Master), master_db, cx)));
+        for mix in controls.mixes() {
+            let slot = mix.index();
+            let name = mix_name(mix);
+            let target = mix.gain_target();
+            let db = controls.gain_db(target).expect("configured mix");
+            let meter_label = match mix {
+                RouteMix::Output => "모니터 믹스 peak",
+                RouteMix::Send => "통화 믹스 peak",
+                RouteMix::Broadcast => "방송 믹스 peak",
+            };
+            output = output.child(div().flex().flex_col().gap_2()
+                .pt_4().border_t_1().border_color(rgb(BORDER))
+                .child(peak_meter(meter_label, levels.and_then(|l| l.outputs[slot])))
+                .child(div().text_sm().font_semibold().child(name))
+                .child(self.fader(("mix-level", slot), &format!("{name} 추가 감쇠"),
+                    FaderTarget::Gain(target), db, cx))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(format!("최종 감쇠: {:.1} dB", master_db + db)))
+                .child(div().flex().items_center().justify_between().text_sm()
+                    .child("음소거")
+                    .child(self.mute(("mute-mix", slot), &format!("{name} 음소거"), mix.mute_target(), cx))));
         }
         output = output.child(div().text_xs().text_color(rgb(MUTED)).pt_3().child(
             "출력 peak는 감쇠·mute·sample guard 후, 장치 채널 매핑 전입니다. 음소거와 경로 선택은 각각 유지됩니다.",
@@ -1328,8 +1277,9 @@ fn source_name(source: RouteSource, scene: &mixlive_audio_windows::scene::AudioS
 
 fn mix_name(mix: RouteMix) -> &'static str {
     match mix {
-        RouteMix::Output => "주 출력",
-        RouteMix::Send => "추가 송출",
+        RouteMix::Output => "모니터",
+        RouteMix::Send => "통화 송출",
+        RouteMix::Broadcast => "방송 송출",
     }
 }
 
