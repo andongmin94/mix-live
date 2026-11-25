@@ -42,7 +42,13 @@ GPUI Deck 0.0.1과 GPUI family 0.3.12만 사용하며 기존 엔진 패키지 �
 Windows 검사 87개, Clippy, release 빌드 및 실제 Scene 편집·저장 검사를 통과했다.
 새 Deck revision은 [Audio #27](https://github.com/andongmin94/mix-live/actions/runs/45548374397)에서
 Windows workspace, native fixture, Clippy, release 빌드 및 실제 Scene UI 검사를 모두 통과했다.
-이번 실행 상태 저장 코드의 Windows 통합 검증은 대기 중이다. 실제 장치와 라이브 fader는 미검증이다.
+실행 상태 저장 코드 `851975d8670e7f4ed41d771b30be9cc9eb1127d6`의 [Audio #28](https://github.com/andongmin94/mix-live/actions/runs/45549620656):
+Windows 검사 **88개**(workspace 79 + native VST3 fixture 9) 성공. Clippy의 `large_enum_variant`가
+CLI Scene Save에 발생하여 release/GUI 검사는 실행되지 않았다.
+`6290cf91c828bff2dd9762d1af62cb8b473a3e0e`에서 Save의 큰 RouteOptions만 Box로 두고
+mix 설정은 인라인으로 유지하도록 수정했다. 린트 억제 없음.
+수정 후 [Audio #29](https://github.com/andongmin94/mix-live/actions/runs/45550324761)는 실행 중이다.
+실제 장치와 라이브 fader는 미검증이다.
 
 ## 남은 작업과 제한
 
