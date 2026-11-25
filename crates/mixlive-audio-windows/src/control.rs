@@ -14,7 +14,7 @@ const BROADCAST: u32 = 1 << (5 + MAX_APPS);
 pub(crate) const MAX_SOURCES: usize = MAX_APPS + 2;
 pub(crate) const MAX_ROUTES: usize = MAX_MIXES * MAX_SOURCES;
 
-pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; trim aux|appN <dB -96..0>; bypass <VST3 slot> on|off; vocal trim|strength|compressor|deesser|reverb|decay <value>; status; stop. Changes last for this run unless saved with --scene-out.";
+pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; trim aux|appN <dB -96..0>; bypass <VST3 slot> on|off; vocal trim|strength|compressor|deesser|reverb|decay|echo|echo-feedback <value>; status; stop. Changes last for this run unless saved with --scene-out.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuteTarget { Mic, Aux, App(usize), Output, Send, Broadcast, All }
@@ -285,7 +285,8 @@ impl LiveControls {
             || self.app_count != route.apps.len() {
             return Err("live controls do not match the Scene topology".into());
         }
-        if route.vocal != self.vocal_start.preset || route.reverb_predelay_ms != self.vocal_start.reverb.predelay_ms {
+        if route.vocal != self.vocal_start.preset || route.reverb_predelay_ms != self.vocal_start.reverb.predelay_ms
+            || route.echo_time_ms != self.vocal_start.echo.time_ms {
             return Err("live vocal processing does not match the Scene topology".into());
         }
         let mut saved = route.clone();
@@ -762,12 +763,13 @@ mod tests {
             "--vocal", "warm", "--vocal-strength", "0", "--reverb-predelay-ms", "25"]).command else { panic!("expected check") };
         let controls = LiveControls::from_route(&route).unwrap();
         for command in ["vocal trim -3", "vocal strength 0.75", "vocal compressor -35",
-            "vocal deesser -40", "vocal reverb 0.25", "vocal decay 2.5"] {
+            "vocal deesser -40", "vocal reverb 0.25", "vocal decay 2.5", "vocal echo 0.375", "vocal echo-feedback 0.5"] {
             controls.apply(command.parse().unwrap()).unwrap();
         }
         let before = controls.vocal_config();
         for command in ["vocal reverb NaN", "vocal decay 5.1", "vocal trim -37",
-            "vocal compressor 1", "vocal strength 1.01", "vocal predelay 10", "vocal preset warm"] {
+            "vocal compressor 1", "vocal strength 1.01", "vocal predelay 10", "vocal preset warm",
+            "vocal echo NaN", "vocal echo-feedback 0.86", "vocal echo-time 100"] {
             assert!(command.parse::<LiveCommand>().is_err(), "{command}");
         }
         assert!(controls.apply(LiveCommand::Vocal { parameter: VocalParameter::Trim, value: f32::NAN }).is_err());
@@ -781,7 +783,8 @@ mod tests {
         let off = LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
         assert!(off.apply("vocal strength 1".parse().unwrap()).is_err());
         assert!(off.apply("vocal reverb 0.5".parse().unwrap()).is_ok());
-        assert_eq!(off.vocal_parameters().count(), 3);
+        assert!(off.apply("vocal echo 0.5".parse().unwrap()).is_ok());
+        assert_eq!(off.vocal_parameters().count(), 5);
     }
 
     #[test]

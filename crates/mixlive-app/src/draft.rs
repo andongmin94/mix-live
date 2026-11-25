@@ -185,6 +185,9 @@ impl SceneDraft {
                 reverb_mix: vocal.reverb.mix,
                 reverb_decay_secs: vocal.reverb.decay_secs,
                 reverb_predelay_ms: vocal.reverb.predelay_ms,
+                echo_mix: vocal.echo.mix,
+                echo_time_ms: vocal.echo.time_ms,
+                echo_feedback: vocal.echo.feedback,
                 mix: self.mix,
                 queue_ms: self.queue_ms.trim().parse().map_err(|_| {
                     "Queue 목표에는 10~100 범위의 정수(ms)를 입력하세요.".to_owned()

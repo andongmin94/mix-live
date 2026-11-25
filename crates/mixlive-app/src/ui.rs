@@ -59,14 +59,14 @@ impl FaderTarget {
 
     fn step(self) -> f32 {
         match self {
-            Self::Vocal(VocalParameter::Strength | VocalParameter::ReverbMix) => 0.01,
+            Self::Vocal(VocalParameter::Strength | VocalParameter::ReverbMix | VocalParameter::EchoMix | VocalParameter::EchoFeedback) => 0.01,
             _ => 0.1,
         }
     }
 
     fn value_label(self, value: f32) -> String {
         match self {
-            Self::Vocal(VocalParameter::Strength | VocalParameter::ReverbMix) => format!("{:.1}%", value * 100.0),
+            Self::Vocal(VocalParameter::Strength | VocalParameter::ReverbMix | VocalParameter::EchoMix | VocalParameter::EchoFeedback) => format!("{:.1}%", value * 100.0),
             Self::Vocal(VocalParameter::ReverbDecay) => format!("{value:.2} s"),
             Self::Vocal(VocalParameter::Compressor | VocalParameter::Deesser) => format!("{value:.1} dBFS"),
             _ => format!("{value:.1} dB"),
@@ -797,6 +797,11 @@ impl MixLive {
                     } else {
                         format!("리버브 {:.1}% · {:.2} s · pre-delay {:.1} ms", vocal.reverb.mix * 100.0,
                             vocal.reverb.decay_secs, vocal.reverb.predelay_ms)
+                    }))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(if vocal.echo.mix == 0.0 {
+                        "스테레오 에코 · 꺼짐".to_owned()
+                    } else {
+                        format!("에코 {:.1}% · {:.1} ms · 피드백 {:.1}%", vocal.echo.mix * 100.0, vocal.echo.time_ms, vocal.echo.feedback * 100.0)
                     })),
             );
         if scene.effects.is_empty() {
@@ -998,6 +1003,8 @@ impl MixLive {
                 VocalParameter::Deesser => "디에서 threshold",
                 VocalParameter::ReverbMix => "리버브 비율",
                 VocalParameter::ReverbDecay => "잔향 시간",
+                VocalParameter::EchoMix => "에코 비율",
+                VocalParameter::EchoFeedback => "에코 피드백",
             };
             fields = fields.child(div().min_w(px(250.)).flex_1().flex().flex_col().gap_1()
                 .child(div().text_sm().font_semibold().child(label))
@@ -1007,17 +1014,17 @@ impl MixLive {
         let hint = if config.preset == mixlive_effects::Preset::Off {
             "EQ/다이내믹스 프리셋이 꺼져 있습니다. 정지 후 프리셋을 선택하면 보정 비율과 threshold를 조절할 수 있습니다."
         } else {
-            "보정 비율을 0으로 내리면 EQ/다이내믹스를 우회합니다. 리버브는 별도로 조절합니다."
+            "보정 비율을 0으로 내리면 EQ/다이내믹스를 우회합니다. 리버브와 에코는 별도로 조절합니다."
         };
         panel().gap_3()
             .child(div().flex().items_center().justify_between().gap_3()
                 .child(div().font_semibold().child("실시간 보컬 보정"))
                 .child(div().text_xs().text_color(rgb(MUTED))
-                    .child(format!("{} · pre-delay {:.1} ms", config.preset, config.reverb.predelay_ms))))
+                    .child(format!("{} · pre-delay {:.1} ms · echo {:.1} ms", config.preset, config.reverb.predelay_ms, config.echo.time_ms))))
             .child(fields)
             .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
             .child(div().text_xs().text_color(rgb(MUTED))
-                .child("프리셋과 pre-delay는 정지 상태에서 변경합니다. 조절값은 약 10 ms 전환 후 반영되며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
+                .child("프리셋과 pre-delay, 에코 시간은 정지 상태에서 변경합니다. 조절값은 약 10 ms 전환 후 반영되며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
     }
 
     fn mixer(&self, cx: &Context<Self>) -> gpui::AnyElement {

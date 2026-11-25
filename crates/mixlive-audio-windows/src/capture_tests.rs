@@ -550,3 +550,45 @@ fn supplemental_trim_ramps_once_before_send_delay_and_keeps_input_meters_raw() {
     assert_eq!(f32::from_bits(health.app_peaks[1].load(Ordering::Relaxed)), 0.125);
     assert!(!health.failed());
 }
+
+#[test]
+fn live_echo_reaches_voice_chain_only_and_mute_covers_its_tail() {
+    let config = VocalConfig { echo: mixlive_effects::EchoConfig { mix: 0.0, time_ms: 10.0, feedback: 0.0 }, ..VocalConfig::default() };
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, config).unwrap());
+    for command in ["route aux broadcast on", "route app1 broadcast on"] {
+        controls.apply(command.parse().unwrap()).unwrap();
+    }
+    let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+        vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
+    let mic = [0.5; 240];
+    let silence = [0.0; 240];
+    let aux = [[0.125, -0.25]; 240];
+    let app = [[-0.0625, 0.125]; 240];
+    // First 480 samples fill the 10 ms echo buffer.
+    for _ in 0..2 { capture.push(&mic, Some(&aux), &[&app]); }
+    controls.apply("vocal echo 1".parse().unwrap()).unwrap();
+    for block in 0..2 {
+        capture.push_with_effect(&silence, Some(&aux), &[&app], &mut |left, right| {
+            assert_eq!(left, right);
+            if block == 1 { assert_eq!(left[239], 0.5); }
+            for (l, r) in left.iter_mut().zip(right) { *l *= 0.5; *r *= -0.25; }
+            true
+        });
+    }
+    let monitor = capture.engine.output(0).unwrap();
+    let broadcast = capture.engine.output(1).unwrap();
+    assert_eq!([monitor.left[239], monitor.right[239]], [0.25, -0.125]);
+    assert_eq!([broadcast.left[239], broadcast.right[239]], [0.3125, -0.25]);
+    // Refill the echo and mute voice before the delayed signal appears.
+    for _ in 0..2 { capture.push(&mic, Some(&aux), &[&app]); }
+    controls.apply("mute mic".parse().unwrap()).unwrap();
+    capture.push(&silence, Some(&aux), &[&app]);
+    assert!(capture.engine.output(0).unwrap().sample_peak() > 0.0);
+    let monitor = capture.engine.output(0).unwrap();
+    assert_eq!([monitor.left[239], monitor.right[239]], [0.0; 2]);
+    let broadcast = capture.engine.output(1).unwrap();
+    assert_eq!([broadcast.left[239], broadcast.right[239]], [0.0625, -0.125]);
+    assert!(!health.failed());
+}

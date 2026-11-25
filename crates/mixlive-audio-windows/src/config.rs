@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::control::MixSettings;
-use mixlive_effects::{Preset, ReverbConfig, VocalConfig};
+use mixlive_effects::{EchoConfig, Preset, ReverbConfig, VocalConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -211,7 +211,7 @@ pub struct RouteOptions {
     #[arg(long, default_value_t = Preset::Off)]
     #[serde(with = "preset_serde")]
     pub vocal: Preset,
-    /// Dry/processed blend (0..1), not loudness matching. Fixed for this run.
+    /// Dry/processed blend (0..1), not loudness matching.
     #[arg(long, default_value = "1")]
     pub vocal_strength: f32,
     /// RMS compressor threshold after input trim (-60..0 dBFS). No automatic makeup gain.
@@ -229,6 +229,15 @@ pub struct RouteOptions {
     /// Wet-only extra pre-delay (0..80 ms); does not delay dry voice.
     #[arg(long, default_value = "15")]
     pub reverb_predelay_ms: f32,
+    /// Independent stereo echo wet/dry blend (0..1).
+    #[arg(long, default_value = "0")]
+    pub echo_mix: f32,
+    /// Time between echo repeats (10..1000 ms); fixed while running.
+    #[arg(long, default_value = "250")]
+    pub echo_time_ms: f32,
+    /// Echo feedback (0..0.85); zero produces one repeat.
+    #[arg(long, default_value = "0.35")]
+    pub echo_feedback: f32,
     /// Target per-endpoint queue depth, not round-trip latency or a hardware buffer size.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(10..=100))]
     pub queue_ms: u32,
@@ -251,7 +260,8 @@ impl RouteOptions {
     pub fn vocal_config(&self) -> VocalConfig {
         VocalConfig { preset: self.vocal, input_gain_db: self.input_gain_db, strength: self.vocal_strength,
             compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db,
-            reverb: ReverbConfig { mix: self.reverb_mix, decay_secs: self.reverb_decay_secs, predelay_ms: self.reverb_predelay_ms } }
+            reverb: ReverbConfig { mix: self.reverb_mix, decay_secs: self.reverb_decay_secs, predelay_ms: self.reverb_predelay_ms },
+            echo: EchoConfig { mix: self.echo_mix, time_ms: self.echo_time_ms, feedback: self.echo_feedback } }
     }
 
     pub fn set_vocal_config(&mut self, config: VocalConfig) {
@@ -263,6 +273,9 @@ impl RouteOptions {
         self.reverb_mix = config.reverb.mix;
         self.reverb_decay_secs = config.reverb.decay_secs;
         self.reverb_predelay_ms = config.reverb.predelay_ms;
+        self.echo_mix = config.echo.mix;
+        self.echo_time_ms = config.echo.time_ms;
+        self.echo_feedback = config.echo.feedback;
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.input.trim().is_empty() || self.output.trim().is_empty() || self.input_channel == 0 {

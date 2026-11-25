@@ -7,7 +7,7 @@ use mixlive_audio_windows::{
     plugin::{EffectSpec, PluginArgs},
     scene::AudioScene,
 };
-use mixlive_effects::{Preset, ReverbConfig, VocalConfig};
+use mixlive_effects::{EchoConfig, Preset, ReverbConfig, VocalConfig};
 
 #[derive(Clone, Debug)]
 pub struct SoundDraft {
@@ -19,6 +19,9 @@ pub struct SoundDraft {
     pub reverb_mix: String,
     pub reverb_decay_secs: String,
     pub reverb_predelay_ms: String,
+    pub echo_mix: String,
+    pub echo_time_ms: String,
+    pub echo_feedback: String,
     pub effects: Vec<EffectSpec>,
 }
 
@@ -43,6 +46,9 @@ impl SoundDraft {
             reverb_mix: config.reverb.mix.to_string(),
             reverb_decay_secs: config.reverb.decay_secs.to_string(),
             reverb_predelay_ms: config.reverb.predelay_ms.to_string(),
+            echo_mix: config.echo.mix.to_string(),
+            echo_time_ms: config.echo.time_ms.to_string(),
+            echo_feedback: config.echo.feedback.to_string(),
             effects,
         }
     }
@@ -62,6 +68,11 @@ impl SoundDraft {
                 mix: number(&self.reverb_mix, "리버브 비율")?,
                 decay_secs: number(&self.reverb_decay_secs, "잔향 시간")?,
                 predelay_ms: number(&self.reverb_predelay_ms, "pre-delay")?,
+            },
+            echo: EchoConfig {
+                mix: number(&self.echo_mix, "에코 비율")?,
+                time_ms: number(&self.echo_time_ms, "에코 시간")?,
+                feedback: number(&self.echo_feedback, "에코 피드백")?,
             },
         };
         config.validate().map_err(|error| error.to_string())?;
@@ -173,6 +184,7 @@ mod tests {
             "--reverb-mix", "0.2",
             "--reverb-decay-secs", "1.75",
             "--reverb-predelay-ms", "22.5",
+            "--echo-mix", "0.125", "--echo-time-ms", "300", "--echo-feedback", "0.25",
             "--queue-ms",
             "47",
         ]);
@@ -215,6 +227,9 @@ mod tests {
         draft.reverb_mix = "0.375".into();
         draft.reverb_decay_secs = "2.5".into();
         draft.reverb_predelay_ms = "7.5".into();
+        draft.echo_mix = "0.375".into();
+        draft.echo_time_ms = "420".into();
+        draft.echo_feedback = "0.625".into();
         let changed = draft.apply_to(&original.route).unwrap();
         let mut expected = original.route.clone();
         expected.vocal = Preset::Bright;
@@ -225,6 +240,9 @@ mod tests {
         expected.reverb_mix = 0.375;
         expected.reverb_decay_secs = 2.5;
         expected.reverb_predelay_ms = 7.5;
+        expected.echo_mix = 0.375;
+        expected.echo_time_ms = 420.0;
+        expected.echo_feedback = 0.625;
         assert_eq!(changed.route, expected);
         assert_eq!(changed.effects, original.effects);
         assert_eq!(original.route, route());
@@ -336,6 +354,15 @@ mod tests {
         assert!(draft.vocal_config().is_err());
         draft.reverb_decay_secs = "1.25".into();
         draft.reverb_predelay_ms = "81".into();
+        assert!(draft.vocal_config().is_err());
+        draft.reverb_predelay_ms = "15".into();
+        draft.echo_mix = "1.01".into();
+        assert!(draft.vocal_config().is_err());
+        draft.echo_mix = "0.25".into();
+        draft.echo_time_ms = "9".into();
+        assert!(draft.vocal_config().is_err());
+        draft.echo_time_ms = "250".into();
+        draft.echo_feedback = "0.9".into();
         assert!(draft.vocal_config().is_err());
         assert_eq!(original.route, route());
     }

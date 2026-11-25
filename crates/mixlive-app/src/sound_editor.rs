@@ -30,6 +30,9 @@ pub struct SoundEditor {
     reverb_mix: Entity<InputState>,
     reverb_decay: Entity<InputState>,
     reverb_predelay: Entity<InputState>,
+    echo_mix: Entity<InputState>,
+    echo_time: Entity<InputState>,
+    echo_feedback: Entity<InputState>,
     busy: bool,
     picking: bool,
     error: Option<String>,
@@ -62,8 +65,11 @@ impl SoundEditor {
         let reverb_mix = text_input("리버브 비율", &draft.reverb_mix, window, cx);
         let reverb_decay = text_input("잔향 시간", &draft.reverb_decay_secs, window, cx);
         let reverb_predelay = text_input("리버브 pre-delay", &draft.reverb_predelay_ms, window, cx);
+        let echo_mix = text_input("에코 비율", &draft.echo_mix, window, cx);
+        let echo_time = text_input("에코 시간", &draft.echo_time_ms, window, cx);
+        let echo_feedback = text_input("에코 피드백", &draft.echo_feedback, window, cx);
         let mut subscriptions = vec![cx.observe(&preset, |_, _, cx| cx.notify())];
-        for input in [&input_gain, &strength, &compressor, &deesser, &reverb_mix, &reverb_decay, &reverb_predelay] {
+        for input in [&input_gain, &strength, &compressor, &deesser, &reverb_mix, &reverb_decay, &reverb_predelay, &echo_mix, &echo_time, &echo_feedback] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
         }
         Self {
@@ -76,6 +82,9 @@ impl SoundEditor {
             reverb_mix,
             reverb_decay,
             reverb_predelay,
+            echo_mix,
+            echo_time,
+            echo_feedback,
             busy: false,
             picking: false,
             error: None,
@@ -93,6 +102,9 @@ impl SoundEditor {
             reverb_mix: self.reverb_mix.read(cx).value().to_string(),
             reverb_decay_secs: self.reverb_decay.read(cx).value().to_string(),
             reverb_predelay_ms: self.reverb_predelay.read(cx).value().to_string(),
+            echo_mix: self.echo_mix.read(cx).value().to_string(),
+            echo_time_ms: self.echo_time.read(cx).value().to_string(),
+            echo_feedback: self.echo_feedback.read(cx).value().to_string(),
             effects: self.draft.effects.clone(),
         }
     }
@@ -118,6 +130,9 @@ impl SoundEditor {
             &self.reverb_mix,
             &self.reverb_decay,
             &self.reverb_predelay,
+            &self.echo_mix,
+            &self.echo_time,
+            &self.echo_feedback,
         ] {
             input.update(cx, |state, cx| state.set_disabled(disabled, cx));
         }
@@ -337,6 +352,14 @@ impl Render for SoundEditor {
                     .child(field("reverb-predelay", "추가 pre-delay", "0~80 ms · wet만", &self.reverb_predelay, window, cx)))
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child("내장 EQ·다이내믹스 뒤, VST3 앞에 적용합니다. 보컬 프리셋과 별개이며 원음 경로는 지연하지 않습니다. 설정은 다음 시작부터 적용됩니다.")))
+            .child(panel().gap_4()
+                .child(section_title("ECHO", "스테레오 에코"))
+                .child(div().flex().flex_wrap().gap_5()
+                    .child(field("echo-mix", "에코 비율", "0~1 · 0은 끄기", &self.echo_mix, window, cx))
+                    .child(field("echo-time", "에코 시간", "10~1000 ms · 정지 상태에서 변경", &self.echo_time, window, cx))
+                    .child(field("echo-feedback", "에코 피드백", "0~0.85 · 0은 한 번 반복", &self.echo_feedback, window, cx)))
+                .child(div().text_xs().text_color(rgb(MUTED))
+                    .child("리버브 뒤, VST3 앞에 적용합니다. 원음 경로에 추가 지연을 넣지 않으며 에코 비율과 피드백은 실행 중에도 조절할 수 있습니다.")))
             .children(self.error.as_ref().map(|error| panel().id("sound-editor-error")
                 .role(Role::Alert).aria_label(error.clone()).gap_2().border_color(rgb(DANGER))
                 .child(div().font_semibold().text_color(rgb(DANGER)).child("플러그인 목록을 변경하지 못했습니다"))

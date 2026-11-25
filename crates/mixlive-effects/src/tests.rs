@@ -295,3 +295,84 @@ fn zero_strength_can_enable_the_prepared_dynamics_and_update_thresholds() {
     assert_eq!(chain.config().compressor_threshold_db, -45.0);
     assert_eq!(chain.config().deess_threshold_db, -40.0);
 }
+
+#[test]
+fn echo_validates_even_while_disabled_and_preserves_dry_onset() {
+    let valid = EchoConfig { mix: 0.25, time_ms: 125.0, feedback: 0.5 };
+    for rate in [8000, 44100, 48000, 96000, 192000] {
+        let config = VocalConfig { echo: valid, ..VocalConfig::default() };
+        assert!(VocalChain::new(rate, config).is_ok());
+    }
+    for value in [f32::NAN, f32::INFINITY, 9.99, 1000.01] {
+        let config = VocalConfig { echo: EchoConfig { time_ms: value, mix: 0.0, ..valid }, ..VocalConfig::default() };
+        assert_eq!(config.validate(), Err(DspError::EchoTime));
+    }
+    for (parameter, error, invalid) in [(VocalParameter::EchoMix, DspError::EchoMix, 1.01),
+        (VocalParameter::EchoFeedback, DspError::EchoFeedback, 0.86)] {
+        let mut config = VocalConfig::default();
+        for value in [f32::NAN, f32::INFINITY, -0.01, invalid] {
+            assert_eq!(config.set_parameter(parameter, value), Err(error));
+        }
+    }
+    let render = |sizes: &[usize]| {
+        let mut chain = VocalChain::new(8000, VocalConfig { echo: valid, ..VocalConfig::default() }).unwrap();
+        let mut input = vec![0.0; 4001];
+        input[0] = 0.5;
+        let mut l = vec![0.0; input.len()];
+        let mut r = l.clone();
+        let mut start = 0;
+        for &size in sizes {
+            let end = start + size;
+            chain.process(&input[start..end], &mut l[start..end], &mut r[start..end]).unwrap();
+            start = end;
+        }
+        assert_eq!(start, input.len());
+        assert_eq!(l, r);
+        l
+    };
+    let whole = render(&[4001]);
+    assert_eq!(whole, render(&[1, 137, 512, 777, 1024, 1550]));
+    for (i, &sample) in whole.iter().enumerate() {
+        let expected = if i == 0 { 0.375 } else if i % 1000 == 0 {
+            0.125 * 0.5_f32.powi((i / 1000 - 1) as i32)
+        } else { 0.0 };
+        assert_eq!(sample, expected, "frame {i}");
+    }
+}
+
+#[test]
+fn stereo_echo_keeps_channels_separate_and_live_ramps_keep_history_current() {
+    let config = EchoConfig { mix: 0.0, time_ms: 10.0, feedback: 0.5 };
+    let mut echo = Echo::new(8000, config);
+    // Warm the ring with distinct left/right input; zero mix is bit-exact dry.
+    for _ in 0..80 { assert_eq!(echo.run([0.5, -0.25]), [0.5, -0.25]); }
+    echo.set_mix(1.0);
+    echo.set_feedback(0.0);
+    for i in 1..=80 {
+        let wet = echo.run([0.0; 2]);
+        let expected = f64::from(i.min(80)) / 80.0;
+        assert!((wet[0] - 0.5 * expected).abs() < 1e-12);
+        assert!((wet[1] + 0.25 * expected).abs() < 1e-12);
+    }
+    // Feedback reached zero, so after this ring's contents have played, silence returns.
+    for _ in 0..160 { echo.run([0.0; 2]); }
+    assert_eq!(echo.run([0.0; 2]), [0.0; 2]);
+    echo.run([0.5, -0.25]);
+    echo.reset();
+    for _ in 0..160 { assert_eq!(echo.run([0.0; 2]), [0.0; 2]); }
+    let mut chain = VocalChain::new(8000, VocalConfig { echo: config, ..VocalConfig::default() }).unwrap();
+    let mut left = [0.0; 80];
+    let mut right = [0.0; 80];
+    chain.process(&[0.5; 80], &mut left, &mut right).unwrap();
+    chain.set_parameter(VocalParameter::EchoMix, 1.0).unwrap();
+    chain.set_parameter(VocalParameter::EchoFeedback, 0.0).unwrap();
+    chain.process(&[0.0; 80], &mut left, &mut right).unwrap();
+    assert_eq!(left, right);
+    assert_eq!(left[79], 0.5);
+    let before = chain.config();
+    assert!(chain.set_parameter(VocalParameter::EchoFeedback, 1.0).is_err());
+    assert_eq!(chain.config(), before);
+    assert!(chain.process(&[f32::NAN], &mut [0.0], &mut [0.0]).is_err());
+    chain.process(&[0.0; 80], &mut left, &mut right).unwrap();
+    assert_eq!(left, [0.0; 80]);
+}

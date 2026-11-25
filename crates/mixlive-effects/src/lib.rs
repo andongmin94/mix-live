@@ -1,4 +1,4 @@
-//! Streaming vocal chain: mono trim/EQ/dynamics/de-essing -> stereo room reverb.
+//! Streaming vocal chain: mono trim/EQ/dynamics/de-essing -> stereo room reverb -> stereo echo.
 //! No automatic makeup gain, lookahead buffer, audio I/O or UI dependencies.
 //! Filters use biquad's RBJ coefficient implementation; presets are unvalidated starting points,
 //! not a claim of production sound quality. IIR phase/group delay is not zero.
@@ -8,6 +8,9 @@ use biquad::{Biquad, Coefficients, DirectForm2Transposed, Type, Q_BUTTERWORTH_F6
 mod reverb;
 pub use reverb::ReverbConfig;
 use reverb::Reverb;
+mod echo;
+pub use echo::EchoConfig;
+use echo::Echo;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
@@ -36,29 +39,31 @@ impl FromStr for Preset {
 /// Parameters that can change without changing processing topology or a delay length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
-pub enum VocalParameter { Trim, Strength, Compressor, Deesser, ReverbMix, ReverbDecay }
+pub enum VocalParameter { Trim, Strength, Compressor, Deesser, ReverbMix, ReverbDecay, EchoMix, EchoFeedback }
 
 impl VocalParameter {
-    pub const ALL: [Self; 6] = [Self::Trim, Self::Strength, Self::Compressor, Self::Deesser, Self::ReverbMix, Self::ReverbDecay];
+    pub const ALL: [Self; 8] = [Self::Trim, Self::Strength, Self::Compressor, Self::Deesser, Self::ReverbMix, Self::ReverbDecay, Self::EchoMix, Self::EchoFeedback];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Trim => "trim", Self::Strength => "strength", Self::Compressor => "compressor",
             Self::Deesser => "deesser", Self::ReverbMix => "reverb", Self::ReverbDecay => "decay",
+            Self::EchoMix => "echo", Self::EchoFeedback => "echo-feedback",
         }
     }
 
     pub fn range(self) -> std::ops::RangeInclusive<f32> {
         match self {
             Self::Trim => -36.0..=18.0,
-            Self::Strength | Self::ReverbMix => 0.0..=1.0,
+            Self::Strength | Self::ReverbMix | Self::EchoMix => 0.0..=1.0,
+            Self::EchoFeedback => 0.0..=0.85,
             Self::Compressor | Self::Deesser => -60.0..=0.0,
             Self::ReverbDecay => 0.2..=5.0,
         }
     }
 
     pub fn available_for(self, preset: Preset) -> bool {
-        preset != Preset::Off || matches!(self, Self::Trim | Self::ReverbMix | Self::ReverbDecay)
+        preset != Preset::Off || matches!(self, Self::Trim | Self::ReverbMix | Self::ReverbDecay | Self::EchoMix | Self::EchoFeedback)
     }
 
     pub fn validate(self, value: f32) -> Result<(), DspError> {
@@ -69,6 +74,8 @@ impl VocalParameter {
             Self::Compressor | Self::Deesser => DspError::Threshold,
             Self::ReverbMix => DspError::ReverbMix,
             Self::ReverbDecay => DspError::ReverbDecay,
+            Self::EchoMix => DspError::EchoMix,
+            Self::EchoFeedback => DspError::EchoFeedback,
         })
     }
 }
@@ -83,10 +90,11 @@ pub struct VocalConfig {
     pub compressor_threshold_db: f32,
     pub deess_threshold_db: f32,
     pub reverb: ReverbConfig,
+    pub echo: EchoConfig,
 }
 impl Default for VocalConfig {
     fn default() -> Self {
-        Self { preset: Preset::Off, input_gain_db: 0.0, strength: 1.0, compressor_threshold_db: -24.0, deess_threshold_db: -30.0, reverb: ReverbConfig::default() }
+        Self { preset: Preset::Off, input_gain_db: 0.0, strength: 1.0, compressor_threshold_db: -24.0, deess_threshold_db: -30.0, reverb: ReverbConfig::default(), echo: EchoConfig::default() }
     }
 }
 impl VocalConfig {
@@ -98,6 +106,8 @@ impl VocalConfig {
             VocalParameter::Deesser => self.deess_threshold_db,
             VocalParameter::ReverbMix => self.reverb.mix,
             VocalParameter::ReverbDecay => self.reverb.decay_secs,
+            VocalParameter::EchoMix => self.echo.mix,
+            VocalParameter::EchoFeedback => self.echo.feedback,
         }
     }
 
@@ -110,18 +120,21 @@ impl VocalConfig {
             VocalParameter::Deesser => self.deess_threshold_db = value,
             VocalParameter::ReverbMix => self.reverb.mix = value,
             VocalParameter::ReverbDecay => self.reverb.decay_secs = value,
+            VocalParameter::EchoMix => self.echo.mix = value,
+            VocalParameter::EchoFeedback => self.echo.feedback = value,
         }
         Ok(())
     }
 
     pub fn validate(self) -> Result<(), DspError> {
         for parameter in VocalParameter::ALL { parameter.validate(self.parameter(parameter))?; }
-        self.reverb.validate()
+        self.reverb.validate()?;
+        self.echo.validate()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DspError { Preset, InputGain, Strength, Threshold, ReverbMix, ReverbDecay, ReverbPredelay, SampleRate, Filter, BlockLength, NonFiniteAudio }
+pub enum DspError { Preset, InputGain, Strength, Threshold, ReverbMix, ReverbDecay, ReverbPredelay, EchoMix, EchoFeedback, EchoTime, SampleRate, Filter, BlockLength, NonFiniteAudio }
 impl fmt::Display for DspError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -132,6 +145,9 @@ impl fmt::Display for DspError {
             Self::ReverbMix => "reverb-mix must be finite and in 0..=1",
             Self::ReverbDecay => "reverb-decay-secs must be finite and in 0.2..=5",
             Self::ReverbPredelay => "reverb-predelay-ms must be finite and in 0..=80",
+            Self::EchoMix => "echo-mix must be finite and in 0..=1",
+            Self::EchoFeedback => "echo-feedback must be finite and in 0..=0.85",
+            Self::EchoTime => "echo-time-ms must be finite and in 10..=1000",
             Self::SampleRate => "vocal presets require 32000..=192000 Hz; off supports 8000..=192000 Hz",
             Self::Filter => "could not prepare vocal filter coefficients",
             Self::BlockLength => "vocal input and stereo output lengths must match",
@@ -301,6 +317,7 @@ pub struct VocalChain {
     deesser_threshold: ParameterRamp,
     processing: Option<Processing>,
     reverb: Reverb,
+    echo: Echo,
 }
 impl VocalChain {
     /// Construct on the control thread, before opening audio streams.
@@ -313,18 +330,19 @@ impl VocalChain {
         let processing = if config.preset == Preset::Off { None }
             else { Some(Processing::new(f64::from(sample_rate), config)?) };
         let reverb = Reverb::new(sample_rate, config.reverb)?;
+        let echo = Echo::new(sample_rate, config.echo);
         Ok(Self { config,
             input_gain: ParameterRamp::new(sample_rate, gain(f64::from(config.input_gain_db))),
             strength: ParameterRamp::new(sample_rate, f64::from(config.strength)),
             compressor_threshold: ParameterRamp::new(sample_rate, f64::from(config.compressor_threshold_db)),
             deesser_threshold: ParameterRamp::new(sample_rate, f64::from(config.deess_threshold_db)),
-            processing, reverb })
+            processing, reverb, echo })
     }
     /// Requested settings, not transient ramp values.
     pub fn config(&self) -> VocalConfig { self.config }
 
     /// Apply a validated target on the audio-processing thread, at a block boundary.
-    /// Preset, sample rate and pre-delay remain fixed. Only changed targets do work.
+    /// Preset, sample rate, pre-delay and echo time remain fixed. Only changed targets do work.
     pub fn set_parameter(&mut self, parameter: VocalParameter, value: f32) -> Result<(), DspError> {
         if self.config.parameter(parameter) == value { return Ok(()); }
         self.config.set_parameter(parameter, value)?;
@@ -335,6 +353,8 @@ impl VocalChain {
             VocalParameter::Deesser => self.deesser_threshold.set(f64::from(value)),
             VocalParameter::ReverbMix => self.reverb.set_mix(value),
             VocalParameter::ReverbDecay => self.reverb.set_decay(value),
+            VocalParameter::EchoMix => self.echo.set_mix(value),
+            VocalParameter::EchoFeedback => self.echo.set_feedback(value),
         }
         Ok(())
     }
@@ -342,11 +362,13 @@ impl VocalChain {
     pub fn reset(&mut self) {
         if let Some(processing) = &mut self.processing { processing.reset(); }
         self.reverb.reset();
+        self.echo.reset();
         for ramp in [&mut self.input_gain, &mut self.strength, &mut self.compressor_threshold, &mut self.deesser_threshold] { ramp.reset(); }
     }
 
     /// Process mono input into stereo output without allocation, locks, logging or I/O.
-    /// Zero reverb duplicates the processed mono signal exactly. Reverb is independent of EQ strength.
+    /// With reverb/echo at zero the processed mono signal is duplicated exactly.
+    /// Both spatial effects are independent of EQ strength.
     /// An invalid block silences both outputs and resets state; callers must stop that route.
     pub fn process(&mut self, samples: &[f32], left: &mut [f32], right: &mut [f32]) -> Result<Meters, DspError> {
         if left.len() != samples.len() || right.len() != samples.len() {
@@ -376,7 +398,7 @@ impl VocalChain {
                     dry + strength * (wet - dry)
                 }
             } else { dry };
-            let stereo = self.reverb.run(value);
+            let stereo = self.echo.run(self.reverb.run(value));
             *left = stereo[0] as f32;
             *right = stereo[1] as f32;
             meters.output_peak = meters.output_peak.max(left.abs()).max(right.abs());

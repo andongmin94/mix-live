@@ -23,7 +23,7 @@ impl AudioScene {
         // CLI paths refer to the current working directory, not a future scene directory.
         // absolute() does not require the plugin to be present or execute its native code.
         for effect in &mut effects { effect.plugin = std::path::absolute(&effect.plugin)?; }
-        Ok(Self { schema: 9, route, effects })
+        Ok(Self { schema: 10, route, effects })
     }
 
     /// Relative paths in a hand-authored scene are anchored to that scene, never the caller's cwd.
@@ -39,7 +39,7 @@ impl AudioScene {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != 9 { return Err("unsupported MixLive scene schema; create a schema 9 scene".into()); }
+        if self.schema != 10 { return Err("unsupported MixLive scene schema; create a schema 10 scene".into()); }
         self.route.validate()?;
         validate_effects(&self.effects)?;
         Ok(())
@@ -75,7 +75,7 @@ mod tests {
             "--input-gain-db", "3", "--output-gain-db", "-12", "--vocal", "warm",
             "--vocal-strength", "0.75", "--vocal-threshold-db", "-20",
             "--deess-threshold-db", "-28", "--reverb-mix", "0.18", "--reverb-decay-secs", "1.75",
-            "--reverb-predelay-ms", "22.5", "--queue-ms", "20",
+            "--reverb-predelay-ms", "22.5", "--echo-mix", "0.15", "--echo-time-ms", "350", "--echo-feedback", "0.25", "--queue-ms", "20",
         ]).unwrap();
         let Command::Check(route) = cli.command else { panic!("expected check") };
         route
@@ -116,7 +116,7 @@ mod tests {
         let controls = LiveControls::from_route(&route).unwrap();
         for command in ["mute all", "mute mic", "mute send", "gain master -96", "gain send -8",
             "vocal trim -7", "vocal strength 0.25", "vocal compressor -35", "vocal deesser -40",
-            "vocal reverb 0.375", "vocal decay 2.5",
+            "vocal reverb 0.375", "vocal decay 2.5", "vocal echo 0.5", "vocal echo-feedback 0.625",
             "route mic output off", "level mic output -13", "level mic send -7",
             "route aux output off", "route aux send off", "level aux output -11", "level aux send -12"] {
             controls.apply(command.parse().unwrap()).unwrap();
@@ -129,6 +129,9 @@ mod tests {
         assert_eq!(live.describe(), controls.describe());
         assert_eq!(restored.route.vocal_config(), controls.vocal_config());
         assert_eq!(restored.route.reverb_predelay_ms, 22.5);
+        assert_eq!(restored.route.echo_time_ms, 350.0);
+        assert_eq!(restored.route.echo_mix, 0.5);
+        assert_eq!(restored.route.echo_feedback, 0.625);
         let mut playback = PlaybackGains::new(48000, &[0, 1], live.clone()).unwrap();
         assert_eq!(playback.next_gains(), [0.0; 3]);
         live.apply("unmute all".parse().unwrap()).unwrap();
@@ -196,7 +199,7 @@ mod tests {
         let path = directory.path().join("invalid.mixlive-scene.json");
         let original = serde_json::to_value(AudioScene::new(route(), vec![]).unwrap()).unwrap();
         let mut cases = Vec::new();
-        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("schema", json!(7)), ("schema", json!(8)), ("unknown", json!(true))] {
+        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("schema", json!(7)), ("schema", json!(8)), ("schema", json!(9)), ("unknown", json!(true))] {
             let mut document = original.clone();
             document[key] = value;
             cases.push(document);
@@ -210,6 +213,7 @@ mod tests {
             ("vocal_strength", json!(2)), ("vocal", json!("magic")),
             ("vocal_threshold_db", json!(-100)), ("deess_threshold_db", json!(1)),
             ("reverb_mix", json!(1.1)), ("reverb_decay_secs", json!(0.1)), ("reverb_predelay_ms", json!(81)),
+            ("echo_mix", json!(1.1)), ("echo_time_ms", json!(1001)), ("echo_feedback", json!(0.86)),
             ("aux_input", json!(" ")), ("apps", json!([{"path":" "}])) , ("aux_channels", json!([0])),
             ("aux_gain_db", json!(1)), ("aux_to", json!("magic")),
             ("unknown", json!(true)),
@@ -228,6 +232,11 @@ mod tests {
         let mut missing_reverb = original.clone();
         missing_reverb["route"].as_object_mut().unwrap().remove("reverb_mix");
         cases.push(missing_reverb);
+        for key in ["echo_mix", "echo_time_ms", "echo_feedback"] {
+            let mut missing_echo = original.clone();
+            missing_echo["route"].as_object_mut().unwrap().remove(key);
+            cases.push(missing_echo);
+        }
         let mut missing_mix = original.clone();
         missing_mix["route"].as_object_mut().unwrap().remove("mix");
         cases.push(missing_mix);
