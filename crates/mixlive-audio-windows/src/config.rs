@@ -34,6 +34,9 @@ pub enum Command {
         /// Read live mute/gain/status/stop commands from stdin. EOF stops the route.
         #[arg(long)]
         interactive: bool,
+        /// Save the complete live Scene to a NEW file after a successful stop.
+        #[arg(long)]
+        scene_out: Option<PathBuf>,
     },
 }
 
@@ -54,9 +57,12 @@ pub enum SceneCommand {
         file: PathBuf,
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
         seconds: u64,
-        /// Read live commands; changes apply only to this run and never overwrite the Scene.
+        /// Read live commands; the original Scene is never overwritten.
         #[arg(long)]
         interactive: bool,
+        /// Save the complete live Scene to a NEW file after a successful stop.
+        #[arg(long)]
+        scene_out: Option<PathBuf>,
     },
 }
 

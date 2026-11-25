@@ -249,8 +249,16 @@ off여도 리버브 비율이 0보다 크면 리버브가 동작한다. 보정 �
 
 `scene run`은 **Scene 내부 체인만** 사용한다. `--vst3`/`--vst3-chain` 덮어쓰기 옵션은 거절한다.
 슬롯별 `--vst3-editor`와 정상 종료의 `--vst3-chain-out <새 파일>`은 실행 시 지정할 수 있다.
-Scene과 체인 파일은 자동으로 덮어쓰지 않는다. CLI는 실행 중 바꾼 믹서 값을 저장하지 않으며,
-GUI의 정지 후 새 Scene 저장에서만 전체 실행 상태를 저장한다. CLI에서 편집한 VST3 상태는 새 체인 파일로 내보낸 뒤 다음 `scene save`에 넣는다.
+Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또는 `scene run`에서
+`--scene-out <새 파일>`을 지정하면 정상 정지(시간 제한, stop, EOF) 후 GUI와 같은
+전체 Scene snapshot을 저장한다. 믹서·라이브 보컬 설정·모든 VST3 상태를 schema 8에 담으며,
+장치나 플러그인이 오류로 중단되면 파일을 게시하지 않는다. 기존 파일 또는 존재하지 않는
+상위 폴더는 시작 전에 거절하고, 종료 시점의 파일 충돌도 덮어쓰지 않는다.
+전체 Scene과 체인만 내보내기를 동시에 요청할 수 없다. 옵션이 없으면 실행 중 변경을 저장하지 않는다.
+
+```powershell
+.\target\release\mixlive-audio.exe scene run singing.mixlive-scene.json --interactive --scene-out adjusted.mixlive-scene.json
+```
 
 상대 경로는 들어 있던 chain/scene 파일 기준으로 해석한다. CLI에서 지정한 경로는 현재 작업
 폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~7는 읽지 않으며 현재 옵션으로

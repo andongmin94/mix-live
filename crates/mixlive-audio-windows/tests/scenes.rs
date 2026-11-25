@@ -141,3 +141,37 @@ fn cli_packs_chain_states_and_rejects_overrides_before_device_access() {
     assert_eq!(scene.effects.iter().map(|effect| effect.plugin.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["eq.vst3", "reverb.vst3"]);
     assert!(scene.effects.iter().all(|effect| effect.plugin.is_absolute() && effect.state.is_none()));
 }
+
+#[test]
+fn scene_output_is_explicit_and_rejects_collisions_before_start() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original.mixlive-scene.json");
+    let fresh = directory.path().join("snapshot.mixlive-scene.json");
+    let chain = directory.path().join("chain.json");
+    let saved = command().args(["scene", "save"]).arg(&original)
+        .args(["--input", "not-a-real-mic", "--output", "not-a-real-output"]).output().unwrap();
+    assert!(saved.status.success());
+    let before = std::fs::read(&original).unwrap();
+    for saved_route in [false, true] {
+        let run = || {
+            let mut process = command();
+            if saved_route { process.args(["scene", "run"]).arg(&original); }
+            else { process.args(["run", "--input", "not-a-real-mic", "--output", "not-a-real-output"]); }
+            process
+        };
+        let result = run().arg("--scene-out").arg(&original).output().unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Scene output already exists"));
+        let result = run().arg("--scene-out").arg(&fresh).arg("--vst3-chain-out").arg(&chain).output().unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("choose --scene-out OR --vst3-chain-out"));
+        let result = run().arg("--scene-out").arg(&fresh).output().unwrap();
+        assert!(!result.status.success(), "a nonexistent device must not start");
+        assert!(!fresh.exists());
+        assert!(!chain.exists());
+        assert_eq!(std::fs::read(&original).unwrap(), before);
+    }
+    let result = command().args(["scene", "show"]).arg(&original).arg("--scene-out").arg(&fresh).output().unwrap();
+    assert!(!result.status.success());
+    assert!(!fresh.exists());
+}

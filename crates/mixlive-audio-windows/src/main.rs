@@ -4,6 +4,9 @@ use mixlive_audio_windows::{
     plugin::{PluginArgs, ResolvedPlugins},
     scene::{AudioScene, Result},
 };
+use std::path::Path;
+#[cfg(any(windows, test))]
+use std::sync::Mutex;
 
 fn parser() -> clap::Command { PluginArgs::augment_args(Cli::command()) }
 
@@ -27,9 +30,10 @@ fn run(cli: Cli, plugin: PluginArgs) -> Result<()> {
         Command::Devices => device::list(),
         Command::Apps => device::apps(),
         Command::Check(route) => device::check(&route),
-        Command::Run { route, seconds, interactive } => {
+        Command::Run { route, seconds, interactive, scene_out } => {
+            validate_scene_output(scene_out.as_deref(), &plugin)?;
             let setup = plugin.resolve()?;
-            device::run(&route, seconds, interactive, &setup)
+            device::run(&route, seconds, interactive, &setup, scene_out.as_deref())
         }
         Command::Scene { command } => match command {
             SceneCommand::Save { file, route } => {
@@ -51,24 +55,54 @@ fn run(cli: Cli, plugin: PluginArgs) -> Result<()> {
                 println!("Scene contains {} VST3 slot(s). Their configuration was parsed; plugin availability, native compatibility and sound were NOT tested.", scene.effects.len());
                 Ok(())
             }
-            SceneCommand::Run { file, seconds, interactive } => {
+            SceneCommand::Run { file, seconds, interactive, scene_out } => {
+                validate_scene_output(scene_out.as_deref(), &plugin)?;
                 let scene = AudioScene::read(&file)?;
                 let setup = plugin.resolve_scene(scene.effects)?;
-                device::run(&scene.route, seconds, interactive, &setup)
+                device::run(&scene.route, seconds, interactive, &setup, scene_out.as_deref())
             }
         },
     }
 }
 
+fn validate_scene_output(path: Option<&Path>, plugin: &PluginArgs) -> Result<()> {
+    let Some(path) = path else { return Ok(()); };
+    if plugin.vst3_chain_out.is_some() {
+        return Err("choose --scene-out OR --vst3-chain-out; a complete Scene already embeds the VST3 chain".into());
+    }
+    if path.file_name().is_none() { return Err("Scene output must name a new file".into()); }
+    match path.symlink_metadata() {
+        Ok(_) => return Err("Scene output already exists; choose a new file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() { return Err("Scene output parent must be an existing directory".into()); }
+    Ok(())
+}
+
+// Only the console and owner thread use this gate, never the audio callback/worker.
+// The reader may remain blocked on stdin after a time limit, but cannot change a final snapshot.
+#[cfg(any(windows, test))]
+fn stop_console(controls: &mixlive_audio_windows::control::LiveControls, gate: &Mutex<()>) {
+    let _guard = gate.lock().expect("console command gate");
+    let _ = controls.apply(mixlive_audio_windows::control::LiveCommand::Stop);
+}
+
 #[cfg(any(windows, test))]
 fn read_commands(reader: impl std::io::BufRead, mut feedback: impl std::io::Write,
-    controls: &mixlive_audio_windows::control::LiveControls) -> std::io::Result<()> {
+    controls: &mixlive_audio_windows::control::LiveControls, gate: &Mutex<()>) -> std::io::Result<()> {
     use mixlive_audio_windows::control::LiveCommand;
     let result = (|| {
         for line in reader.lines() {
             let line = line?;
             if line.trim().is_empty() { continue; }
-            match line.parse::<LiveCommand>().and_then(|command| controls.apply(command)) {
+            let applied = {
+                let _guard = gate.lock().expect("console command gate");
+                if controls.stop_requested() { break; }
+                line.parse::<LiveCommand>().and_then(|command| controls.apply(command))
+            };
+            match applied {
                 Ok(()) => writeln!(feedback, "{}", controls.describe())?,
                 Err(error) => writeln!(feedback, "Control rejected: {error}")?,
             }
@@ -76,15 +110,15 @@ fn read_commands(reader: impl std::io::BufRead, mut feedback: impl std::io::Writ
         }
         Ok(())
     })();
-    let _ = controls.apply(LiveCommand::Stop);
+    stop_console(controls, gate);
     result
 }
 
 #[cfg(windows)]
 mod device {
-    use super::{ResolvedPlugins, Result, RouteOptions};
+    use super::{Mutex, Path, ResolvedPlugins, Result, RouteOptions};
     use mixlive_audio_windows::windows::{Prepared, list_devices};
-    use std::time::{Duration, Instant};
+    use std::{sync::Arc, time::{Duration, Instant}};
 
     pub fn list() -> Result<()> {
         let rows = list_devices()?;
@@ -108,23 +142,26 @@ mod device {
         Ok(())
     }
 
-    pub fn run(route: &RouteOptions, seconds: u64, interactive: bool, plugin: &ResolvedPlugins) -> Result<()> {
+    pub fn run(route: &RouteOptions, seconds: u64, interactive: bool, plugin: &ResolvedPlugins,
+        scene_out: Option<&Path>) -> Result<()> {
         let prepared = Prepared::new(route)?;
         println!("{}", prepared.describe());
         println!("Use headphones at LOW hardware volume. Disable other monitoring paths.\nStarting a {seconds}s live mic route; no recording. Sample clipping guard is not a mastering limiter.");
         if !plugin.effects.is_empty() {
-            println!("Loading a trusted native VST3 chain in this process. A plugin crash/hang is not isolated. No delay compensation; all processing must finish before shutdown can complete.");
+            println!("Loading a trusted native VST3 chain in this process. A plugin crash/hang is not isolated. Reported VST3 latency is compensated on outgoing AUX/app sends, not monitoring; all processing must finish before shutdown can complete.");
         }
         if !plugin.editors.is_empty() {
             println!("Opening selected LIVE plugin editors. Closing a window keeps audio running. Restart/bus/latency requests stop the route. Use stop or the session time limit to finish.");
         }
         let mut active = prepared.start(plugin)?;
         for line in &active.timing { println!("{line}"); }
+        let command_gate = Arc::new(Mutex::new(()));
         if interactive {
             println!("{}", mixlive_audio_windows::control::HELP);
             let controls = active.controls.clone();
+            let gate = command_gate.clone();
             std::thread::Builder::new().name("mixlive-console".into()).spawn(move || {
-                if let Err(error) = super::read_commands(std::io::stdin().lock(), std::io::stderr(), &controls) {
+                if let Err(error) = super::read_commands(std::io::stdin().lock(), std::io::stderr(), &controls, &gate) {
                     eprintln!("Console closed: {error}");
                 }
             })?;
@@ -145,10 +182,15 @@ mod device {
             }
             std::thread::sleep(poll_interval);
         }
+        super::stop_console(&active.controls, &command_gate);
         let report = active.report(&active.take_levels());
-        let finished = active.finish(plugin.chain_out.as_deref());
+        let finished = match scene_out {
+            Some(path) => active.finish_scene(route.clone()).and_then(|scene| scene.save_new(path)),
+            None => active.finish(plugin.chain_out.as_deref()),
+        };
         println!("Stopped. {report}");
         finished?;
+        if let Some(path) = scene_out { println!("Saved complete Scene: {}", path.display()); }
         if let Some(path) = &plugin.chain_out { println!("Saved VST3 chain: {}", path.display()); }
         Ok(())
     }
@@ -156,12 +198,13 @@ mod device {
 
 #[cfg(not(windows))]
 mod device {
-    use super::{ResolvedPlugins, Result, RouteOptions};
+    use super::{Path, ResolvedPlugins, Result, RouteOptions};
     const UNSUPPORTED: &str = "audio devices are implemented for Windows only; scene save/show do not require devices";
     pub fn list() -> Result<()> { Err(UNSUPPORTED.into()) }
     pub fn apps() -> Result<()> { Err(UNSUPPORTED.into()) }
     pub fn check(_route: &RouteOptions) -> Result<()> { Err(UNSUPPORTED.into()) }
-    pub fn run(_route: &RouteOptions, _seconds: u64, _interactive: bool, _plugin: &ResolvedPlugins) -> Result<()> { Err(UNSUPPORTED.into()) }
+    pub fn run(_route: &RouteOptions, _seconds: u64, _interactive: bool, _plugin: &ResolvedPlugins,
+        _scene_out: Option<&Path>) -> Result<()> { Err(UNSUPPORTED.into()) }
 }
 
 #[cfg(test)]
@@ -191,15 +234,37 @@ mod tests {
         let controls = LiveControls::new(-18.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
         let mut feedback = Vec::new();
         read_commands(Cursor::new(b"\nmute output\ngain master NaN\nmute aux\ngain master -12\nstatus\nstop\ngain master 0\n"),
-            &mut feedback, &controls).unwrap();
+            &mut feedback, &controls, &Mutex::new(())).unwrap();
         assert!(controls.stop_requested());
         let text = String::from_utf8(feedback).unwrap();
         assert!(text.contains("Control rejected:"));
         assert!(controls.describe().contains("master_gain=-12.0dB"));
         assert!(controls.describe().contains("output=true"));
         let controls = LiveControls::new(-18.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
-        read_commands(Cursor::new(b"status\n"), Vec::new(), &controls).unwrap();
+        read_commands(Cursor::new(b"status\n"), Vec::new(), &controls, &Mutex::new(())).unwrap();
         assert!(controls.stop_requested());
+    }
+
+    #[test]
+    fn stopped_console_cannot_change_the_complete_scene_snapshot() {
+        let cli = Cli::try_parse_from(["mixlive-audio", "check", "--input", "mic", "--output", "phones"]).unwrap();
+        let Command::Check(mut route) = cli.command else { panic!("expected route"); };
+        let controls = LiveControls::from_route(&route).unwrap();
+        let gate = Mutex::new(());
+        controls.apply("gain master -12".parse().unwrap()).unwrap();
+        controls.apply("vocal trim -3".parse().unwrap()).unwrap();
+        controls.apply("mute mic".parse().unwrap()).unwrap();
+        // A late line (for example after the time limit) must never mutate the saved targets.
+        stop_console(&controls, &gate);
+        read_commands(Cursor::new(b"gain master 0\nvocal trim 0\nunmute mic\n"), Vec::new(), &controls, &gate).unwrap();
+        controls.snapshot_into(&mut route).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.mixlive-scene.json");
+        AudioScene::new(route, vec![]).unwrap().save_new(&path).unwrap();
+        let saved = AudioScene::read(&path).unwrap();
+        assert!((saved.route.output_gain_db + 12.0).abs() < 1e-4);
+        assert_eq!(saved.route.input_gain_db, -3.0);
+        assert!(saved.route.mix.mute_mic);
     }
 
     #[test]

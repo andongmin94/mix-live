@@ -14,7 +14,7 @@ const BROADCAST: u32 = 1 << (5 + MAX_APPS);
 pub(crate) const MAX_SOURCES: usize = MAX_APPS + 2;
 pub(crate) const MAX_ROUTES: usize = MAX_MIXES * MAX_SOURCES;
 
-pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; vocal trim|strength|compressor|deesser|reverb|decay <value>; status; stop. Changes last for this run only.";
+pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; vocal trim|strength|compressor|deesser|reverb|decay <value>; status; stop. Changes last for this run unless saved with --scene-out.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuteTarget { Mic, Aux, App(usize), Output, Send, Broadcast, All }

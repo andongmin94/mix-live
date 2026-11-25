@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **Call/Broadcast/Return 가상 장치 개발 패키지 · Windows 통합 검증 대기**
+단계: **가상 장치 개발 패키지 빌드 완료 · CLI 전체 Scene snapshot 추가**
 
 ## 현재 구현
 
@@ -38,6 +38,9 @@
   상태 수집 → 새 파일 게시를 사용한다. 실행 중 모든 소스/출력 mute·route·gain, 보컬 파라미터와 VST3 상태를
   다음 시작 전에 복원한다. 일반 정지/닫기/오류는 저장하지 않으며 파일 덮어쓰기 없음.
   schema 8은 `route.apps` 배열(실행 파일 경로와 슬롯별 설정), 방송 장치·채널·감쇠와 각 믹스의 상태 및 리버브 설정을 저장하고 PID나 잔향 버퍼는 저장하지 않는다.
+  CLI의 직접 `run`/`scene run --scene-out`도 같은 전체 snapshot을 정상 정지 후 새 파일에 저장한다.
+  종료 시 console 명령을 닫아 늦은 입력이 snapshot을 바꾸지 못하게 한다. 기존 파일·chain-out 동시 요청은
+  시작 전에 거절하고 schema 8은 유지한다.
   schema 1~7, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
   `appN` 제어 명령을 사용한다.
 
@@ -64,11 +67,13 @@
   두 PnP ID의 부재 확인까지 성공했지만, 예상된 SignTool 실패의 native 종료 코드가
   PowerShell CI wrapper에 전달되어 job 실패 및 artifact 미게시로 기록됐다.
   모든 assertion 통과 시에만 명시적으로 0을 반환하도록 수정했다.
-- 이번 Return 추가는 같은 driver service/miniport와 독립 adapter state를 재사용한다.
-  세 고정 INF/PnP ID·서명 대상 일치·부재 검사 및 세 케이블의 실제 transport 격리 검사를
-  확장했다. 새 Virtual Audio CI 검증은 대기 중이다.
+- [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) 성공:
+  `08d0007`의 세 고정 INF/PnP ID, transport 격리, WDK/INF/unsigned catalog 및
+  미서명 거절·부재 검사 workflow 완료.
   드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는
   검증하지 않았다.
+- CLI 전체 Scene snapshot: 종료 이후 명령 차단/저장값 복원과 두 CLI 경로의 충돌·실패 시 미게시
+  회귀 테스트를 추가했다. 변경된 Rust/CLI의 Audio CI 결과는 아직 확인하지 않았다.
 
 ## 남은 작업과 제한
 
@@ -76,8 +81,8 @@
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
 - 탭 선택·ASIO·실행 중
-  소스/체인 삽입/삭제·내장 음정 보정·CLI 전체 Scene snapshot 출력은 미구현이다.
-  세 가상 장치의 새 INF/패키지는 CI 대기 중이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
+  소스/체인 삽입/삭제·내장 음정 보정은 미구현이다.
+  CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
   실행 중 프리셋/pre-delay 변경은 미구현이다. 리버브/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.
