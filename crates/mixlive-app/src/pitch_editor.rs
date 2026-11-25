@@ -1,6 +1,6 @@
 //! Explicit draft editing of one coherent live pitch configuration.
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement, IntoElement,
+    App, AppContext as _, Context, Entity, EventEmitter, IntoElement,
     ParentElement, Render, Styled, Subscription, Window, div, px, rgb,
 };
 use gpui_deck::{InputState, SelectItem, SelectState, StyledExt as _};
