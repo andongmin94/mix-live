@@ -1,7 +1,7 @@
 //! WASAPI adapter. Endpoint selection, stream setup and text formatting stay off callbacks.
 use std::{error::Error, sync::{Arc, atomic::Ordering}};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
-use mixlive_effects::VocalChain;
+use mixlive_effects::{VocalChain, VocalSettings};
 use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget, resolve_apps};
 use crate::process_capture::{self, ProcessCapture};
 use crate::pitch::{self, PitchMonitor, PitchReading, PitchTap};
@@ -183,7 +183,7 @@ impl Prepared {
                 index + 1, target.pid, map.left + 1, map.right + 1));
         }
         text.push_str(&format!("Initial mixer: {}\n", self.controls.describe()));
-        text.push_str("Vocal preset, reverb pre-delay, echo time and device bindings are fixed for this run. GPUI can apply live pitch settings and their delay compensation together. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
+        text.push_str("Device bindings are fixed for this run. GPUI can apply live vocal preset, reverb pre-delay and echo time settings, as well as pitch settings and their delay compensation. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
         text
     }
 
@@ -438,6 +438,17 @@ impl Active {
     /// Query authoritative state after an error too: a later audio fault may follow its commit.
     pub fn set_pitch_config(&mut self, config: PitchConfig) -> Result<()> {
         let result = self.plugin_worker.set_pitch_config(config);
+        self.timing[self.plugin_timing] = self.plugin_worker.description.clone();
+        Ok(result?)
+    }
+
+    pub fn vocal_settings(&self) -> VocalSettings { self.plugin_worker.vocal_settings() }
+
+    /// Commit only preset and wet delay times; independent live targets stay intact.
+    /// Publish acknowledged settings even if a later audio fault follows the change.
+    pub fn set_vocal_settings(&mut self, settings: VocalSettings) -> Result<()> {
+        let result = self.plugin_worker.set_vocal_settings(settings, self.controls.vocal_config());
+        self.controls.publish_vocal_settings(self.plugin_worker.vocal_settings());
         self.timing[self.plugin_timing] = self.plugin_worker.description.clone();
         Ok(result?)
     }

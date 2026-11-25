@@ -682,6 +682,74 @@ fn live_echo_reaches_voice_chain_only_and_mute_covers_its_tail() {
 }
 
 #[test]
+fn live_vocal_settings_use_worker_preset_and_preserve_pitch_and_send_delay_history() {
+    use mixlive_effects::{Preset, VocalSettings};
+    let config = VocalConfig { preset: Preset::Warm, strength: 0.0, ..VocalConfig::default() };
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, config).unwrap());
+    for command in ["route aux output on", "route aux broadcast on", "route app1 output on", "route app1 broadcast on"] {
+        controls.apply(command.parse().unwrap()).unwrap();
+    }
+    let (writer, _reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+        vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
+    let pitch = PitchConfig { strength: 0.7, ..PitchConfig::default() };
+    capture.prepare_pitch(48000, pitch).unwrap();
+    let total = capture.prepare_voice_delay(71, 48000).unwrap();
+    assert_eq!(total, 2048 + 71);
+    let mut aux = vec![[0.0; 2]; total + 384];
+    let mut app = aux.clone();
+    let mut mic = vec![0.0; aux.len()];
+    mic[17] = 0.03125;
+    aux[17] = [0.125, -0.25];
+    app[17] = [-0.0625, 0.125];
+    let mut next_settings = config.settings();
+    for start in (0..aux.len()).step_by(137) {
+        if start == 137 || start == 274 || start == 411 {
+            next_settings = VocalSettings { preset: if start == 137 { Preset::Off } else { Preset::Bright },
+                reverb_predelay_ms: if start == 411 { 80.0 } else { 30.0 },
+                echo_time_ms: if start == 411 { 1000.0 } else { 20.0 } };
+            let mut next = controls.vocal_config();
+            next_settings.apply_to(&mut next);
+            let mut change = PreparedVocalChange::new(48000, capture.vocal_config().settings(), next).unwrap();
+            capture.apply_vocal_change(&mut change);
+            // The UI still exposes the old preset between application and publication.
+            if start == 137 { controls.apply("vocal eq-hpf 120".parse().unwrap()).unwrap(); }
+        }
+        let end = (start + 137).min(aux.len());
+        capture.push(&mic[start..end], Some(&aux[start..end]), &[&app[start..end]]);
+        if start == 137 {
+            assert_eq!(capture.vocal_config().eq.hpf_hz, config.eq.hpf_hz);
+            assert_eq!(controls.vocal_config().preset, Preset::Warm);
+        }
+        if start == 274 {
+            assert_eq!(capture.vocal_config().eq.hpf_hz, 120.0);
+            assert_eq!(controls.vocal_config().preset, Preset::Off);
+        }
+        controls.publish_vocal_settings(next_settings);
+        assert_eq!(capture.pitch_config(), pitch);
+        assert_eq!(capture.voice_latency, total);
+        assert_eq!(capture.compensation, total);
+        for mix in [0, 1] {
+            let output = capture.engine.output(mix).unwrap();
+            for (index, (&left, &right)) in output.left.iter().zip(output.right).enumerate() {
+                let impulse = if mix == 0 { 17 } else { 17 + total };
+                let music = if start + index == impulse { [0.0625, -0.125] } else { [0.0; 2] };
+                // This test prepares synthetic 71-sample VST3 compensation but
+                // does not process a VST3. Mic latency is pitch-only (2048), while
+                // outgoing AUX/app latency is 2119. Retained impulse proves the
+                // vocal edits did not replace/reset the in-flight pitch corrector.
+                let voice = if start + index == 17 + 2048 { 0.03125 } else { 0.0 };
+                let expected = music.map(|sample| sample + voice);
+                assert_eq!([left, right], expected);
+            }
+        }
+    }
+    assert_eq!(capture.vocal_config().settings(), next_settings);
+    assert!(!health.failed());
+}
+
+#[test]
 fn live_pitch_toggles_and_settings_keep_vst3_delay_and_outgoing_alignment() {
     const PLUGIN_DELAY: usize = 71;
     for plugin_delay in [0, PLUGIN_DELAY] {

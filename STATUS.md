@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실행 중 음정 설정 변경 검증 완료 · main 병합**
+단계: **실행 중 프리셋·공간계 시간 변경 구현 · Windows 통합 검증 준비**
 
 ## 현재 구현
 
@@ -60,10 +60,19 @@
   추가 delay buffer 없이 같은 마이크 처리 결과를 모든 연결된 믹스에 보낸다.
   compressor ratio(1..8), attack(1..50 ms), release(20..500 ms), deesser 최대 감쇠(0..12 dB)를
   기존 atomic target과 10 ms ramp로 실시간 변경한다. 새 기본값은 명시적 2.5:1, 8/140 ms, 최대 4 dB다.
-  pre-delay와 프리셋은 정지 상태에서만 변경한다. off 프리셋의 EQ/다이내믹스 파라미터는 비활성이다.
+  off 프리셋의 EQ/다이내믹스 파라미터는 비활성이다.
   리버브 뒤에 독립 stereo feedback echo를 추가했다. 최대 1초 delay buffer를 시작 전에 만들고
-  mix(0..1), feedback(0..0.85)을 10 ms ramp로 실시간 조절한다. 시간(10..1000 ms)은 정지 중 변경한다.
+  mix(0..1), feedback(0..0.85)을 10 ms ramp로 실시간 조절한다.
   AUX/앱은 영향을 받지 않는다. 보컬은 한 번만 처리하고 mute는 리버브와 반복음을 포함해 적용한다.
+- 실행 중 보컬 설정 패널에서 preset·reverb pre-delay(0..80 ms)·echo time(10..1000 ms)을
+  함께 적용한다. 기존 16개 live target은 별도로 유지하며 현재 preset에 맞춰 fader를 갱신한다.
+  활성 프리셋끼리는 EQ 계수를 10 ms 전환하고 EQ·다이내믹스 이력을 유지한다. off↔활성은
+  제어 스레드에서 준비한 처리부만 기존 worker 요청·반환 큐로 교체하고 이전 상태를 반환해 해제한다.
+  시간 변경은 최대 길이 ring의 읽기 위치를 10 ms 보간하며 reverb/echo 이력과 ramp를 유지한다.
+  음정 보정·VST3 인스턴스·송출 PDC는 바꾸지 않는다. 승인된 세 값만 제어/UI에 게시하고
+  Scene 저장에 반영하며, worker는 자신에게 적용된 preset을 읽어 설정 mutex를 사용하지 않는다.
+  잘못된 값과 입력 sample rate에 맞지 않는 preset은 무변경 거절한다. 시간 변경의 효과음 변조와
+  off 전환의 순간 소리 변화는 가능하며 실제 청취 품질은 미검증이다.
 - VST3 슬롯마다 명시적 host bypass: 신고 지연만큼 정렬한 dry를 5 ms ramp로 교차 전환한다.
   같은 효과 인스턴스를 계속 처리하며 다른 슬롯과 PDC를 유지한다. 총 신고 지연 상한은 2초다.
   GPUI 실행 중/정지 설정 및 CLI `bypass N on|off`에서 조절하고 Scene/체인에 저장한다.
@@ -105,6 +114,9 @@
 
 ## 검증
 
+- 이번 변경의 로컬 effects 28개 및 해당 crate Clippy, control snapshot과 capture 경로 19개 검사는
+  통과했다. preset/time 변경을 거치는 mic impulse와 AUX/app PDC 이력도 확인했다.
+  아래 Audio #54는 직전 음정 설정 변경의 완료 결과이며, 이번 Windows 통합 검사는 아직 실행 전이다.
 - [Audio #54](https://github.com/andongmin94/mix-live/actions/runs/45630152738) `5342a4c` 전체 성공:
   Windows workspace 검사 134개와 실제 native VST3 fixture 검사 13개, 총 **147개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
@@ -134,7 +146,7 @@
 - 탭 선택·ASIO·실행 중
   소스 삽입/삭제·고급 formant 보존과 음정 보정 품질 수용은 미완료다(실험적 자동 보정은 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
-  실행 중 프리셋/pre-delay/에코 시간 변경은 미구현이다. 음정 설정/리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
+  음정 설정/프리셋/리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.
 - 원래 앱 재생 경로·장치 기본값은 변경하지 않는다. 자동 mix-minus 추정/외부 피드백 검출/

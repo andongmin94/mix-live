@@ -549,3 +549,202 @@ fn live_eq_preserves_history_and_retargets_independently_of_block_size() {
         }
     }
 }
+
+#[test]
+fn live_vocal_settings_validate_before_preparing_a_change() {
+    let config = VocalConfig::default();
+    let settings = config.settings();
+    for value in [f32::NAN, f32::INFINITY, -0.1, 80.1] {
+        let next = VocalSettings { reverb_predelay_ms: value, ..settings };
+        assert_eq!(next.validate(), Err(DspError::ReverbPredelay));
+        let mut proposed = config;
+        next.apply_to(&mut proposed);
+        assert_eq!(PreparedVocalChange::new(48000, settings, proposed).err(), Some(DspError::ReverbPredelay));
+    }
+    for value in [f32::NAN, f32::INFINITY, 9.9, 1000.1] {
+        let next = VocalSettings { echo_time_ms: value, ..settings };
+        assert_eq!(next.validate(), Err(DspError::EchoTime));
+        let mut proposed = config;
+        next.apply_to(&mut proposed);
+        assert_eq!(PreparedVocalChange::new(48000, settings, proposed).err(), Some(DspError::EchoTime));
+    }
+    let enabled = VocalConfig { preset: Preset::Warm, ..config };
+    for rate in [8000, 16000] {
+        assert!(PreparedVocalChange::new(rate, settings, config).is_ok());
+        assert_eq!(PreparedVocalChange::new(rate, settings, enabled).err(), Some(DspError::SampleRate));
+    }
+    for rate in [32000, 48000, 192000] { assert!(PreparedVocalChange::new(rate, settings, enabled).is_ok()); }
+}
+
+#[test]
+fn live_vocal_settings_keep_independent_targets_ramps_and_retire_only_processing() {
+    let config = VocalConfig { preset: Preset::Natural, ..VocalConfig::default() };
+    let mut chain = VocalChain::new(48000, config).unwrap();
+    let settings = VocalSettings { preset: Preset::Bright, reverb_predelay_ms: 80.0, echo_time_ms: 1000.0 };
+    let mut proposed = config;
+    settings.apply_to(&mut proposed);
+    let mut change = PreparedVocalChange::new(48000, config.settings(), proposed).unwrap();
+    // All independent targets can advance after the prepared settings snapshot.
+    for parameter in VocalParameter::ALL { chain.set_parameter(parameter, *parameter.range().end()).unwrap(); }
+    chain.process(&[0.25; 37], &mut [0.0; 37], &mut [0.0; 37]).unwrap();
+    let targets = chain.config();
+    let ramp_state = |chain: &VocalChain| {
+        [&chain.input_gain, &chain.strength, &chain.compressor_threshold, &chain.deesser_threshold,
+            &chain.compressor_ratio, &chain.compressor_attack, &chain.compressor_release, &chain.deess_maximum]
+            .map(|ramp| (ramp.current, ramp.target, ramp.remaining))
+    };
+    let before = ramp_state(&chain);
+    chain.apply_settings(&mut change);
+    assert_eq!(chain.config().settings(), settings);
+    for parameter in VocalParameter::ALL { assert_eq!(chain.config().parameter(parameter), targets.parameter(parameter)); }
+    assert_eq!(ramp_state(&chain), before);
+    assert!(change.replacement.is_none());
+
+    let power = chain.processing.as_ref().unwrap().compressor.power;
+    let next = VocalConfig { preset: Preset::Off, ..chain.config() };
+    let mut off = PreparedVocalChange::new(48000, chain.config().settings(), next).unwrap();
+    chain.apply_settings(&mut off);
+    assert!(chain.processing.is_none());
+    assert_eq!(off.replacement.as_ref().unwrap().as_ref().unwrap().compressor.power, power);
+    assert_eq!(ramp_state(&chain), before);
+    let next = VocalConfig { preset: Preset::Warm, ..chain.config() };
+    let mut on = PreparedVocalChange::new(48000, chain.config().settings(), next).unwrap();
+    chain.apply_settings(&mut on);
+    assert!(chain.processing.is_some());
+    assert!(on.replacement.as_ref().unwrap().is_none());
+    for parameter in VocalParameter::ALL { assert_eq!(chain.config().parameter(parameter), targets.parameter(parameter)); }
+    assert_eq!(ramp_state(&chain), before);
+}
+
+#[test]
+fn live_preset_changes_reconcile_eq_targets_that_arrived_after_preparation() {
+    let rate = 48000;
+    for preset in [Preset::Off, Preset::Natural] {
+        let config = VocalConfig { preset,
+            dynamics: DynamicsConfig { ratio: 1.0, deess_max_db: 0.0, ..DynamicsConfig::default() },
+            ..VocalConfig::default() };
+        let mut chain = VocalChain::new(rate, config).unwrap();
+        let next = VocalConfig { preset: Preset::Bright, ..config };
+        let mut prepared = PreparedVocalChange::new(rate, config.settings(), next).unwrap();
+        let targets = [(VocalParameter::EqHpf, 160.0), (VocalParameter::EqBody, 5.0),
+            (VocalParameter::EqPresence, -4.0), (VocalParameter::EqAir, 3.0)];
+        for (parameter, value) in targets { chain.set_parameter(parameter, value).unwrap(); }
+        chain.apply_settings(&mut prepared);
+        // The normal unchanged-target path must not leave prepared EQ offsets stale.
+        for (parameter, value) in targets { chain.set_parameter(parameter, value).unwrap(); }
+        let mut input = tone(100.0, 0.02, rate, 24000);
+        for (i, value) in input.iter_mut().enumerate() {
+            *value += (0.02 * (TAU * 2800.0 * i as f64 / f64::from(rate)).sin()
+                + 0.02 * (TAU * 11000.0 * i as f64 / f64::from(rate)).sin()) as f32;
+        }
+        let mut actual = vec![0.0; input.len()];
+        let mut expected = actual.clone();
+        let mut right = actual.clone();
+        chain.process(&input, &mut actual, &mut right).unwrap();
+        let mut reference = VocalChain::new(rate, chain.config()).unwrap();
+        reference.process(&input, &mut expected, &mut right).unwrap();
+        for (actual, expected) in actual[12000..].iter().zip(&expected[12000..]) {
+            assert!((actual - expected).abs() < 1e-7, "stale EQ after {preset} -> bright");
+        }
+    }
+}
+
+#[test]
+fn live_active_preset_changes_preserve_eq_and_dynamics_history() {
+    let config = VocalConfig { preset: Preset::Natural, ..VocalConfig::default() };
+    let mut chain = VocalChain::new(48000, config).unwrap();
+    let input = tone(10000.0, 0.5, 48000, 12000);
+    chain.process(&input, &mut vec![0.0; input.len()], &mut vec![0.0; input.len()]).unwrap();
+    let dynamics_state = |chain: &VocalChain| {
+        let p = chain.processing.as_ref().unwrap();
+        [p.compressor.power, p.compressor.reduction, p.deesser.power, p.deesser.high_power,
+            p.deesser.reduction, p.deesser.low.0.s1, p.deesser.low.0.s2]
+    };
+    let before = dynamics_state(&chain);
+    assert!(before[..5].iter().all(|value| *value > 0.0));
+    let mut change = PreparedVocalChange::new(48000, config.settings(), VocalConfig { preset: Preset::Warm, ..config }).unwrap();
+    chain.apply_settings(&mut change);
+    assert_eq!(dynamics_state(&chain), before);
+
+    for rate in [32000, 48000, 192000] {
+        let mut chain = VocalChain::new(rate, config).unwrap();
+        for _ in 0..rate / 2 { chain.processing.as_mut().unwrap().eq.run(0.25); }
+        for preset in [Preset::Warm, Preset::Bright, Preset::Natural] {
+            let next = VocalConfig { preset, ..chain.config() };
+            let mut change = PreparedVocalChange::new(rate, chain.config().settings(), next).unwrap();
+            chain.apply_settings(&mut change);
+            for _ in 0..rate / 50 {
+                assert!(chain.processing.as_mut().unwrap().eq.run(0.25).abs() < 1e-8,
+                    "preset {preset} reset settled high-pass history at {rate} Hz");
+            }
+        }
+    }
+}
+
+#[test]
+fn live_vocal_settings_preserve_reverb_tails_through_time_and_preset_changes() {
+    let config = VocalConfig { preset: Preset::Natural, strength: 0.0,
+        reverb: ReverbConfig { mix: 1.0, decay_secs: 2.0, predelay_ms: 0.0 }, ..VocalConfig::default() };
+    let mut chain = VocalChain::new(48000, config).unwrap();
+    let mut reference = VocalChain::new(48000, config).unwrap();
+    let mut input = vec![0.0; 4800];
+    input[0] = 0.5;
+    let mut actual = vec![0.0; input.len()];
+    let mut actual_right = actual.clone();
+    let mut expected = actual.clone();
+    let mut expected_right = actual.clone();
+    chain.process(&input, &mut actual, &mut actual_right).unwrap();
+    reference.process(&input, &mut expected, &mut expected_right).unwrap();
+    input.fill(0.0); // The impulse has left even the maximum 80 ms pre-delay history.
+    for (preset, predelay) in [(Preset::Warm, 80.0), (Preset::Off, 0.0), (Preset::Bright, 37.0)] {
+        for effect in [&mut chain, &mut reference] {
+            effect.set_parameter(VocalParameter::ReverbMix, 0.75).unwrap();
+            effect.set_parameter(VocalParameter::ReverbDecay, 1.7).unwrap();
+        }
+        let mut next = chain.config();
+        VocalSettings { preset, reverb_predelay_ms: predelay, echo_time_ms: 1000.0 }.apply_to(&mut next);
+        let mut change = PreparedVocalChange::new(48000, chain.config().settings(), next).unwrap();
+        chain.apply_settings(&mut change);
+        chain.process(&input, &mut actual, &mut actual_right).unwrap();
+        reference.process(&input, &mut expected, &mut expected_right).unwrap();
+        assert!(rms(&expected) > 1e-7);
+        assert_eq!(actual, expected);
+        assert_eq!(actual_right, expected_right);
+    }
+}
+
+#[test]
+fn live_vocal_settings_and_repeated_plans_are_block_invariant() {
+    let rate = 48000;
+    let config = VocalConfig { preset: Preset::Natural,
+        reverb: ReverbConfig { mix: 0.3, decay_secs: 1.2, predelay_ms: 0.0 },
+        echo: EchoConfig { mix: 0.25, time_ms: 10.0, feedback: 0.5 }, ..VocalConfig::default() };
+    let edits = [
+        (VocalSettings { preset: Preset::Bright, reverb_predelay_ms: 80.0, echo_time_ms: 1000.0 }, 120),
+        (VocalSettings { preset: Preset::Warm, reverb_predelay_ms: 0.0, echo_time_ms: 10.0 }, 240),
+        (VocalSettings { preset: Preset::Natural, reverb_predelay_ms: 23.7, echo_time_ms: 71.3 }, 4800),
+    ];
+    let input = tone(170.0, 0.3, rate, edits.iter().map(|(_, count)| count).sum());
+    let render = |block: usize| {
+        let mut chain = VocalChain::new(rate, config).unwrap();
+        let mut left = vec![0.0; input.len()];
+        let mut right = left.clone();
+        let mut start = 0;
+        for (settings, count) in edits {
+            let end = start + count;
+            for ((part, l), r) in input[start..end].chunks(block)
+                .zip(left[start..end].chunks_mut(block)).zip(right[start..end].chunks_mut(block)) {
+                let mut next = chain.config();
+                settings.apply_to(&mut next);
+                let mut change = PreparedVocalChange::new(rate, chain.config().settings(), next).unwrap();
+                chain.apply_settings(&mut change);
+                chain.process(part, l, r).unwrap();
+            }
+            start = end;
+        }
+        assert!(left.iter().chain(&right).all(|sample| sample.is_finite() && sample.abs() < 1.0));
+        (left, right)
+    };
+    let whole = render(input.len());
+    for block in [1, 17, 256] { assert_eq!(whole, render(block), "block {block}"); }
+}

@@ -271,7 +271,7 @@ pub struct RouteOptions {
     /// Experimental monophonic pitch correction strength (0..1); zero adds no delay.
     #[arg(long, default_value = "0")]
     pub pitch_correction: f32,
-    /// Pitch correction target smoothing time (5..200 ms); fixed for the session.
+    /// Initial pitch correction target smoothing time (5..200 ms).
     #[arg(long, default_value = "20")]
     pub pitch_retune_ms: f32,
     /// Dry/processed blend (0..1), not loudness matching.
@@ -283,7 +283,7 @@ pub struct RouteOptions {
     /// High-band de-esser threshold (-60..0 dBFS).
     #[arg(long, default_value = "-30", allow_hyphen_values = true)]
     pub deess_threshold_db: f32,
-    /// High-pass cutoff (40..200 Hz), fixed during playback.
+    /// Initial high-pass cutoff (40..200 Hz).
     #[arg(long, default_value = "75")]
     pub eq_hpf_hz: f32,
     /// Additional low-shelf gain at 180 Hz (-6..6 dB).
@@ -319,7 +319,7 @@ pub struct RouteOptions {
     /// Independent stereo echo wet/dry blend (0..1).
     #[arg(long, default_value = "0")]
     pub echo_mix: f32,
-    /// Time between echo repeats (10..1000 ms); fixed while running.
+    /// Initial time between echo repeats (10..1000 ms).
     #[arg(long, default_value = "250")]
     pub echo_time_ms: f32,
     /// Echo feedback (0..0.85); zero produces one repeat.

@@ -12,7 +12,7 @@ mod echo;
 pub use echo::EchoConfig;
 use echo::Echo;
 mod eq;
-use eq::Equalizer;
+use eq::{Equalizer, EqTargets};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
@@ -35,6 +35,29 @@ impl FromStr for Preset {
             "warm" => Ok(Self::Warm), "bright" => Ok(Self::Bright),
             _ => Err(DspError::Preset),
         }
+    }
+}
+
+/// Settings applied together at a processing block boundary. Independent live
+/// parameter targets and their current ramps remain unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VocalSettings {
+    pub preset: Preset,
+    pub reverb_predelay_ms: f32,
+    pub echo_time_ms: f32,
+}
+impl VocalSettings {
+    pub fn validate(self) -> Result<(), DspError> {
+        if !(0.0..=80.0).contains(&self.reverb_predelay_ms) { return Err(DspError::ReverbPredelay); }
+        if !(10.0..=1000.0).contains(&self.echo_time_ms) { return Err(DspError::EchoTime); }
+        Ok(())
+    }
+
+    /// Replace only these three settings; validate the resulting config before use.
+    pub fn apply_to(self, config: &mut VocalConfig) {
+        config.preset = self.preset;
+        config.reverb.predelay_ms = self.reverb_predelay_ms;
+        config.echo.time_ms = self.echo_time_ms;
     }
 }
 
@@ -142,6 +165,11 @@ impl Default for VocalConfig {
     }
 }
 impl VocalConfig {
+    pub fn settings(self) -> VocalSettings {
+        VocalSettings { preset: self.preset, reverb_predelay_ms: self.reverb.predelay_ms,
+            echo_time_ms: self.echo.time_ms }
+    }
+
     pub fn parameter(self, parameter: VocalParameter) -> f32 {
         match parameter {
             VocalParameter::Trim => self.input_gain_db,
@@ -371,6 +399,32 @@ impl Processing {
     }
 }
 
+/// Prepare on the control thread for the current chain's sample rate and settings.
+/// After one application, return this value to the control thread to retire any
+/// replaced EQ/dynamics state. Delay buffers remain owned by the running chain.
+pub struct PreparedVocalChange {
+    settings: VocalSettings,
+    eq_snapshot: EqConfig,
+    eq_targets: Option<EqTargets>,
+    replacement: Option<Option<Processing>>,
+    predelay_frames: usize,
+    echo_frames: usize,
+}
+impl PreparedVocalChange {
+    pub fn new(rate: u32, current: VocalSettings, next_config: VocalConfig) -> Result<Self, DspError> {
+        next_config.validate()?;
+        let minimum = if next_config.preset == Preset::Off { 8000 } else { 32000 };
+        if !(minimum..=192_000).contains(&rate) { return Err(DspError::SampleRate); }
+        let enabled = next_config.preset != Preset::Off;
+        let eq_targets = if enabled { Some(Equalizer::prepare(rate, next_config.preset, next_config.eq)?) } else { None };
+        let replacement = if (current.preset != Preset::Off) == enabled { None }
+            else if enabled { Some(Some(Processing::new(rate, next_config)?)) } else { Some(None) };
+        let frames = |ms| (f64::from(ms) * f64::from(rate) / 1000.0).round() as usize;
+        Ok(Self { settings: next_config.settings(), eq_snapshot: next_config.eq, eq_targets, replacement,
+            predelay_frames: frames(next_config.reverb.predelay_ms), echo_frames: frames(next_config.echo.time_ms) })
+    }
+}
+
 pub struct VocalChain {
     config: VocalConfig,
     rate: f64,
@@ -413,8 +467,28 @@ impl VocalChain {
     /// Requested settings, not transient ramp values.
     pub fn config(&self) -> VocalConfig { self.config }
 
+    /// Apply once on the processing thread at a block boundary, without allocating
+    /// or freeing buffers. Active presets retain EQ/dynamics history; toggling off
+    /// swaps only that processing stage. Wet delay read positions ramp for 10 ms.
+    pub fn apply_settings(&mut self, change: &mut PreparedVocalChange) {
+        let eq_targets = change.eq_targets.map(|prepared| {
+            if self.config.eq == change.eq_snapshot { prepared } else {
+                // Independent atomic EQ targets may have reached this worker after
+                // the control-side snapshot. Reconcile before its unchanged-target
+                // fast path could leave the prepared filters using stale offsets.
+                Equalizer::prepare(self.rate as u32, change.settings.preset, self.config.eq)
+                    .expect("validated live EQ targets at the current processing rate")
+            }
+        });
+        if let Some(replacement) = &mut change.replacement { std::mem::swap(&mut self.processing, replacement); }
+        if let (Some(processing), Some(targets)) = (&mut self.processing, eq_targets) { processing.eq.apply_targets(targets); }
+        self.reverb.set_predelay_frames(change.predelay_frames);
+        self.echo.set_time_frames(change.echo_frames);
+        change.settings.apply_to(&mut self.config);
+    }
+
     /// Apply a validated target on the audio-processing thread, at a block boundary.
-    /// Preset, sample rate, pre-delay and echo time remain fixed. Only changed targets do work.
+    /// Only changed targets do work; settings changes use a prepared block-boundary plan.
     pub fn set_parameter(&mut self, parameter: VocalParameter, value: f32) -> Result<(), DspError> {
         if self.config.parameter(parameter) == value { return Ok(()); }
         self.config.set_parameter(parameter, value)?;

@@ -1,6 +1,7 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
 use super::{ChainEdit, ChainFile, EffectSpec, LiveParameter, ResolvedPlugins};
 use crate::{bridge::{Fault, Health}, capture::{Capture, PreparedPitchChange, PreparedVoiceDelay, VoiceDelayLayout, CAPTURE_BLOCK}, config::{PitchConfig, PitchScale, MAX_APPS}, control::{GainRamp, LiveControls}};
+use mixlive_effects::{PreparedVocalChange, VocalConfig, VocalSettings};
 use mixlive_vst3::editor::flush_editor_changes;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::{path::Path, sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
@@ -199,12 +200,13 @@ impl ChainChange {
     }
 }
 
-// Both explicit edits use the same serialized block-boundary handoff. The pitch
-// plan is boxed on the control thread because it may own all of a corrector's FFT
-// storage; the same box brings the retired corrector back for control-thread drop.
+// Explicit chain, pitch and vocal edits share one serialized boundary handoff.
+// Large DSP plans are boxed on the control thread; those same boxes bring retired
+// processing storage back for control-thread drop.
 enum ProcessingChange {
     Chain(ChainChange),
     Pitch { pitch: Box<PreparedPitchChange>, delays: Option<PreparedVoiceDelay> },
+    Vocal(Box<PreparedVocalChange>),
 }
 impl ProcessingChange {
     fn apply(&mut self, capture: &mut Capture, processors: &mut Vec<Option<Processor>>) {
@@ -214,6 +216,7 @@ impl ProcessingChange {
                 capture.apply_pitch_change(pitch);
                 if let Some(delays) = delays { capture.swap_voice_delay(delays); }
             }
+            Self::Vocal(change) => capture.apply_vocal_change(change),
         }
     }
 }
@@ -250,6 +253,7 @@ pub(crate) struct PluginWorker {
     health: Arc<Health>,
     chain: Option<ChainControl>,
     pitch_config: PitchConfig,
+    vocal_settings: VocalSettings,
     pub description: String,
 }
 
@@ -354,9 +358,10 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
     let layout = capture.delay_layout();
     let pitch_config = capture.pitch_config();
     let pitch_latency = capture.pitch_latency();
+    let vocal_settings = capture.vocal_config().settings();
     let mut owner = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots: Vec::new(),
         stopped: false, health: health.clone(), chain: Some(ChainControl { requests, retired: acknowledgments,
-            layout, rate, capacity, latency: 0, pitch_latency, compensation: 0 }), pitch_config, description: String::new() };
+            layout, rate, capacity, latency: 0, pitch_latency, compensation: 0 }), pitch_config, vocal_settings, description: String::new() };
     let mut processors = Vec::new();
     let mut total_latency = 0_u64;
     for (index, (plugin, bypassed)) in plugins.into_iter().enumerate() {
@@ -440,7 +445,8 @@ fn reject_added(added: Option<Slot>, error: String) -> String {
 impl PluginWorker {
     fn refresh_description(&mut self) {
         let Some(chain) = &self.chain else { return; };
-        self.description = format!("Pitch: {} {}; correction {:.0}%; retune {:.1} ms; nominal pitch delay {} samples ({:.2} ms).\n",
+        self.description = format!("Vocal: {}; reverb pre-delay {:.1} ms; echo time {:.1} ms.\nPitch: {} {}; correction {:.0}%; retune {:.1} ms; nominal pitch delay {} samples ({:.2} ms).\n",
+            self.vocal_settings.preset, self.vocal_settings.reverb_predelay_ms, self.vocal_settings.echo_time_ms,
             PitchScale::NAMES[usize::from(self.pitch_config.key)], self.pitch_config.scale.name(),
             self.pitch_config.strength * 100.0, self.pitch_config.retune_ms, chain.pitch_latency,
             chain.pitch_latency as f64 * 1000.0 / f64::from(chain.rate));
@@ -465,6 +471,25 @@ impl PluginWorker {
     }
 
     pub fn pitch_config(&self) -> PitchConfig { self.pitch_config }
+
+    pub fn vocal_settings(&self) -> VocalSettings { self.vocal_settings }
+
+    /// Prepare only the requested vocal modules. The target snapshot initializes
+    /// newly enabled processing; it never replaces the independent atomic controls.
+    pub fn set_vocal_settings(&mut self, next: VocalSettings, mut targets: VocalConfig) -> Result<(), String> {
+        if self.health.failed() || self.stopped { return Err("audio path has stopped; cannot edit vocal settings".into()); }
+        let chain = self.chain.as_ref().ok_or("no running audio processor")?;
+        if self.thread.is_none() { return Err("no running audio processor".into()); }
+        if next == self.vocal_settings { return Ok(()); }
+        next.apply_to(&mut targets);
+        let change = PreparedVocalChange::new(chain.rate, self.vocal_settings, targets).map_err(|error| error.to_string())?;
+        let retired = self.exchange_change(ProcessingChange::Vocal(Box::new(change)))?;
+        drop(retired);
+        self.vocal_settings = next;
+        self.refresh_description();
+        if let Some(error) = self.health.error() { return Err(error.into()); }
+        Ok(())
+    }
 
     /// All pitch settings form one committed configuration. Off/on changes prepare
     /// and retire FFT storage with the matching PDC bank; enabled edits keep history.
