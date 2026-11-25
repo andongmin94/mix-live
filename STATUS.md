@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실행 중 VST3 슬롯 편집 구현 · Windows 통합 검증 준비**
+단계: **실행 중 VST3 슬롯 추가·삭제·순서 변경 검증 완료 · main 병합**
 
 ## 현재 구현
 
@@ -98,26 +98,23 @@
 
 ## 검증
 
-- 이번 슬롯 편집 변경의 로컬 core 지연 교체, capture 경로 18개 및 bypass 목록 재배치 검사는 통과했다.
-  Windows workspace/native VST3/Clippy/release/GPUI 통합 검사는 아직 실행 전이다.
-- [Audio #49](https://github.com/andongmin94/mix-live/actions/runs/45602634932) `25daa2d` 전체 성공:
-  Windows workspace 검사 130개와 실제 native VST3 fixture 검사 11개, 총 **141개 성공**.
+- [Audio #51](https://github.com/andongmin94/mix-live/actions/runs/45623727270) `f6b5b79` 전체 성공:
+  Windows workspace 검사 131개와 실제 native VST3 fixture 검사 13개, 총 **144개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
-  PR #3의 병합 tree가 검증한 source tree와 동일함을 확인했다.
-- 직전 변경에서 라이브 EQ의 주파수 응답·전환 연속성·목표 재변경·처리 블록 독립성·
-  32/48/192 kHz 유한 출력, 마이크 send 반영과 AUX/앱 격리, 반복 Scene snapshot/JSON
-  저장을 검사했다. VST3 공통 편집은 실제 출력 변화·슬롯 독립성·이산값·읽기 전용 거절,
-  controller-only 값 새로고침·processor 피드백 보존·마지막 편집 후 상태 저장/복원을 검사했다.
-  앞선 음정 보정/limiter와 Scene 13 검사도 같은 Windows 묶음에서 통과했다.
-- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45602634932/artifacts/15015708424):
+  PR #4의 병합 tree가 검증한 source tree와 동일함을 확인했다.
+- 이번 변경에서 같은 지연의 PDC 이력 유지, 마지막 지연 제거, 잘못된 준비의 무변경 거절,
+  bypass 목록 재배치를 검사했다. native fixture에서는 입력 없는 첫 슬롯 추가, 서로 다른
+  파라미터의 인스턴스 동일성·순서 유지, 잘못된 경로/레이아웃/인덱스 거절, 전체 삭제 후
+  오디오 처리·AUX/앱 격리·빈 체인 snapshot 및 편집한 순서/bypass의 snapshot을 확인했다.
+  기존 state fixture의 파라미터 저장/복원과 음정 보정·라이브 EQ·limiter·Scene 13 검사도 통과했다.
+- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45623727270/artifacts/15028093063):
   `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe`와 의존성/라이선스 고지.
-  실장비 라이브 패널 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
+  실장비 라이브 체인 UI 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
 - [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) `08d0007` 성공:
   세 고정 INF/PnP ID, transport 격리, WDK/INF/unsigned catalog 및 미서명 거절·부재 검사 완료.
   드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는 미검증이다.
-- 로컬 DSP/변경 경로 검사는 통과했다. Linux library Clippy는 Windows 전용 호출부가
-  제외된 기존 항목의 dead_code 경고로 종료됐다. 지원 플랫폼 Windows의 엄격한 Clippy는 위 CI에서 통과했다.
+- 로컬 core 지연 교체, capture 경로 18개 및 bypass 목록 재배치 검사도 통과했다.
 
 ## 남은 작업과 제한
 
