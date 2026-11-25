@@ -31,6 +31,54 @@ fn capture_queue_rejects_overflow_and_invalid_input_without_waiting() {
 }
 
 #[test]
+fn live_vocal_settings_acknowledge_before_publication_and_keep_independent_targets() {
+    use mixlive_effects::{Preset, VocalParameter};
+    let config = VocalConfig { preset: Preset::Warm, ..VocalConfig::default() };
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, config).unwrap());
+    let (writer, _reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+        vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+    let pitch = PitchConfig { strength: 0.8, ..PitchConfig::default() };
+    capture.prepare_pitch(48000, pitch).unwrap();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, true, health.clone()).unwrap();
+    for parameter in VocalParameter::ALL {
+        let range = parameter.range();
+        let value = (range.start() + range.end()) * 0.5;
+        controls.apply(crate::control::LiveCommand::Vocal { parameter, value }).unwrap();
+    }
+    let targets = VocalParameter::ALL.map(|parameter| controls.vocal_value(parameter));
+    let next = VocalSettings { preset: Preset::Bright, reverb_predelay_ms: 80.0, echo_time_ms: 1000.0 };
+    worker.set_vocal_settings(next, controls.vocal_config()).unwrap();
+    assert_eq!(worker.vocal_settings(), next);
+    assert_eq!(controls.vocal_config().settings(), config.settings());
+    assert_eq!(worker.pitch_config(), pitch);
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
+    assert!(worker.description.contains("Vocal: bright; reverb pre-delay 80.0 ms; echo time 1000.0 ms"));
+    controls.publish_vocal_settings(worker.vocal_settings());
+    assert_eq!(controls.vocal_config().settings(), next);
+    assert_eq!(VocalParameter::ALL.map(|parameter| controls.vocal_value(parameter)), targets);
+    for invalid in [VocalSettings { reverb_predelay_ms: f32::NAN, ..next },
+        VocalSettings { reverb_predelay_ms: 81.0, ..next }, VocalSettings { echo_time_ms: 9.0, ..next }] {
+        assert!(worker.set_vocal_settings(invalid, controls.vocal_config()).is_err());
+        assert_eq!(worker.vocal_settings(), next);
+        assert_eq!(controls.vocal_config().settings(), next);
+        assert_eq!(VocalParameter::ALL.map(|parameter| controls.vocal_value(parameter)), targets);
+        assert!(!health.failed());
+    }
+    let off = VocalSettings { preset: Preset::Off, ..next };
+    worker.set_vocal_settings(off, controls.vocal_config()).unwrap();
+    controls.publish_vocal_settings(worker.vocal_settings());
+    assert_eq!(worker.vocal_settings(), off);
+    assert_eq!(controls.vocal_parameters().count(), 5);
+    assert_eq!(VocalParameter::ALL.map(|parameter| controls.vocal_value(parameter)), targets);
+    assert_eq!(worker.pitch_config(), pitch);
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
+    assert_eq!(health.captured_frames.load(Ordering::Relaxed), 0);
+    worker.finish(None).unwrap();
+}
+
+#[test]
 fn live_pitch_updates_commit_on_idle_boundaries_and_reject_invalid_preparation() {
     let health = Arc::new(Health::default());
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, VocalConfig::default()).unwrap());
@@ -159,6 +207,16 @@ fn native_live_chain_edits_preserve_instances_outputs_and_the_empty_worker() {
     let pitch = PitchConfig { strength: 0.7, ..PitchConfig::default() };
     worker.set_pitch_config(pitch).unwrap();
     worker.edit_chain(ChainEdit::Add(spec.clone())).unwrap();
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
+    let retained_vst = worker.slots[0].plugin.clone();
+    worker.set_effect_parameter(0, 0, 0.375).unwrap();
+    let vocal = VocalSettings { preset: mixlive_effects::Preset::Natural, reverb_predelay_ms: 55.0, echo_time_ms: 420.0 };
+    worker.set_vocal_settings(vocal, controls.vocal_config()).unwrap();
+    controls.publish_vocal_settings(worker.vocal_settings());
+    assert!(Arc::ptr_eq(&worker.slots[0].plugin, &retained_vst));
+    assert_eq!(worker.effect_parameters(0).unwrap()[0].normalized, 0.375);
+    assert_eq!(worker.pitch_config(), pitch);
+    assert_eq!(worker.chain.as_ref().unwrap().pitch_latency, 2048);
     assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
     worker.slots[0].latency = 71;
     worker.chain.as_mut().unwrap().latency = 71;
@@ -379,7 +437,7 @@ fn native_editors_reopen_on_the_same_slots_and_detach_independently() {
         Slot::new(plugin, Arc::new(AtomicBool::new(gain > 0.5)), 0)
     }).collect();
     let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
-        stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), description: String::new() };
+        stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), vocal_settings: VocalConfig::default().settings(), description: String::new() };
     // Upstream's documented Editor Attached instrumentation (read-only parameter 1000).
     let attached = |worker: &PluginWorker, index: usize| {
         worker.slots[index].plugin.lock().unwrap().get_parameter(1000).unwrap()
@@ -445,7 +503,7 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
             slots.push(Slot::new(plugin, Arc::new(AtomicBool::new(gain > 0.5)), 0));
         }
         let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
-            stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), description: String::new() };
+            stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), vocal_settings: VocalConfig::default().settings(), description: String::new() };
         // A last generic-panel edit with no subsequent audio block must survive its snapshot.
         for (index, gain) in [0.23, 0.61].into_iter().enumerate() {
             let parameters = worker.set_effect_parameter(index, 0, gain).unwrap();

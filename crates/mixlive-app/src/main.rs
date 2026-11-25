@@ -19,6 +19,8 @@ mod sound;
 mod sound_editor;
 #[cfg(windows)]
 mod ui;
+#[cfg(windows)]
+mod vocal_editor;
 
 #[derive(Parser)]
 #[command(

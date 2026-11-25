@@ -8,6 +8,7 @@ use mixlive_audio_windows::{
     scene::AudioScene,
     windows::{Active, LevelReadings, Prepared},
 };
+use mixlive_effects::VocalSettings;
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -74,6 +75,11 @@ impl Session {
     pub fn pitch_config(&self) -> Option<PitchConfig> {
         self.active.as_ref().map(Active::pitch_config)
             .or_else(|| self.scene().map(|scene| scene.route.pitch_config()))
+    }
+
+    pub fn vocal_settings(&self) -> Option<VocalSettings> {
+        self.active.as_ref().map(Active::vocal_settings)
+            .or_else(|| self.scene().map(|scene| scene.route.vocal_config().settings()))
     }
 
     fn fail<T>(&mut self, message: &str, error: impl ToString) -> Result<T, String> {
@@ -229,6 +235,25 @@ impl Session {
                 Ok(())
             }
             Err(error) => self.fail("음정 설정을 적용하지 못했습니다.", error),
+        }
+    }
+
+    /// Apply only the three prepared vocal settings, keeping the live fader targets.
+    pub fn set_vocal_settings(&mut self, settings: VocalSettings) -> Result<(), String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 실행 중에만 보컬 설정을 적용할 수 있습니다.", "audio is not running");
+        };
+        let previous = active.vocal_settings();
+        let result = active.set_vocal_settings(settings);
+        self.timing = active.timing.clone();
+        if active.vocal_settings() != previous { self.report.clear(); }
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.message = "보컬 설정 적용 · 정지 후 새 Scene 저장으로 현재 설정을 보존할 수 있습니다.".into();
+                Ok(())
+            }
+            Err(error) => self.fail("보컬 설정을 적용하지 못했습니다.", error),
         }
     }
 
@@ -413,6 +438,11 @@ mod tests {
         assert!(session.set_pitch_config(PitchConfig { strength: 0.75, ..pitch }).is_err());
         assert_eq!(session.pitch_config(), Some(pitch));
         assert_eq!(session.scene().unwrap().route.pitch_config(), pitch);
+        let vocal = session.scene().unwrap().route.vocal_config().settings();
+        assert_eq!(session.vocal_settings(), Some(vocal));
+        assert!(session.set_vocal_settings(VocalSettings { echo_time_ms: 450.0, ..vocal }).is_err());
+        assert_eq!(session.vocal_settings(), Some(vocal));
+        assert_eq!(session.scene().unwrap().route.vocal_config().settings(), vocal);
         assert_eq!(session.effects(), session.scene().unwrap().effects.as_slice());
         assert!(session.edit_chain(ChainEdit::Remove { index: 0 }).is_err());
         assert_eq!(session.effects().len(), 1);
@@ -425,6 +455,7 @@ mod tests {
         assert!(session.scene().is_none());
         assert!(session.pitch_config().is_none());
         assert!(session.path().is_none());
+        assert!(session.vocal_settings().is_none());
         assert!(session.error.is_some());
     }
 
@@ -435,6 +466,8 @@ mod tests {
         assert!(!session.running());
         assert!(session.pitch_config().is_none());
         assert!(session.set_pitch_config(PitchConfig::default()).is_err());
+        assert!(session.vocal_settings().is_none());
+        assert!(session.set_vocal_settings(mixlive_effects::VocalConfig::default().settings()).is_err());
         assert!(
             session
                 .apply(LiveCommand::Mute {

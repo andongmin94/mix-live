@@ -1,6 +1,8 @@
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, SendDelays, Source};
-use mixlive_effects::{Meters, VocalChain};
+use mixlive_effects::{Meters, VocalChain, VocalParameter};
+#[cfg(any(windows, test))]
+use mixlive_effects::{PreparedVocalChange, VocalConfig};
 use crate::{bridge::{Fault, Health, OutputWriter}, config::{MAX_APPS, MAX_MIXES, PitchConfig}, pitch_correction::PitchCorrector, control::{GainRamp, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
 
 pub const CAPTURE_BLOCK: usize = 256;
@@ -169,6 +171,16 @@ impl Capture {
     #[cfg(windows)]
     pub(crate) fn app_count(&self) -> usize { self.app_count }
 
+    #[cfg(any(windows, test))]
+    pub(crate) fn vocal_config(&self) -> VocalConfig { self.vocal.config() }
+
+    /// Prepared module changes share the worker boundary with other live edits.
+    /// The plan retains removed processing storage for control-thread retirement.
+    #[cfg(any(windows, test))]
+    pub(crate) fn apply_vocal_change(&mut self, prepared: &mut PreparedVocalChange) {
+        self.vocal.apply_settings(prepared);
+    }
+
     /// Prepare the opt-in pitch stage before opening the microphone stream.
     pub fn prepare_pitch(&mut self, rate: u32, config: PitchConfig) -> Result<usize, String> {
         self.pitch = PitchCorrector::new(rate, config)?;
@@ -239,7 +251,10 @@ impl Capture {
             self.health.fail(Fault::Input); return;
         }
         for (block_index, block) in samples.chunks(CAPTURE_BLOCK).enumerate() {
-            for parameter in self.controls.vocal_parameters() {
+            // The control/UI settings are published only after acknowledgment.
+            // Use the preset already applied here, never its mutex or stale preset.
+            let preset = self.vocal.config().preset;
+            for parameter in VocalParameter::ALL.into_iter().filter(|parameter| parameter.available_for(preset)) {
                 if self.vocal.set_parameter(parameter, self.controls.vocal_value(parameter)).is_err() {
                     self.health.fail(Fault::Routing); return;
                 }

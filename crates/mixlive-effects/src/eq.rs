@@ -1,7 +1,13 @@
 //! Live EQ uses biquad's DF1 form, which retains input/output history during retuning.
 //! Coefficients are prepared only for a changed target and interpolated for 10 ms.
 use biquad::{Biquad, Coefficients, DirectForm1, Type, Q_BUTTERWORTH_F64};
-use super::{DspError, Preset, VocalConfig, VocalParameter};
+use super::{DspError, EqConfig, Preset, VocalConfig, VocalParameter};
+
+#[derive(Clone, Copy)]
+pub(super) struct EqTargets {
+    preset: Preset,
+    coefficients: [Coefficients<f64>; 4],
+}
 
 pub(super) struct Equalizer {
     filters: [LiveFilter; 4],
@@ -11,16 +17,27 @@ pub(super) struct Equalizer {
 
 impl Equalizer {
     pub(super) fn new(rate: u32, config: VocalConfig) -> Result<Self, DspError> {
-        let make = |parameter| -> Result<LiveFilter, DspError> {
-            let (_, coefficients) = target(config.preset, parameter, config.parameter(parameter), f64::from(rate))?;
-            Ok(LiveFilter::new(coefficients, rate))
-        };
+        let targets = Self::prepare(rate, config.preset, config.eq)?;
         Ok(Self {
-            filters: [make(VocalParameter::EqHpf)?, make(VocalParameter::EqBody)?,
-                make(VocalParameter::EqPresence)?, make(VocalParameter::EqAir)?],
+            filters: targets.coefficients.map(|coefficients| LiveFilter::new(coefficients, rate)),
             preset: config.preset,
             rate: f64::from(rate),
         })
+    }
+
+    pub(super) fn prepare(rate: u32, preset: Preset, config: EqConfig) -> Result<EqTargets, DspError> {
+        let coefficient = |parameter, value| target(preset, parameter, value, f64::from(rate)).map(|(_, c)| c);
+        Ok(EqTargets { preset, coefficients: [
+            coefficient(VocalParameter::EqHpf, config.hpf_hz)?,
+            coefficient(VocalParameter::EqBody, config.body_db)?,
+            coefficient(VocalParameter::EqPresence, config.presence_db)?,
+            coefficient(VocalParameter::EqAir, config.air_db)?,
+        ] })
+    }
+
+    pub(super) fn apply_targets(&mut self, targets: EqTargets) {
+        for (filter, coefficients) in self.filters.iter_mut().zip(targets.coefficients) { filter.set(coefficients); }
+        self.preset = targets.preset;
     }
 
     pub(super) fn set_parameter(&mut self, parameter: VocalParameter, value: f32) -> Result<(), DspError> {
@@ -74,6 +91,8 @@ impl LiveFilter {
     }
 
     fn set(&mut self, target: Coefficients<f64>) {
+        if [self.target.a1, self.target.a2, self.target.b0, self.target.b1, self.target.b2]
+            == [target.a1, target.a2, target.b0, target.b1, target.b2] { return; }
         self.start = self.current;
         self.target = target;
         self.remaining = self.duration;

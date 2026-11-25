@@ -18,13 +18,14 @@ use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteM
 use mixlive_audio_windows::config::PitchConfig;
 use mixlive_audio_windows::plugin::{ChainEdit, EffectSpec, LiveParameter};
 use mixlive_audio_windows::windows::device_catalog;
-use mixlive_effects::VocalParameter;
+use mixlive_effects::{VocalParameter, VocalSettings};
 
 use crate::{
     form::{FormEvent, SceneForm, select_control, selected},
     parameter_editor::{ParameterEditor, ParameterEvent},
     pitch_editor::{PitchEditor, PitchEvent},
     session::Session,
+    vocal_editor::{VocalEditor, VocalEvent},
 };
 
 pub(crate) const BACKGROUND: u32 = 0x0b1120;
@@ -105,6 +106,7 @@ enum Operation {
     SetParameter { index: usize, id: u32, normalized: f64 },
     EditChain(ChainEdit),
     SetPitch(PitchConfig),
+    SetVocalSettings(VocalSettings),
     Close,
 }
 
@@ -122,6 +124,8 @@ pub struct MixLive {
     parameter_subscription: Option<Subscription>,
     pitch_editor: Option<Entity<PitchEditor>>,
     pitch_subscription: Option<Subscription>,
+    vocal_editor: Option<Entity<VocalEditor>>,
+    vocal_subscription: Option<Subscription>,
     installed_plugins: Option<InstalledPlugins>,
     scanning_plugins: bool,
     workspace_scroll: ScrollHandle,
@@ -209,6 +213,8 @@ impl MixLive {
             parameter_subscription: None,
             pitch_editor: None,
             pitch_subscription: None,
+            vocal_editor: None,
+            vocal_subscription: None,
             installed_plugins: None,
             scanning_plugins: false,
             workspace_scroll: ScrollHandle::new(),
@@ -239,6 +245,8 @@ impl MixLive {
                                 this.parameter_subscription = None;
                                 this.pitch_editor = None;
                                 this.pitch_subscription = None;
+                                this.vocal_editor = None;
+                                this.vocal_subscription = None;
                                 let _ = this.session.open(path);
                                 this.selected_name = scene_name(&this.session);
                                 this.workspace_scroll.set_offset(Default::default());
@@ -260,6 +268,8 @@ impl MixLive {
         self.parameter_subscription = None;
         self.pitch_editor = None;
         self.pitch_subscription = None;
+        self.vocal_editor = None;
+        self.vocal_subscription = None;
         self.form_subscription =
             Some(
                 cx.subscribe_in(&form, window, |this, form, event, window, cx| match event {
@@ -529,6 +539,35 @@ impl MixLive {
         cx.notify();
     }
 
+    fn install_vocal_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(settings) = self.session.vocal_settings() else { return; };
+        let editor = cx.new(|cx| VocalEditor::new(settings, window, cx));
+        self.vocal_subscription = Some(cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
+            match event {
+                VocalEvent::Apply(settings) => this.perform(Operation::SetVocalSettings(*settings), window, cx),
+                VocalEvent::Reset if this.busy.is_none() && !this.picking && this.session.running() => {
+                    this.install_vocal_editor(window, cx);
+                    cx.notify();
+                }
+                VocalEvent::Reset => {}
+                VocalEvent::Close if this.busy.is_none() => {
+                    this.vocal_editor = None;
+                    this.vocal_subscription = None;
+                    cx.notify();
+                }
+                VocalEvent::Close => {}
+            }
+        }));
+        self.vocal_editor = Some(editor);
+    }
+
+    fn open_vocal_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.picking || !self.session.running() { return; }
+        if self.vocal_editor.is_none() { self.install_vocal_editor(window, cx); }
+        self.workspace_scroll.set_offset(Default::default());
+        cx.notify();
+    }
+
     fn perform(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
@@ -545,7 +584,7 @@ impl MixLive {
         {
             return;
         }
-        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_));
+        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_) | Operation::SetVocalSettings(_));
         if live_operation && (!self.session.running() || self.picking) {
             return;
         }
@@ -559,6 +598,7 @@ impl MixLive {
             Operation::SetParameter { .. } => "VST3 파라미터 적용 중",
             Operation::EditChain(_) => "VST3 체인 변경 중",
             Operation::SetPitch(_) => "음정 설정 적용 중",
+            Operation::SetVocalSettings(_) => "보컬 설정 적용 중",
         });
         if matches!(operation, Operation::EditChain(_)) {
             // Parameter events capture a slot index. A topology change invalidates that selection.
@@ -572,12 +612,18 @@ impl MixLive {
             self.parameter_subscription = None;
             self.pitch_editor = None;
             self.pitch_subscription = None;
+            self.vocal_editor = None;
+            self.vocal_subscription = None;
         } else if let Some(editor) = &self.parameter_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
         if let Some(editor) = &self.pitch_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
+        if let Some(editor) = &self.vocal_editor {
+            editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
+        }
+        let previous_preset = self.session.vocal_settings().map(|settings| settings.preset);
         let mut session = std::mem::take(&mut self.session);
         cx.notify();
         cx.spawn_in(window, async move |owner, cx| {
@@ -609,6 +655,10 @@ impl MixLive {
                 }
                 Operation::SetPitch(config) => {
                     let _ = session.set_pitch_config(*config);
+                    None
+                }
+                Operation::SetVocalSettings(settings) => {
+                    let _ = session.set_vocal_settings(*settings);
                     None
                 }
                 Operation::StopAndSave(path) => {
@@ -658,7 +708,16 @@ impl MixLive {
                             editor.set_busy(false, window, cx);
                         });
                     }
-                    if !live_operation {
+                    if let Some(editor) = &this.vocal_editor {
+                        editor.update(cx, |editor, cx| {
+                            if let Some(settings) = this.session.vocal_settings() { editor.set_current(settings, cx); }
+                            editor.set_busy(false, window, cx);
+                        });
+                    }
+                    // A committed preset may change fader availability even if a later
+                    // error is reported. Delay-only edits keep the existing controls.
+                    let current_preset = this.session.vocal_settings().map(|settings| settings.preset);
+                    if !live_operation || current_preset != previous_preset {
                         this.install_faders(cx);
                     }
                     cx.notify();
@@ -1310,7 +1369,7 @@ impl MixLive {
             else { fields = fields.child(field); }
         }
         let hint = if config.preset == mixlive_effects::Preset::Off {
-            "EQ/다이내믹스 프리셋이 꺼져 있습니다. 정지 후 프리셋을 선택하면 EQ/다이내믹스를 조절할 수 있습니다."
+            "EQ/다이내믹스 프리셋이 꺼져 있습니다. 실행 중 보컬 설정에서 프리셋을 적용하면 EQ/다이내믹스를 조절할 수 있습니다."
         } else {
             "보정 비율을 0으로 내리면 EQ/다이내믹스를 우회합니다. 리버브와 에코는 별도로 조절합니다."
         };
@@ -1319,6 +1378,9 @@ impl MixLive {
                 .child(div().font_semibold().child("실시간 보컬 보정"))
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child(format!("{} · pre-delay {:.1} ms · echo {:.1} ms", config.preset, config.reverb.predelay_ms, config.echo.time_ms))))
+            .child(button("edit-live-vocal", "실행 중 보컬 설정", false)
+                .disabled(self.busy.is_some() || self.picking)
+                .on_click(cx.listener(|this, _, window, cx| this.open_vocal_editor(window, cx))))
             .children((config.preset != mixlive_effects::Preset::Off).then(|| div().flex().flex_col().gap_3()
                 .pb_4().border_b_1().border_color(rgb(BORDER))
                 .child(div().text_sm().font_semibold().child("실시간 EQ"))
@@ -1328,7 +1390,7 @@ impl MixLive {
             .child(fields)
             .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
             .child(div().text_xs().text_color(rgb(MUTED))
-                .child("프리셋, pre-delay, 에코 시간은 정지 상태에서 변경합니다. 조절값은 약 10 ms에 걸쳐 반영되며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
+                .child("슬라이더 조절값은 약 10 ms에 걸쳐 반영됩니다. 프리셋·pre-delay·에코 시간은 실행 중 보컬 설정에서 함께 적용하며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
     }
 
     fn mixer(&self, cx: &Context<Self>) -> gpui::AnyElement {
@@ -1634,6 +1696,11 @@ impl Render for MixLive {
         if let Some(form) = &self.form {
             body = body.child(form.clone());
         } else {
+            if self.session.running()
+                && let Some(editor) = &self.vocal_editor
+            {
+                body = body.child(editor.clone());
+            }
             if self.session.running()
                 && let Some(editor) = &self.pitch_editor
             {

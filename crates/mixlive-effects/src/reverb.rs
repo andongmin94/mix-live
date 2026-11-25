@@ -44,7 +44,6 @@ impl Delay {
     fn new(frames: usize) -> Self { Self { samples: vec![0.0; frames], cursor: 0 } }
     fn read(&self) -> f64 { self.samples[self.cursor] }
     fn push(&mut self, value: f64) -> f64 {
-        if self.samples.is_empty() { return value; }
         let previous = std::mem::replace(&mut self.samples[self.cursor], value);
         self.cursor += 1;
         if self.cursor == self.samples.len() { self.cursor = 0; }
@@ -59,9 +58,44 @@ struct Line {
     feedback_gain: ParameterRamp,
 }
 
+// Keep the full supported wet-input history, including while pre-delay is zero.
+// The extra slot permits reading the maximum delay after writing the current sample.
+struct Predelay {
+    samples: Vec<f64>,
+    cursor: usize,
+    delay: ParameterRamp,
+}
+impl Predelay {
+    fn new(rate: u32, frames: usize) -> Self {
+        let maximum = (f64::from(rate) * 0.080).round() as usize;
+        Self { samples: vec![0.0; maximum + 1], cursor: 0,
+            delay: ParameterRamp::new(rate, frames as f64) }
+    }
+
+    fn push(&mut self, value: f64) -> f64 {
+        self.samples[self.cursor] = value;
+        let delay = self.delay.next_value();
+        let whole = delay.floor() as usize;
+        let fraction = delay - whole as f64;
+        let newer = (self.cursor + self.samples.len() - whole) % self.samples.len();
+        let output = if fraction == 0.0 { self.samples[newer] } else {
+            let older = (newer + self.samples.len() - 1) % self.samples.len();
+            self.samples[newer] * (1.0 - fraction) + self.samples[older] * fraction
+        };
+        self.cursor = (self.cursor + 1) % self.samples.len();
+        output
+    }
+
+    fn reset(&mut self) {
+        self.samples.fill(0.0);
+        self.cursor = 0;
+        self.delay.reset();
+    }
+}
+
 pub(super) struct Reverb {
     lines: Vec<Line>,
-    predelay: Delay,
+    predelay: Predelay,
     mix: ParameterRamp,
     rate: u32,
 }
@@ -80,7 +114,7 @@ impl Reverb {
                 feedback_gain: ParameterRamp::new(rate, feedback_gain),
             })
         }).collect::<Result<Vec<_>, DspError>>()?;
-        Ok(Self { lines, predelay: Delay::new(frames(f64::from(config.predelay_ms))),
+        Ok(Self { lines, predelay: Predelay::new(rate, frames(f64::from(config.predelay_ms))),
             mix: ParameterRamp::new(rate, f64::from(config.mix)), rate })
     }
 
@@ -89,6 +123,8 @@ impl Reverb {
     }
 
     pub(super) fn set_mix(&mut self, mix: f32) { self.mix.set(f64::from(mix)); }
+
+    pub(super) fn set_predelay_frames(&mut self, frames: usize) { self.predelay.delay.set(frames as f64); }
 
     pub(super) fn set_decay(&mut self, decay: f32) {
         for line in &mut self.lines {
@@ -134,5 +170,48 @@ impl Reverb {
         self.predelay.reset();
         self.mix.reset();
         for line in &mut self.lines { line.delay.reset(); line.damping.reset(); line.feedback_gain.reset(); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_predelay_reads_zero_maximum_and_fractional_history() {
+        for rate in [8000, 44100, 192000] {
+            let maximum = (f64::from(rate) * 0.080).round() as usize;
+            let duration = rate as usize / 100;
+            let mut delay = Predelay::new(rate, 0);
+            assert!(delay.push(-0.0).is_sign_negative());
+            let mut frame = 0;
+            // Zero pre-delay must still collect history for a later time edit.
+            while frame < maximum * 2 + 17 {
+                assert_eq!(delay.push(frame as f64 + 0.25), frame as f64 + 0.25);
+                frame += 1;
+            }
+            for (start, target) in [(0, maximum), (maximum, 0)] {
+                delay.delay.set(target as f64);
+                for step in 1..=duration {
+                    let offset = start as f64 + (target as f64 - start as f64) * step as f64 / duration as f64;
+                    let expected = frame as f64 + 0.25 - offset;
+                    assert!((delay.push(frame as f64 + 0.25) - expected).abs() < 1e-8,
+                        "rate {rate}, target {target}, step {step}");
+                    frame += 1;
+                }
+                assert_eq!(delay.delay.current, target as f64);
+                assert_eq!(delay.delay.remaining, 0);
+                for _ in 0..maximum + 3 {
+                    assert_eq!(delay.push(frame as f64 + 0.25), (frame - target) as f64 + 0.25);
+                    frame += 1;
+                }
+            }
+            delay.delay.set(maximum as f64);
+            delay.reset();
+            for frame in 0..=maximum {
+                let output = delay.push(if frame == 0 { 1.0 } else { 0.0 });
+                assert_eq!(output, if frame == maximum { 1.0 } else { 0.0 });
+            }
+        }
     }
 }

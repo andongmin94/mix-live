@@ -1,7 +1,7 @@
 //! Live session controls. Parsing/printing stays on the control thread; callbacks only load atomics.
 use crate::config::{AuxDestination, RouteOptions, MAX_APPS, MAX_MIXES};
 use serde::{Deserialize, Serialize};
-use mixlive_effects::{VocalConfig, VocalParameter};
+use mixlive_effects::{VocalConfig, VocalParameter, VocalSettings};
 use std::{str::FromStr, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU32, Ordering}}};
 
 const MIC: u32 = 1;
@@ -210,7 +210,9 @@ pub struct LiveControls {
     // Only foreground/CLI code accesses this list. Processing keeps each flag's
     // Arc directly and never takes this lock when the slot order changes.
     effect_bypasses: Mutex<Vec<Arc<AtomicBool>>>,
-    vocal_start: VocalConfig,
+    // Only control/UI code reads the acknowledged settings. Audio processing
+    // uses its own VocalChain configuration and never takes this lock.
+    vocal_settings: Mutex<VocalSettings>,
     vocal_targets: [AtomicU32; VocalParameter::ALL.len()],
 }
 impl LiveControls {
@@ -233,7 +235,7 @@ impl LiveControls {
             route_levels: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
             source_trims: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
             effect_bypasses: Mutex::new(Vec::new()),
-            vocal_start: vocal,
+            vocal_settings: Mutex::new(vocal.settings()),
             vocal_targets: VocalParameter::ALL.map(|parameter| AtomicU32::new(vocal.parameter(parameter).to_bits())) })
     }
 
@@ -286,10 +288,6 @@ impl LiveControls {
         if self.has_aux != route.has_aux() || self.enabled_mixes != [true, route.send.is_some(), route.broadcast.is_some()]
             || self.app_count != route.apps.len() {
             return Err("live controls do not match the Scene topology".into());
-        }
-        if route.vocal != self.vocal_start.preset || route.reverb_predelay_ms != self.vocal_start.reverb.predelay_ms
-            || route.echo_time_ms != self.vocal_start.echo.time_ms {
-            return Err("live vocal processing does not match the Scene topology".into());
         }
         let mut saved = route.clone();
         saved.set_vocal_config(self.vocal_config());
@@ -359,8 +357,9 @@ impl LiveControls {
     }
     pub fn stop_requested(&self) -> bool { self.stop_requested.load(Ordering::Relaxed) }
 
-    pub fn vocal_parameters(&self) -> impl Iterator<Item = VocalParameter> + '_ {
-        VocalParameter::ALL.into_iter().filter(move |parameter| parameter.available_for(self.vocal_start.preset))
+    pub fn vocal_parameters(&self) -> impl Iterator<Item = VocalParameter> {
+        let preset = self.vocal_settings().preset;
+        VocalParameter::ALL.into_iter().filter(move |parameter| parameter.available_for(preset))
     }
 
     /// Read one requested value, not a transient DSP ramp.
@@ -368,9 +367,21 @@ impl LiveControls {
         f32::from_bits(self.vocal_targets[parameter as usize].load(Ordering::Relaxed))
     }
 
-    /// Control-thread snapshot of the targets and the fixed startup topology.
+    fn vocal_settings(&self) -> VocalSettings {
+        *self.vocal_settings.lock().expect("control vocal settings")
+    }
+
+    /// Publish after the worker acknowledges the edit, including an acknowledged
+    /// edit followed by an audio fault. Never replace the independent live targets.
+    #[cfg(any(windows, test))]
+    pub(crate) fn publish_vocal_settings(&self, settings: VocalSettings) {
+        *self.vocal_settings.lock().expect("control vocal settings") = settings;
+    }
+
+    /// Control-thread snapshot of current requested targets and acknowledged settings.
     pub fn vocal_config(&self) -> VocalConfig {
-        let mut config = self.vocal_start;
+        let mut config = VocalConfig::default();
+        self.vocal_settings().apply_to(&mut config);
         for parameter in VocalParameter::ALL {
             config.set_parameter(parameter, self.vocal_value(parameter)).expect("validated atomic vocal target");
         }
@@ -489,8 +500,8 @@ impl LiveControls {
                 self.effect_flag(index)?.store(bypassed, Ordering::Relaxed);
             }
             LiveCommand::Vocal { parameter, value } => {
-                if !parameter.available_for(self.vocal_start.preset) {
-                    return Err("this parameter requires a non-off vocal preset; stop and select a preset first".into());
+                if !parameter.available_for(self.vocal_settings().preset) {
+                    return Err("this parameter requires a non-off vocal preset; select a preset first".into());
                 }
                 parameter.validate(value).map_err(|error| error.to_string())?;
                 self.vocal_targets[parameter as usize].store(value.to_bits(), Ordering::Relaxed);
@@ -802,13 +813,31 @@ mod tests {
         });
         // A later snapshot can update EQ again; it no longer changes the topology.
         controls.apply("vocal eq-hpf 80".parse().unwrap()).unwrap();
+        let targets = VocalParameter::ALL.map(|parameter| controls.vocal_value(parameter));
+        let next = VocalSettings { preset: Preset::Bright, reverb_predelay_ms: 64.0, echo_time_ms: 750.0 };
+        controls.publish_vocal_settings(next);
+        assert_eq!(VocalParameter::ALL.map(|parameter| controls.vocal_value(parameter)), targets);
+        assert_eq!(controls.vocal_parameters().count(), 16);
+        // The loaded Scene still has its original preset/times. Save the acknowledged
+        // settings together with all live targets, rather than rejecting that difference.
         controls.snapshot_into(&mut route).unwrap();
+        assert_eq!(route.vocal_config().settings(), next);
         let scene = crate::scene::AudioScene::new(route.clone(), Vec::new()).unwrap();
         let json = serde_json::to_string(&scene).unwrap();
         let saved: crate::scene::AudioScene = serde_json::from_str(&json).unwrap();
         assert_eq!(saved.route.vocal_config(), controls.vocal_config());
         let restored = LiveControls::from_route(&route).unwrap();
         assert_eq!(restored.describe(), controls.describe());
+        assert_eq!(restored.vocal_config(), controls.vocal_config());
+        controls.publish_vocal_settings(VocalSettings { preset: Preset::Off, ..next });
+        assert_eq!(controls.vocal_parameters().count(), 5);
+        assert!(controls.apply("vocal eq-body 1".parse().unwrap()).is_err());
+        assert_eq!(VocalParameter::ALL.map(|parameter| controls.vocal_value(parameter)), targets);
+        controls.snapshot_into(&mut route).unwrap();
+        assert_eq!(route.vocal, Preset::Off);
+        assert_eq!(route.vocal_config().eq.body_db, -3.0);
+        controls.publish_vocal_settings(next);
+        assert!(controls.apply("vocal eq-body 1".parse().unwrap()).is_ok());
         let off = LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
         assert!(off.apply("vocal strength 1".parse().unwrap()).is_err());
         assert!(off.apply("vocal ratio 4".parse().unwrap()).is_err());
