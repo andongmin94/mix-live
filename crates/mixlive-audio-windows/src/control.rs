@@ -14,7 +14,7 @@ const BROADCAST: u32 = 1 << (5 + MAX_APPS);
 pub(crate) const MAX_SOURCES: usize = MAX_APPS + 2;
 pub(crate) const MAX_ROUTES: usize = MAX_MIXES * MAX_SOURCES;
 
-pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; trim aux|appN <dB -96..0>; vocal trim|strength|compressor|deesser|reverb|decay <value>; status; stop. Changes last for this run unless saved with --scene-out.";
+pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; trim aux|appN <dB -96..0>; bypass <VST3 slot> on|off; vocal trim|strength|compressor|deesser|reverb|decay <value>; status; stop. Changes last for this run unless saved with --scene-out.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuteTarget { Mic, Aux, App(usize), Output, Send, Broadcast, All }
@@ -67,6 +67,7 @@ pub enum LiveCommand {
     Route { source: RouteSource, mix: RouteMix, enabled: bool },
     RouteGain { source: RouteSource, mix: RouteMix, db: f32 },
     SourceTrim { source: RouteSource, db: f32 },
+    EffectBypass { index: usize, bypassed: bool },
     Vocal { parameter: VocalParameter, value: f32 },
     Status,
     Stop,
@@ -123,6 +124,13 @@ impl FromStr for LiveCommand {
                 let db: f32 = words.next().ok_or(HELP)?.parse().map_err(|_| HELP)?;
                 validate_db(db)?;
                 Self::SourceTrim { source, db }
+            }
+            Some("bypass") => {
+                let index = words.next().ok_or(HELP)?.parse::<usize>().map_err(|_| HELP)?.checked_sub(1).ok_or(HELP)?;
+                let bypassed = match words.next() {
+                    Some("on") => true, Some("off") => false, _ => return Err(HELP.into()),
+                };
+                Self::EffectBypass { index, bypassed }
             }
             Some("vocal") => {
                 let name = words.next().ok_or(HELP)?;
@@ -199,6 +207,7 @@ pub struct LiveControls {
     routes_enabled: AtomicU32,
     route_levels: [AtomicU32; MAX_ROUTES],
     source_trims: [AtomicU32; MAX_SOURCES],
+    effect_bypasses: Vec<Arc<AtomicBool>>,
     vocal_start: VocalConfig,
     vocal_targets: [AtomicU32; VocalParameter::ALL.len()],
 }
@@ -221,6 +230,7 @@ impl LiveControls {
             routes_enabled: AtomicU32::new(mic_routes),
             route_levels: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
             source_trims: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
+            effect_bypasses: Vec::new(),
             vocal_start: vocal,
             vocal_targets: VocalParameter::ALL.map(|parameter| AtomicU32::new(vocal.parameter(parameter).to_bits())) })
     }
@@ -385,6 +395,20 @@ impl LiveControls {
         Ok(&self.mix_gains[mix.index()])
     }
 
+    /// Called once before sharing the prepared controls with processing or UI threads.
+    #[cfg(any(windows, test))]
+    pub(crate) fn prepare_effects(&mut self, bypasses: impl Iterator<Item = bool>) {
+        self.effect_bypasses = bypasses.map(|bypassed| Arc::new(AtomicBool::new(bypassed))).collect();
+    }
+
+    pub(crate) fn effect_flag(&self, index: usize) -> Result<&Arc<AtomicBool>, String> {
+        self.effect_bypasses.get(index).ok_or_else(|| "VST3 slot is outside the active chain".into())
+    }
+
+    pub fn effect_bypassed(&self, index: usize) -> Result<bool, String> {
+        Ok(self.effect_flag(index)?.load(Ordering::Relaxed))
+    }
+
     /// Supplemental input attenuation, independent of mute and all destination sends.
     pub fn source_trim_db(&self, source: RouteSource) -> Result<f32, String> {
         let index = self.trim_index(source)?;
@@ -451,6 +475,9 @@ impl LiveControls {
                 let index = self.trim_index(source)?;
                 self.source_trims[index].store(gain(db).to_bits(), Ordering::Relaxed);
             }
+            LiveCommand::EffectBypass { index, bypassed } => {
+                self.effect_flag(index)?.store(bypassed, Ordering::Relaxed);
+            }
             LiveCommand::Vocal { parameter, value } => {
                 if !parameter.available_for(self.vocal_start.preset) {
                     return Err("this parameter requires a non-off vocal preset; stop and select a preset first".into());
@@ -508,6 +535,9 @@ impl LiveControls {
         }
         for parameter in self.vocal_parameters() {
             text.push_str(&format!(" vocal.{}={:.3}", parameter.name(), self.vocal_value(parameter)));
+        }
+        for (index, flag) in self.effect_bypasses.iter().enumerate() {
+            text.push_str(&format!(" vst3.{}.bypass={}", index + 1, flag.load(Ordering::Relaxed)));
         }
         let enabled = self.routes_enabled.load(Ordering::Relaxed);
         for source in self.sources() {
@@ -668,6 +698,25 @@ mod tests {
         assert!("mute app0".parse::<LiveCommand>().is_err());
         route.apps.push(AppSource::new("browser.exe".into()));
         assert!(route.validate().is_err());
+    }
+
+    #[test]
+    fn bypass_commands_target_only_explicit_active_vst3_slots() {
+        let mut controls = LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
+        assert!(controls.apply("bypass 1 on".parse().unwrap()).is_err());
+        controls.prepare_effects([false, true].into_iter());
+        let first = controls.effect_flag(0).unwrap().clone();
+        assert!(!first.load(Ordering::Relaxed));
+        assert!(controls.effect_bypassed(1).unwrap());
+        controls.apply("bypass 1 on".parse().unwrap()).unwrap();
+        controls.apply("bypass 2 off".parse().unwrap()).unwrap();
+        assert!(first.load(Ordering::Relaxed));
+        assert!(!controls.effect_bypassed(1).unwrap());
+        assert!(controls.apply("bypass 3 on".parse().unwrap()).is_err());
+        for invalid in ["bypass 0 on", "bypass -1 on", "bypass 1 true", "bypass 1 on now"] {
+            assert!(invalid.parse::<LiveCommand>().is_err());
+        }
+        assert!(controls.describe().contains("vst3.1.bypass=true vst3.2.bypass=false"));
     }
 
     #[test]

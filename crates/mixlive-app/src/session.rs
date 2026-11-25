@@ -299,6 +299,7 @@ mod tests {
                 plugin: directory.path().join("missing.vst3"),
                 class_id: None,
                 state: None,
+                bypassed: false,
             }],
         )
         .unwrap()

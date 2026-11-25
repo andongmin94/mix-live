@@ -45,7 +45,7 @@ impl PluginArgs {
         let effects = match &self.vst3_chain {
             Some(path) => ChainFile::read(path)?.effects,
             None => self.vst3.iter().map(|path| Ok(EffectSpec {
-                plugin: std::path::absolute(path).map_err(|e| e.to_string())?, class_id: None, state: None,
+                plugin: std::path::absolute(path).map_err(|e| e.to_string())?, class_id: None, state: None, bypassed: false,
             })).collect::<Result<Vec<_>, String>>()?,
         };
         ResolvedPlugins::new(effects, self.vst3_editor.clone(), self.vst3_chain_out.clone())
@@ -101,6 +101,8 @@ pub struct EffectSpec {
     pub plugin: PathBuf,
     pub class_id: Option<String>,
     pub state: Option<Vec<u8>>,
+    /// Explicit host-side, latency-aligned comparison; the plugin still processes.
+    pub bypassed: bool,
 }
 
 pub(crate) fn validate_effects(effects: &[EffectSpec]) -> Result<(), String> {
@@ -126,7 +128,7 @@ pub(crate) struct ChainFile {
 }
 impl ChainFile {
     fn validate(&self) -> Result<(), String> {
-        if self.schema != 1 { return Err("unsupported MixLive VST3 chain schema".into()); }
+        if self.schema != 2 { return Err("unsupported MixLive VST3 chain schema".into()); }
         if self.effects.is_empty() { return Err("a VST3 chain needs at least one effect".into()); }
         validate_effects(&self.effects)
     }
@@ -195,7 +197,7 @@ mod tests {
 
     #[test]
     fn scene_chain_is_authoritative_and_editor_selection_uses_its_slots() {
-        let effects = vec![EffectSpec { plugin: "effect.vst3".into(), class_id: None, state: None }];
+        let effects = vec![EffectSpec { plugin: "effect.vst3".into(), class_id: None, state: None, bypassed: false }];
         let args = PluginArgs { vst3_editor: vec![1], ..PluginArgs::default() };
         let setup = args.resolve_scene(effects.clone()).unwrap();
         assert_eq!(setup.effects, effects);
@@ -214,9 +216,9 @@ mod tests {
     fn chain_files_keep_independent_states_relative_paths_and_never_overwrite() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("보컬 체인.json");
-        let first = EffectSpec { plugin: "effect.vst3".into(), class_id: Some("0123456789ABCDEF0123456789abcdef".into()), state: Some(vec![1, 2]) };
-        let second = EffectSpec { state: Some(vec![3, 4]), ..first.clone() };
-        let chain = ChainFile { schema: 1, effects: vec![first, second] };
+        let first = EffectSpec { plugin: "effect.vst3".into(), class_id: Some("0123456789ABCDEF0123456789abcdef".into()), state: Some(vec![1, 2]), bypassed: false };
+        let second = EffectSpec { state: Some(vec![3, 4]), bypassed: true, ..first.clone() };
+        let chain = ChainFile { schema: 2, effects: vec![first, second] };
         chain.save_new(&path).unwrap();
         let original = std::fs::read(&path).unwrap();
         assert!(chain.save_new(&path).unwrap_err().contains("already exists"));
@@ -225,6 +227,7 @@ mod tests {
         assert_eq!(loaded.effects[0].plugin, path.canonicalize().unwrap().parent().unwrap().join("effect.vst3"));
         assert_eq!(loaded.effects[0].state.as_deref(), Some([1, 2].as_slice()));
         assert_eq!(loaded.effects[1].state.as_deref(), Some([3, 4].as_slice()));
+        assert!(!loaded.effects[0].bypassed && loaded.effects[1].bypassed);
         let args = PluginArgs { vst3_chain: Some(path.clone()), vst3_editor: vec![2], ..PluginArgs::default() };
         assert_eq!(args.resolve().unwrap().effects, loaded.effects);
         let args = PluginArgs { vst3_chain_out: Some(path), ..args };
@@ -236,13 +239,16 @@ mod tests {
     fn malformed_chain_files_are_rejected_without_loading_plugins() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("chain.json");
-        for document in [json!({"schema": 99, "effects": [{"plugin": "effect.vst3"}]}),
-            json!({"schema": 1, "effects": []}),
-            json!({"schema": 1, "effects": [{"plugin": ""}]}),
-            json!({"schema": 1, "effects": [{"plugin": "x", "class_id": "wrong"}]}),
-            json!({"schema": 1, "effects": [{"plugin": "x", "state": [1]}]}),
-            json!({"schema": 1, "effects": [{"plugin": "x", "typo": true}]}),
-            json!({"schema": 1, "effects": [{"plugin": "x"}], "typo": true})] {
+        for document in [json!({"schema": 99, "effects": [{"plugin": "effect.vst3", "bypassed": false}]}),
+            json!({"schema": 1, "effects": [{"plugin": "x", "bypassed": false}]}),
+            json!({"schema": 2, "effects": []}),
+            json!({"schema": 2, "effects": [{"plugin": "", "bypassed": false}]}),
+            json!({"schema": 2, "effects": [{"plugin": "x", "class_id": "wrong", "bypassed": false}]}),
+            json!({"schema": 2, "effects": [{"plugin": "x", "state": [1], "bypassed": false}]}),
+            json!({"schema": 2, "effects": [{"plugin": "x", "bypassed": false, "typo": true}]}),
+            json!({"schema": 2, "effects": [{"plugin": "x", "bypassed": false}], "typo": true}),
+            json!({"schema": 2, "effects": [{"plugin": "x"}]}),
+            json!({"schema": 2, "effects": [{"plugin": "x", "bypassed": 1}]})] {
             std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
             assert!(ChainFile::read(&path).is_err(), "accepted {document}");
         }

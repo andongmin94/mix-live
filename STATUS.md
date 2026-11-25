@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **가상 장치 개발 패키지 빌드 완료 · 라이브 소스 trim 추가**
+단계: **가상 장치 개발 패키지 빌드 완료 · 라이브 소스 trim 및 VST3 슬롯 우회 추가**
 
 ## 현재 구현
 
@@ -34,22 +34,26 @@
   10 ms sample ramp로 조절한다. zero strength/mix에서도 준비된 DSP 상태를 갱신한다.
   pre-delay와 프리셋은 정지 상태에서만 변경한다. off 프리셋의 EQ/다이내믹스 파라미터는 비활성이다.
   AUX/앱은 영향을 받지 않는다. 보컬은 한 번만 처리하고 mute는 잔향을 포함해 적용한다.
+- VST3 슬롯마다 명시적 host bypass: 신고 지연만큼 정렬한 dry를 5 ms ramp로 교차 전환한다.
+  같은 효과 인스턴스를 계속 처리하며 다른 슬롯과 PDC를 유지한다. 총 신고 지연 상한은 2초다.
+  GPUI 실행 중/정지 설정 및 CLI `bypass N on|off`에서 조절하고 Scene/체인에 저장한다.
+  음량 일치·CPU 절감·오류 시 dry fallback은 아니다.
 - 실행 중 VST3 원본 창은 슬롯별 열기/닫기/재열기. 같은 실제 인스턴스를 유지하며, GPUI가
   메시지 루프를 소유한다. 창 조작과 native poll은 GPUI 변경 참조 밖에서 수행한다.
 - 정지 후 새 Scene 저장은 장치 중지 → 앱 capture thread join → VST3 worker join → 모든
   상태 수집 → 새 파일 게시를 사용한다. 실행 중 모든 소스/출력 mute·route·gain, 보컬 파라미터와 VST3 상태를
   다음 시작 전에 복원한다. 일반 정지/닫기/오류는 저장하지 않으며 파일 덮어쓰기 없음.
-  schema 8은 `route.apps` 배열(실행 파일 경로와 슬롯별 설정), 방송 장치·채널·감쇠와 각 믹스의 상태 및 리버브 설정을 저장하고 PID나 잔향 버퍼는 저장하지 않는다.
+  schema 9는 슬롯별 `bypassed`와 `route.apps` 배열(실행 파일 경로와 슬롯별 설정), 방송 장치·채널·감쇠와 각 믹스의 상태 및 리버브 설정을 저장하고 PID나 잔향 버퍼는 저장하지 않는다.
   CLI의 직접 `run`/`scene run --scene-out`도 같은 전체 snapshot을 정상 정지 후 새 파일에 저장한다.
   종료 시 console 명령을 닫아 늦은 입력이 snapshot을 바꾸지 못하게 한다. 기존 파일·chain-out 동시 요청은
-  시작 전에 거절하고 schema 8은 유지한다.
-  schema 1~7, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
+  시작 전에 거절한다. VST3 chain schema는 2이며 bypassed는 필수다.
+  Scene schema 1~8 및 chain schema 1, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
   `appN` 제어 명령을 사용한다.
 
 - `drivers/virtual-audio/`에 고정 Call/Broadcast/Return PnP 하드웨어 ID와 독립 render/capture
   WaveRT miniport를 추가했다. Cableloom의 MIT 고지를 보존한 C++ WDK 경계이며 별도 관리자·IOCTL은 없다.
   48 kHz stereo PCM32, 96-frame 고정 FIFO, QPC 기반 clock, RUN 경계 초기화와 부재 시 무음/폐기를
-  제공한다. Rust 오디오/DSP/VST3/Scene schema 8은 변경하지 않았다. 설치된 render ID만 기존 WASAPI에서
+  제공한다. 드라이버는 Rust 오디오/DSP/VST3/Scene 형식과 독립이다. 설치된 render ID만 기존 WASAPI에서
   선택할 수 있으며 실제 endpoint 노출은 아직 미검증이다.
   Return은 외부 앱/DAW의 render→capture→기존 AUX를 위한 별도 장치이며 실제 앱에서 선택·수신한 결과는 미검증이다.
   Return과 같은 앱의 process loopback 중복 캡처, Return으로의 자기 송출은 사용하지 않는다.
@@ -76,8 +80,9 @@
   검증하지 않았다.
 - [Audio #38](https://github.com/andongmin94/mix-live/actions/runs/45571558178) 성공:
   `9817ec6`의 CLI 전체 Scene snapshot/종료 입력 차단을 포함한 Windows 통합 검사 통과.
-- 라이브 AUX/앱 trim: stereo ramp, 지연 이전 적용, raw meter 및 snapshot/입력 검증 회귀 테스트를
-  추가했다. 변경된 Rust/GPUI의 Audio CI 결과는 아직 확인하지 않았다.
+- 라이브 AUX/앱 trim과 VST3 슬롯 우회: source trim·지연 이전 적용·raw meter·snapshot 검증,
+  지연 정렬 dry/ramp·native gain fixture·슬롯별 상태·Scene 편집/재정렬 회귀 검사를 추가했다.
+  변경 묶음의 Windows Audio CI 결과는 아직 확인하지 않았다.
 
 ## 남은 작업과 제한
 

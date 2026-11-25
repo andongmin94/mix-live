@@ -1,6 +1,6 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
 use super::{ChainFile, EffectSpec, ResolvedPlugins};
-use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}, config::MAX_APPS};
+use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}, config::MAX_APPS, control::{GainRamp, LiveControls}};
 use mixlive_vst3::editor::flush_editor_changes;
 use rtrb::{Producer, RingBuffer};
 use std::{path::Path, sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
@@ -49,8 +49,65 @@ impl CaptureSink {
     }
 }
 
-struct Slot { plugin: Arc<Mutex<Plugin>>, editor: Option<PluginWindow> }
-struct Processor { plugin: Arc<Mutex<Plugin>>, buffers: BusAudioBuffers }
+struct Slot {
+    plugin: Arc<Mutex<Plugin>>,
+    editor: Option<PluginWindow>,
+    bypassed: Arc<AtomicBool>,
+}
+
+// Always advance the aligned dry history, even when listening to the wet path.
+// No processing instance, buffer allocation or topology change during a comparison.
+struct DryBlend {
+    delay: Vec<[f32; 2]>,
+    cursor: usize,
+    samples: [[f32; 2]; CAPTURE_BLOCK],
+    ramp: GainRamp,
+}
+impl DryBlend {
+    fn new(rate: u32, latency: usize, bypassed: bool) -> Self {
+        Self { delay: vec![[0.0; 2]; latency], cursor: 0, samples: [[0.0; 2]; CAPTURE_BLOCK],
+            ramp: GainRamp::new(rate, if bypassed { 1.0 } else { 0.0 }) }
+    }
+
+    fn prepare(&mut self, left: &[f32], right: &[f32]) {
+        for (sample, (&l, &r)) in self.samples.iter_mut().zip(left.iter().zip(right)) {
+            let input = [l, r];
+            if self.delay.is_empty() {
+                *sample = input;
+            } else {
+                *sample = std::mem::replace(&mut self.delay[self.cursor], input);
+                self.cursor = (self.cursor + 1) % self.delay.len();
+            }
+        }
+    }
+
+    fn mix(&mut self, left: &mut [f32], right: &mut [f32], bypassed: bool) {
+        self.ramp.set(if bypassed { 1.0 } else { 0.0 });
+        for ((l, r), dry) in left.iter_mut().zip(right).zip(&self.samples) {
+            let gain = self.ramp.next_gain();
+            if gain == 1.0 {
+                *l = dry[0]; *r = dry[1];
+            } else if gain != 0.0 {
+                *l = *l * (1.0 - gain) + dry[0] * gain;
+                *r = *r * (1.0 - gain) + dry[1] * gain;
+            }
+        }
+    }
+}
+
+struct Processor {
+    plugin: Arc<Mutex<Plugin>>,
+    buffers: BusAudioBuffers,
+    bypassed: Arc<AtomicBool>,
+    dry: DryBlend,
+}
+impl Processor {
+    fn new(plugin: Arc<Mutex<Plugin>>, buffers: BusAudioBuffers, bypassed: Arc<AtomicBool>,
+        rate: u32, latency: u32) -> Self {
+        let dry = DryBlend::new(rate, latency as usize, bypassed.load(Ordering::Relaxed));
+        Self { plugin, buffers, bypassed, dry }
+    }
+}
 
 /// Loaded/polled/dropped on the main thread. Join ONE processing thread before native teardown.
 /// Native crashes/hangs are not isolated; editor/control calls still share the plugin mutexes.
@@ -80,13 +137,14 @@ fn load_effect(spec: &EffectSpec, rate: u32) -> Result<Plugin, String> {
     Ok(plugin)
 }
 
-pub fn connect(capture: Capture, setup: &ResolvedPlugins, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>)
+pub fn connect(capture: Capture, setup: &ResolvedPlugins, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>, controls: &LiveControls)
     -> Result<(CaptureSink, Option<PluginWorker>), String> {
     setup.validate()?;
     if setup.effects.is_empty() { return Ok((CaptureSink::Direct(Box::new(capture)), None)); }
     // Selection was resolved once, from CLI/chain or an embedded scene. Native loading happens here.
     let plugins = setup.effects.iter().enumerate().map(|(index, spec)| {
-        load_effect(spec, rate).map_err(|e| format!("VST3 slot {}: {e}", index + 1))
+        let plugin = load_effect(spec, rate).map_err(|e| format!("VST3 slot {}: {e}", index + 1))?;
+        Ok::<_, String>((plugin, controls.effect_flag(index)?.clone()))
     }).collect::<Result<Vec<_>, _>>()?;
     let (input, mut worker) = spawn(capture, plugins, rate, queue_ms, has_aux, health)?;
     for &index in &setup.editors {
@@ -108,6 +166,8 @@ fn open_editor(plugin: Arc<Mutex<Plugin>>) -> Result<PluginWindow, String> {
 fn process_chain(processors: &mut [Processor], left: &mut [f32], right: &mut [f32]) -> bool {
     let frames = left.len();
     for processor in processors {
+        let bypassed = processor.bypassed.load(Ordering::Relaxed);
+        processor.dry.prepare(left, right);
         let buffers = &mut processor.buffers;
         buffers.block_size = frames;
         buffers.clear();
@@ -119,11 +179,13 @@ fn process_chain(processors: &mut [Processor], left: &mut [f32], right: &mut [f3
         right.copy_from_slice(&buffers.outputs[0].channels[1][..frames]);
         // An invalid intermediate stage must not be concealed by a later effect.
         if !left.iter().chain(right.iter()).all(|s| s.is_finite()) { return false; }
+        processor.dry.mix(left, right, bypassed);
+        if !left.iter().chain(right.iter()).all(|s| s.is_finite()) { return false; }
     }
     true
 }
 
-fn spawn(mut capture: Capture, plugins: Vec<Plugin>, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>)
+fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>)
     -> Result<(QueuedInput, PluginWorker), String> {
     if plugins.is_empty() || !(8_000..=192_000).contains(&rate) || !(10..=100).contains(&queue_ms) {
         return Err("invalid VST3 chain/rate/queue capacity".into());
@@ -135,7 +197,7 @@ fn spawn(mut capture: Capture, plugins: Vec<Plugin>, rate: u32, queue_ms: u32, h
         stopped: false, health: health.clone(), description: String::new() };
     let mut processors = Vec::new();
     let mut total_latency = 0_u64;
-    for (index, mut plugin) in plugins.into_iter().enumerate() {
+    for (index, (mut plugin, bypassed)) in plugins.into_iter().enumerate() {
         let layout = plugin.audio_bus_layout().map_err(|e| e.to_string())?;
         for buses in [&layout.inputs, &layout.outputs] {
             if buses.len() != 1 || !buses[0].active || buses[0].channel_count != 2 {
@@ -150,14 +212,19 @@ fn spawn(mut capture: Capture, plugins: Vec<Plugin>, rate: u32, queue_ms: u32, h
         // Read the report only after the final rate, state and processing activation.
         let latency = plugin.latency_samples();
         total_latency += u64::from(latency);
+        // The same two-second live compensation bound applies to all aligned dry paths.
+        if total_latency > u64::from(rate) * 2 {
+            let _ = plugin.stop_processing();
+            return Err("VST3 chain latency exceeds the supported 2-second live bypass/compensation bound".into());
+        }
         owner.description.push_str(&format!("VST3 slot {}: {} [{}]; reported latency {} samples.\n",
             index + 1, plugin.info().name, plugin.info().uid, latency));
         let plugin = Arc::new(Mutex::new(plugin));
-        processors.push(Processor { plugin: plugin.clone(), buffers });
-        owner.slots.push(Slot { plugin, editor: None });
+        processors.push(Processor::new(plugin.clone(), buffers, bypassed.clone(), rate, latency));
+        owner.slots.push(Slot { plugin, editor: None, bypassed });
     }
     let compensation = capture.prepare_vst3_delay(total_latency, rate)?;
-    owner.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOutgoing AUX/app send compensation: {compensation} samples ({:.2} ms); monitor adds no compensation. Only reported VST3 latency, not device or clock alignment.\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. No dry fallback or crash isolation. Restart requests stop the route.",
+    owner.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOutgoing AUX/app send compensation: {compensation} samples ({:.2} ms); monitor adds no compensation. Only reported VST3 latency, not device or clock alignment.\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. Explicit slot bypass blends with latency-aligned dry audio; effects still process. No automatic dry fallback or crash isolation. Restart requests stop the route.",
         processors.len(), total_latency, total_latency as f64 * 1000.0 / f64::from(rate),
         compensation as f64 * 1000.0 / f64::from(rate), capacity as f64 * 1000.0 / f64::from(rate)));
     let stop = owner.stop.clone();
@@ -182,7 +249,7 @@ fn spawn(mut capture: Capture, plugins: Vec<Plugin>, rate: u32, queue_ms: u32, h
 }
 
 /// Worker is already joined. Always attempt stop, including when the final flush fails.
-fn stop_and_snapshot(plugin: &mut Plugin, save: bool) -> Result<Option<EffectSpec>, String> {
+fn stop_and_snapshot(plugin: &mut Plugin, save: bool, bypassed: bool) -> Result<Option<EffectSpec>, String> {
     let flushed = if save { flush_editor_changes(plugin).map(|_| ()).map_err(|e| e.to_string()) } else { Ok(()) };
     let stopped = plugin.stop_processing().map_err(|e| e.to_string());
     flushed?;
@@ -192,7 +259,7 @@ fn stop_and_snapshot(plugin: &mut Plugin, save: bool) -> Result<Option<EffectSpe
         return Err("VST3 requested a restart during final state flush".into());
     }
     Ok(Some(EffectSpec { plugin: plugin.info().path.clone(), class_id: Some(plugin.info().uid.clone()),
-        state: Some(plugin.save_state().map_err(|e| e.to_string())?) }))
+        state: Some(plugin.save_state().map_err(|e| e.to_string())?), bypassed }))
 }
 
 impl PluginWorker {
@@ -271,7 +338,7 @@ impl PluginWorker {
                 self.health.fail(Fault::Routing); poisoned.into_inner()
             });
             if plugin.take_restart_flags() != Default::default() { self.health.fail(Fault::Routing); }
-            match stop_and_snapshot(&mut plugin, save && !self.health.failed()) {
+            match stop_and_snapshot(&mut plugin, save && !self.health.failed(), slot.bypassed.load(Ordering::Relaxed)) {
                 Ok(Some(effect)) => effects.push(effect),
                 Ok(None) => {},
                 Err(error) => {
@@ -282,7 +349,7 @@ impl PluginWorker {
         }
         if let Some(error) = first_error { return Err(error); }
         if let Some(error) = self.health.error() { return Err(error.into()); }
-        Ok(save.then_some(ChainFile { schema: 1, effects }))
+        Ok(save.then_some(ChainFile { schema: 2, effects }))
     }
 
     /// Devices have stopped. Return all slot states only after native teardown.

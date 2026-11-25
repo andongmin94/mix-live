@@ -188,11 +188,13 @@ mod tests {
                 plugin: PathBuf::from("not-installed.vst3"),
                 class_id: Some("0123456789ABCDEF0123456789abcdef".into()),
                 state: Some(vec![1, 2, 3]),
+                bypassed: false,
             },
             EffectSpec {
                 plugin: PathBuf::from("not-installed.vst3"),
                 class_id: Some("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF".into()),
                 state: Some(vec![4, 5]),
+                bypassed: true,
             },
         ]
     }
@@ -265,9 +267,9 @@ mod tests {
         let path = folder.join("voice.chain.json");
         std::fs::write(
             &path,
-            r#"{"schema":1,"effects":[
-            {"plugin":"relative.vst3","class_id":"0123456789ABCDEF0123456789abcdef","state":[7,8]},
-            {"plugin":"relative.vst3","class_id":"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF","state":[9]}
+            r#"{"schema":2,"effects":[
+            {"plugin":"relative.vst3","class_id":"0123456789ABCDEF0123456789abcdef","state":[7,8],"bypassed":false},
+            {"plugin":"relative.vst3","class_id":"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF","state":[9],"bypassed":true}
         ]}"#,
         )
         .unwrap();
@@ -284,13 +286,14 @@ mod tests {
         assert_eq!(draft.effects[2].plugin, expected_path);
         assert_eq!(draft.effects[1].state.as_deref(), Some([7, 8].as_slice()));
         assert_eq!(draft.effects[2].state.as_deref(), Some([9].as_slice()));
+        assert!(!draft.effects[1].bypassed && draft.effects[2].bypassed);
         assert!(!expected_path.exists());
 
         let before = draft.effects.clone();
         for invalid in [
             r#"{"schema":99,"effects":[{"plugin":"x.vst3"}]}"#,
-            r#"{"schema":1,"effects":[{"plugin":"x.vst3","state":[1]}]}"#,
-            r#"{"schema":1,"effects":[{"plugin":"x.vst3"},{"plugin":""}]}"#,
+            r#"{"schema":2,"effects":[{"plugin":"x.vst3","state":[1],"bypassed":false}]}"#,
+            r#"{"schema":2,"effects":[{"plugin":"x.vst3","bypassed":false},{"plugin":"","bypassed":false}]}"#,
         ] {
             std::fs::write(&path, invalid).unwrap();
             assert!(draft.append_chain(&path).is_err());

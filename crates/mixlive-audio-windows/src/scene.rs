@@ -23,7 +23,7 @@ impl AudioScene {
         // CLI paths refer to the current working directory, not a future scene directory.
         // absolute() does not require the plugin to be present or execute its native code.
         for effect in &mut effects { effect.plugin = std::path::absolute(&effect.plugin)?; }
-        Ok(Self { schema: 8, route, effects })
+        Ok(Self { schema: 9, route, effects })
     }
 
     /// Relative paths in a hand-authored scene are anchored to that scene, never the caller's cwd.
@@ -39,7 +39,7 @@ impl AudioScene {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != 8 { return Err("unsupported MixLive scene schema; create a schema 8 scene".into()); }
+        if self.schema != 9 { return Err("unsupported MixLive scene schema; create a schema 9 scene".into()); }
         self.route.validate()?;
         validate_effects(&self.effects)?;
         Ok(())
@@ -149,8 +149,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let chain_path = directory.path().join("original.chain.json");
         let first = EffectSpec { plugin: "not-installed.vst3".into(),
-            class_id: Some("0123456789ABCDEF0123456789abcdef".into()), state: Some(vec![1, 2]) };
-        ChainFile { schema: 1, effects: vec![first.clone(), EffectSpec { state: Some(vec![3, 4]), ..first }] }
+            class_id: Some("0123456789ABCDEF0123456789abcdef".into()), state: Some(vec![1, 2]), bypassed: false };
+        ChainFile { schema: 2, effects: vec![first.clone(), EffectSpec { state: Some(vec![3, 4]), bypassed: true, ..first }] }
             .save_new(&chain_path).unwrap();
         let effects = PluginArgs { vst3_chain: Some(chain_path.clone()), ..PluginArgs::default() }.resolve().unwrap().effects;
         let folder = directory.path().join("다른 폴더");
@@ -163,6 +163,7 @@ mod tests {
         let setup = PluginArgs { vst3_editor: vec![2], ..PluginArgs::default() }.resolve_scene(scene.effects).unwrap();
         assert_eq!(setup.effects[0].state.as_deref(), Some([1, 2].as_slice()));
         assert_eq!(setup.effects[1].state.as_deref(), Some([3, 4].as_slice()));
+        assert!(!setup.effects[0].bypassed && setup.effects[1].bypassed);
         assert_eq!(setup.effects[0].plugin, chain_path.parent().unwrap().canonicalize().unwrap().join("not-installed.vst3"));
         assert!(!setup.effects[0].plugin.exists()); // save/show/resolve did not load or require a DLL
         let mut document = serde_json::to_value(AudioScene::new(route(), effects).unwrap()).unwrap();
@@ -195,7 +196,7 @@ mod tests {
         let path = directory.path().join("invalid.mixlive-scene.json");
         let original = serde_json::to_value(AudioScene::new(route(), vec![]).unwrap()).unwrap();
         let mut cases = Vec::new();
-        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("schema", json!(7)), ("unknown", json!(true))] {
+        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("schema", json!(7)), ("schema", json!(8)), ("unknown", json!(true))] {
             let mut document = original.clone();
             document[key] = value;
             cases.push(document);
@@ -217,8 +218,9 @@ mod tests {
             document["route"][key] = value;
             cases.push(document);
         }
-        for effects in [json!([{"plugin": ""}]), json!([{"plugin": "x", "state": [1]}]),
-            json!([{"plugin": "x", "class_id": "wrong"}]), json!([{"plugin": "x", "typo": true}]), json!(null)] {
+        for effects in [json!([{"plugin": "", "bypassed": false}]), json!([{"plugin": "x", "state": [1], "bypassed": false}]),
+            json!([{"plugin": "x", "class_id": "wrong", "bypassed": false}]), json!([{"plugin": "x", "typo": true, "bypassed": false}]),
+            json!([{"plugin": "x"}]), json!([{"plugin": "x", "bypassed": 1}]), json!(null)] {
             let mut document = original.clone();
             document["effects"] = effects;
             cases.push(document);

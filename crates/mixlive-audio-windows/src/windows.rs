@@ -75,7 +75,7 @@ pub struct Prepared {
     output_gain_db: f32,
     mix_gains_db: [f32; MAX_MIXES],
     queue_ms: u32,
-    controls: Arc<LiveControls>,
+    controls: LiveControls,
     outputs: Vec<OutputEndpoint>,
 }
 
@@ -154,7 +154,7 @@ impl Prepared {
         Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal,
             auxiliary, apps,
             output_gain_db: options.output_gain_db, mix_gains_db: [options.monitor_gain_db, options.send_gain_db, options.broadcast_gain_db],
-            queue_ms: options.queue_ms, controls: Arc::new(LiveControls::from_route(options)?), outputs })
+            queue_ms: options.queue_ms, controls: LiveControls::from_route(options)?, outputs })
     }
 
     pub fn describe(&self) -> String {
@@ -186,7 +186,9 @@ impl Prepared {
     pub fn start(self, plugin: &ResolvedPlugins) -> Result<Active> {
         plugin.validate()?;
         let health = Arc::new(Health::default());
-        let controls = self.controls;
+        let mut controls = self.controls;
+        controls.prepare_effects(plugin.effects.iter().map(|effect| effect.bypassed));
+        let controls = Arc::new(controls);
         let mut streams = Vec::new();
         let mut writers = Vec::new();
         let mut stats = Vec::new();
@@ -248,7 +250,7 @@ impl Prepared {
         }
         let capture = Capture::new(self.vocal, self.input_config.sample_rate(), writers, health.clone(), controls.clone())?;
         let vocal_stats = capture.vocal_stats.clone();
-        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, controls.has_aux(), health.clone())?;
+        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, controls.has_aux(), health.clone(), &controls)?;
         if let Some(worker) = &plugin_worker { timing.push(worker.description.clone()); }
         let format = self.input_config.sample_format();
         let config = self.input_config.config();

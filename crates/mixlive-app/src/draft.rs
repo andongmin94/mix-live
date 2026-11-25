@@ -338,11 +338,13 @@ mod tests {
                     plugin: "not-installed.vst3".into(),
                     class_id: Some("0123456789ABCDEF0123456789ABCDEF".into()),
                     state: Some(vec![1, 2]),
+                    bypassed: false,
                 },
                 EffectSpec {
                     plugin: "not-installed.vst3".into(),
                     class_id: Some("FEDCBA9876543210FEDCBA9876543210".into()),
                     state: Some(vec![3, 4]),
+                    bypassed: true,
                 },
             ],
         )

@@ -215,6 +215,7 @@ impl SoundEditor {
         }
         for (index, effect) in self.draft.effects.iter().enumerate() {
             let slot = index + 1;
+            let bypass_label = if effect.bypassed { "우회 끄기" } else { "우회 켜기" };
             let name = effect
                 .plugin
                 .file_name()
@@ -295,8 +296,18 @@ impl SoundEditor {
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .whitespace_normal()
-                            .child(format!("{class} · {state}")),
-                    ),
+                            .child(format!("{class} · {state} · {}", if effect.bypassed { "우회" } else { "효과 적용" })),
+                    )
+                    .child(button(("slot-bypass", index), bypass_label, false)
+                        .accessibility_label(format!("VST3 {slot} {bypass_label}"))
+                        .disabled(disabled)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if this.is_busy() { return; }
+                            if let Some(effect) = this.draft.effects.get_mut(index) {
+                                effect.bypassed = !effect.bypassed;
+                                cx.notify();
+                            }
+                        }))),
             );
         }
         chain.child(div().text_xs().text_color(rgb(MUTED))

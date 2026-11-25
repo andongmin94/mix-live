@@ -99,9 +99,9 @@ fn cli_packs_chain_states_and_rejects_overrides_before_device_access() {
     let directory = tempfile::tempdir().unwrap();
     let source = directory.path().join("original.chain.json");
     let id = "0123456789ABCDEF0123456789ABCDEF";
-    std::fs::write(&source, serde_json::to_vec(&json!({"schema": 1, "effects": [
-        {"plugin": "absent.vst3", "class_id": id, "state": [1,2]},
-        {"plugin": "absent.vst3", "class_id": id, "state": [3,4]}
+    std::fs::write(&source, serde_json::to_vec(&json!({"schema": 2, "effects": [
+        {"plugin": "absent.vst3", "class_id": id, "state": [1,2], "bypassed": false},
+        {"plugin": "absent.vst3", "class_id": id, "state": [3,4], "bypassed": true}
     ]})).unwrap()).unwrap();
     let folder = directory.path().join("다른 저장 폴더");
     std::fs::create_dir(&folder).unwrap();
@@ -115,6 +115,7 @@ fn cli_packs_chain_states_and_rejects_overrides_before_device_access() {
     assert_eq!(scene.effects.len(), 2);
     assert_eq!(scene.effects[0].state.as_deref(), Some([1,2].as_slice()));
     assert_eq!(scene.effects[1].state.as_deref(), Some([3,4].as_slice()));
+    assert!(!scene.effects[0].bypassed && scene.effects[1].bypassed);
     assert_eq!(scene.effects[0].plugin, directory.path().canonicalize().unwrap().join("absent.vst3"));
     let shown = command().args(["scene", "show"]).arg(&path).output().unwrap();
     assert!(shown.status.success());
@@ -139,7 +140,7 @@ fn cli_packs_chain_states_and_rejects_overrides_before_device_access() {
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     let scene = AudioScene::read(&listed).unwrap();
     assert_eq!(scene.effects.iter().map(|effect| effect.plugin.file_name().unwrap().to_str().unwrap()).collect::<Vec<_>>(), ["eq.vst3", "reverb.vst3"]);
-    assert!(scene.effects.iter().all(|effect| effect.plugin.is_absolute() && effect.state.is_none()));
+    assert!(scene.effects.iter().all(|effect| effect.plugin.is_absolute() && effect.state.is_none() && !effect.bypassed));
 }
 
 #[test]

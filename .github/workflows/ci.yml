@@ -106,6 +106,8 @@ jobs:
           MIXLIVE_UI_REVERB_PREDELAY: '리버브 pre-delay'
           MIXLIVE_UI_BLEND: '보컬 보정 비율'
           MIXLIVE_UI_MOVE_SECOND: 'VST3 2 위로'
+          MIXLIVE_UI_BYPASS_SECOND_ON: 'VST3 2 우회 켜기'
+          MIXLIVE_UI_BYPASS_SECOND_OFF: 'VST3 2 우회 끄기'
           MIXLIVE_UI_WORKSPACE: 'Scene 작업 영역'
         run: |
           Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
@@ -235,7 +237,7 @@ jobs:
           $savedPath = Join-Path $sceneDirectory 'Edited scene.mixlive-scene.json'
           $pluginPath = Join-Path $sceneDirectory 'not-installed.vst3'
           $scene = [ordered]@{
-            schema = 8
+            schema = 9
             route = [ordered]@{
               input = 'ci-absent-mic'; input_channel = 2
               aux_input = 'ci-absent-aux'; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
@@ -257,8 +259,8 @@ jobs:
               }
             }
             effects = @(
-              [ordered]@{ plugin = $pluginPath; class_id = '0123456789ABCDEF0123456789ABCDEF'; state = @(1, 2) },
-              [ordered]@{ plugin = $pluginPath; class_id = 'FEDCBA9876543210FEDCBA9876543210'; state = @(3, 4) }
+              [ordered]@{ plugin = $pluginPath; class_id = '0123456789ABCDEF0123456789ABCDEF'; state = @(1, 2); bypassed = $false },
+              [ordered]@{ plugin = $pluginPath; class_id = 'FEDCBA9876543210FEDCBA9876543210'; state = @(3, 4); bypassed = $false }
             )
           }
           [IO.File]::WriteAllText($originalPath, ($scene | ConvertTo-Json -Depth 10), [Text.UTF8Encoding]::new($false))
@@ -347,6 +349,8 @@ jobs:
             Set-UiValue $env:MIXLIVE_UI_TRIM '3.5'
             if ((Read-UiValue $env:MIXLIVE_UI_REVERB) -cne '0.125') { throw 'Saved reverb was not loaded' }
             Set-UiValue $env:MIXLIVE_UI_REVERB '0.25'
+            Invoke-UiName $env:MIXLIVE_UI_BYPASS_SECOND_ON
+            $null = Wait-UiName $env:MIXLIVE_UI_BYPASS_SECOND_OFF -Enabled
             Invoke-UiName $env:MIXLIVE_UI_MOVE_SECOND
             Invoke-UiName $env:MIXLIVE_UI_CANCEL
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
@@ -363,6 +367,8 @@ jobs:
             Set-UiValue $env:MIXLIVE_UI_REVERB '0.375'
             Set-UiValue $env:MIXLIVE_UI_REVERB_DECAY '2.5'
             Set-UiValue $env:MIXLIVE_UI_REVERB_PREDELAY '25'
+            Invoke-UiName $env:MIXLIVE_UI_BYPASS_SECOND_ON
+            $null = Wait-UiName $env:MIXLIVE_UI_BYPASS_SECOND_OFF -Enabled
             Invoke-UiName $env:MIXLIVE_UI_MOVE_SECOND
             Invoke-UiName $env:MIXLIVE_UI_SAVE
 
@@ -415,7 +421,7 @@ jobs:
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
             if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
             $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json
-            if ($saved.schema -ne 8 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5 -or
+            if ($saved.schema -ne 9 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5 -or
                 $saved.route.reverb_mix -ne 0.375 -or $saved.route.reverb_decay_secs -ne 2.5 -or $saved.route.reverb_predelay_ms -ne 25) {
               throw 'The saved Scene did not contain the edited vocal values'
             }
@@ -448,6 +454,7 @@ jobs:
             for ($slot = 0; $slot -lt 2; $slot++) {
               $expected = $scene.effects[1 - $slot]
               $actual = $saved.effects[$slot]
+              if ($actual.bypassed -ne ($slot -eq 0)) { throw "Reordering VST3 slots lost the edited bypass state at slot $slot" }
               if ([IO.Path]::GetFullPath($actual.plugin) -ne [IO.Path]::GetFullPath($expected.plugin) -or
                   $actual.class_id -cne $expected.class_id -or ($actual.state -join ',') -cne ($expected.state -join ',')) {
                 throw "Reordering VST3 slots lost the matching path/class/state at slot $slot"

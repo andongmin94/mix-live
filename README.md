@@ -51,7 +51,7 @@ AUX를 통화 또는 방송으로 보내려면 해당 출력 장치도 선택해
 내장 보정 `off/natural/warm/bright`를 고를 수 있으며, 새 Scene의 초기값은 출력 −18 dB,
 AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. 전체/모니터/통화/방송/AUX 시작 음량과
 queue 목표, 입력 trim, 보정 비율, 컴프레서/디에서 threshold, 리버브 비율/잔향/pre-delay와 VST3 순서를 저장 전에 바꿀 수 있다.
-저장은 기존 schema 8의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
+저장은 기존 schema 9의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
 이전 Scene 선택을 유지한다. 장치와 현재 설정은 실제 시작 때 다시 검사한다.
 
 기존 체인은 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작**으로 실행한다.
@@ -107,11 +107,14 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 
 실행 중 **정지 후 새 Scene 저장**을 선택하면 파일명 선택을 취소할 때는 오디오를 계속 실행하고,
 확정하면 장치 중지 → worker join → 모든 VST3 슬롯 상태 수집 → 새 Scene 저장을 수행한다.
-저장된 전체/믹스별 음량, AUX/앱 입력 trim, 소스·출력·전체 mute, 모든 경로의 연결·gain, 라이브 보컬 파라미터와 VST3 상태는 다음 명시적 시작부터
+저장된 전체/믹스별 음량, AUX/앱 입력 trim, 소스·출력·전체 mute, 모든 경로의 연결·gain, 라이브 보컬 파라미터와 VST3 우회·상태는 다음 명시적 시작부터
 적용된다. 초기 mute는 스트림 시작 전에 복원한다. 오류·상태 수집 실패·기존 파일 충돌 시 이전 Scene 선택을
 유지하고 새 파일을 게시하지 않는다. 일반 정지/창 닫기는 저장하지 않는다.
 장치·출력, EQ/다이내믹스 프리셋, 리버브 pre-delay 및 VST3 체인 순서 편집은 정지 상태에서만 제공한다.
-실행 중 보컬 체인의 각 VST3 슬롯에서 **원본 창 열기/닫기**를 선택할 수 있다. 기존 라이브
+실행 중 보컬 체인의 각 VST3 슬롯에서 **우회 켜기/끄기** 및 **원본 창 열기/닫기**를 선택할 수 있다.
+우회는 해당 슬롯의 신고 지연만큼 정렬한 dry 신호로 약 5 ms 교차 전환한다. 다른 슬롯과 PDC는
+유지하며 모든 native 효과는 계속 처리한다(CPU 절감이나 음량 일치 A/B가 아니다).
+총 신고 지연이 2초를 넘는 체인은 시작을 거절한다. 정지한 보컬 설정에서도 우회 시작값을 변경할 수 있다. 기존 라이브
 인스턴스의 네이티브 편집창이며 별도 검사 인스턴스가 아니다. 닫았다 다시 열어도 파라미터와
 체인 순서를 유지한다. 원본 창의 닫기 버튼도 다음 상태 확인에서 반영한다. 편집창이 없는
 플러그인은 오류를 표시하며 해당 요청만 거절한다. GPUI가 메시지 루프를 소유하고 native
@@ -232,7 +235,7 @@ off여도 리버브 비율이 0보다 크면 리버브가 동작한다. 보정 �
 
 ## 장치·보컬·VST3를 Scene 하나로 재실행
 
-**Scene schema 8**는 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
+**Scene schema 9**는 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state·bypassed를
 한 파일에 담는다. 기존 체인을 넣으면 상태 바이트를 복사하므로 원래 체인 JSON은 재실행에
 필요하지 않다. 플러그인 DLL과 외부 샘플/라이선스 등은 여전히 설치되어 있어야 한다.
 
@@ -253,7 +256,7 @@ off여도 리버브 비율이 0보다 크면 리버브가 동작한다. 보정 �
 슬롯별 `--vst3-editor`와 정상 종료의 `--vst3-chain-out <새 파일>`은 실행 시 지정할 수 있다.
 Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또는 `scene run`에서
 `--scene-out <새 파일>`을 지정하면 정상 정지(시간 제한, stop, EOF) 후 GUI와 같은
-전체 Scene snapshot을 저장한다. 믹서·라이브 보컬 설정·모든 VST3 상태를 schema 8에 담으며,
+전체 Scene snapshot을 저장한다. 믹서·라이브 보컬 설정·모든 VST3 상태를 schema 9에 담으며,
 장치나 플러그인이 오류로 중단되면 파일을 게시하지 않는다. 기존 파일 또는 존재하지 않는
 상위 폴더는 시작 전에 거절하고, 종료 시점의 파일 충돌도 덮어쓰지 않는다.
 전체 Scene과 체인만 내보내기를 동시에 요청할 수 없다. 옵션이 없으면 실행 중 변경을 저장하지 않는다.
@@ -263,7 +266,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또�
 ```
 
 상대 경로는 들어 있던 chain/scene 파일 기준으로 해석한다. CLI에서 지정한 경로는 현재 작업
-폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~7는 읽지 않으며 현재 옵션으로
+폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~8은 읽지 않으며 현재 옵션으로
 다시 저장한다. 마이그레이션/누락값 복구는 없다. Scene에는 개인 장치 ID와 플러그인 상태가
 포함되므로 공개하지 않는다. `*.mixlive-scene.json`은 Git에서 제외한다.
 
@@ -279,6 +282,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또�
 | `route aux send off` | 두 번째 믹스의 MR만 제외 |
 | `level aux send -6`, `level mic output -9` | 지정 경로만 추가 감쇠 -96..0 dB |
 | `trim aux -12`, `trim app1 -6` | AUX/앱 전체 입력 trim -96..0 dB |
+| `bypass 1 on`, `bypass 1 off` | 1번 VST3 슬롯의 지연 정렬 우회/효과 적용 |
 | `vocal trim -3`, `vocal strength 0.75` | 입력 trim(dB) / EQ·다이내믹스 blend(0..1) |
 | `vocal compressor -28`, `vocal deesser -35` | threshold(-60..0 dBFS) |
 | `vocal reverb 0.15`, `vocal decay 1.5` | room blend(0..1) / 명목 잔향 시간(0.2..5초) |
@@ -315,11 +319,12 @@ CLI는 시작 시 지정한 창만 연다. 실행 중 재열기는 GPUI 앱에�
 editor 제거→마지막 편집 flush/processing stop→state 취득→native 해제→파일 게시 순서다.
 어느 슬롯이든 실패하면 부분 파일을 게시하지 않는다. 오류·restart·암묵적 Drop에서는 저장하지 않는다.
 
-체인 JSON은 아래처럼 작성할 수도 있다. `class_id`/`state`는 생략 가능하나 state가 있으면
+체인 JSON schema 2는 아래처럼 작성할 수도 있다. `bypassed`는 필수이며 schema 1은 읽지 않는다.
+`class_id`/`state`는 생략 가능하나 state가 있으면
 32자리 hexadecimal class ID가 필요하다. 저장 snapshot에는 절대 경로와 확인된 class가 들어간다.
 
 ```json
-{"schema": 1, "effects": [{"plugin": "plugins/EQ.vst3"}, {"plugin": "plugins/Reverb.vst3"}]}
+{"schema": 2, "effects": [{"plugin": "plugins/EQ.vst3", "bypassed": false}, {"plugin": "plugins/Reverb.vst3", "bypassed": false}]}
 ```
 
 이전 단일 플러그인 launch 옵션 `--vst3-state`, `--vst3-class`, `--vst3-state-out`은 제거했다.

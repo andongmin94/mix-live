@@ -814,6 +814,9 @@ impl MixLive {
                 .unwrap_or(effect.plugin.as_os_str())
                 .to_string_lossy()
                 .into_owned();
+            let bypassed = self.session.controls().map_or(effect.bypassed, |controls| {
+                controls.effect_bypassed(index).expect("configured live VST3 slot")
+            });
             sound = sound.child(
                 div()
                     .flex()
@@ -841,6 +844,19 @@ impl MixLive {
                                     "플러그인 기본 시작 상태"
                                 },
                             ))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                if bypassed { "우회 · 지연 유지" } else { "효과 적용" },
+                            ))
+                            .children(self.session.running().then(|| {
+                                let label = if bypassed { "우회 끄기" } else { "우회 켜기" };
+                                button(("vst3-bypass", index), label, false)
+                                    .accessibility_label(format!("VST3 {} {label}", index + 1))
+                                    .disabled(self.busy.is_some() || self.picking)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        let _ = this.session.apply(LiveCommand::EffectBypass { index, bypassed: !bypassed });
+                                        cx.notify();
+                                    }))
+                            }))
                             .children(self.session.running().then(|| {
                                 let open = !self.session.editor_is_open(index);
                                 let label = if open { "원본 창 열기" } else { "원본 창 닫기" };
