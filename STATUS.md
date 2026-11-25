@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-26
-단계: **실행 중 물리 AUX 추가·교체·삭제 구현 · Windows 통합 검증 대기**
+단계: **실행 중 물리 AUX 추가·교체·삭제 검증 완료 · main 병합**
 
 ## 현재 구현
 
@@ -134,15 +134,18 @@
 
 ## 검증
 
-- 이번 AUX 변경은 로컬 scoped 검사 39개가 통과했다: capture 24, control 13,
-  AUX fault 전달 1, UI 선택 검증 1. 이전 소스의 PDC 폐기, 진행 중 mic pitch/app ramp·PDC
-  보존, AUX 없음/있음에 따른 후속 delay 준비, 현재 mixer snapshot과 fresh add reset을 확인했다.
-  Windows worker/native fixture와 실제 GPUI 파일 흐름은 통합 CI에서 검증할 예정이다.
-- 직전 main의 [Audio #59](https://github.com/andongmin94/mix-live/actions/runs/45645735079) `359cc26` 전체 성공:
-  Windows workspace 검사 151개와 실제 native VST3 fixture 검사 13개, 총 **164개 성공**.
+- [Audio #63](https://github.com/andongmin94/mix-live/actions/runs/45652215464) `6b971b0` 전체 성공:
+  Windows workspace 검사 161개와 실제 native VST3 fixture 검사 14개, 총 **175개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
-  PR #7의 실제 병합 tree가 검증한 source tree와 동일함을 확인했다.
+  PR #8의 실제 병합 tree가 검증한 source tree와 동일함을 확인했다.
+- 물리 AUX 추가·삭제 중 app의 진행 중 음량 ramp·PDC와 실제 mic pitch impulse 이력을
+  기준 출력과 비교했다. AUX 교체의 이전 지연 샘플 폐기·mixer/ramp 유지, 새 AUX 기본값,
+  승인 후 게시, 현재/비활성 mixer snapshot과 후속 pitch/VST delay 준비를 확인했다.
+  Windows worker는 준비 실패 거절, 현재 독립 입력의 idle 오류 전파, 제거한 입력의 늦은 오류
+  차단 및 1..256채널의 공유 tag/generation을 검사했다. 실제 gain VST3 fixture에서 이전 tag의
+  대기 샘플/NaN을 폐기하고, 동일 VST3 인스턴스·파라미터·앱을 유지하면서 새 독립 AUX를
+  두 믹스에 더하는 실제 sample 결과를 확인했다. 실장비/실행 중 AUX GUI 전환은 미검증이다.
 - 앱 삭제 중 남은 앱과 AUX의 부분 trim/mute/send ramp·PDC 이력, 전체 삭제 후 새 앱의
   초기 상태, 반복 편집 중 pitch·EQ/다이내믹스·리버브·에코의 기준 출력 일치를 확인했다.
   기존 clock bridge의 샘플 출력과 control/peak 정체성, 승인 후 게시, 새 목록 저장,
@@ -163,7 +166,7 @@
   파라미터의 인스턴스 동일성·순서 유지, 잘못된 경로/레이아웃/인덱스 거절, 전체 삭제 후
   오디오 처리·AUX/앱 격리·빈 체인 snapshot 및 편집한 순서/bypass의 snapshot을 확인했다.
   기존 state fixture의 파라미터 저장/복원과 라이브 EQ·limiter·Scene 13 검사도 통과했다.
-- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45645735079/artifacts/15036933588):
+- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45652215464/artifacts/15040153954):
   `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe`와 의존성/라이선스 고지.
   실장비의 실행 중 UI 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
 - [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) `08d0007` 성공:
