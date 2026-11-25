@@ -167,7 +167,7 @@ fn native_aux_boundary_discards_queued_old_pairs_and_preserves_voice_and_apps() 
     assert!(worker.chain.as_mut().unwrap().requests.push(ProcessingChange::Aux(change)).is_ok());
     drop(held);
     wait_for(&mut worker, &health, 1536);
-    let ProcessingChange::Aux(retired) = worker.chain.as_mut().unwrap().retired.pop().ok().expect("AUX acknowledgment") else {
+    let ProcessingChange::Aux(retired) = worker.chain.as_mut().unwrap().retired.pop().expect("AUX acknowledgment") else {
         panic!("unexpected processing acknowledgment");
     };
     assert!(retired.applied);
