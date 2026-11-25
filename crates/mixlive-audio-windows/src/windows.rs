@@ -5,7 +5,7 @@ use mixlive_effects::{VocalChain, VocalSettings};
 use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget, resolve_apps};
 use crate::process_capture::{self, ProcessCapture};
 use crate::pitch::{self, PitchMonitor, PitchReading, PitchTap};
-use crate::{bridge::{self, Fault, Health, LimiterReading, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{InputMap, OutputMap, PitchConfig, PitchScale, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{LiveControls, PlaybackGains, RouteSource}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
+use crate::{bridge::{self, Fault, Health, LimiterReading, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AppSource, InputMap, OutputMap, PitchConfig, PitchScale, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{AppControls, LiveControls, PlaybackGains, RouteMix, RouteSource}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -71,7 +71,7 @@ pub struct Prepared {
     input_config: SupportedStreamConfig,
     input_channel: usize,
     auxiliary: Option<AuxiliaryEndpoint>,
-    apps: Vec<(String, ProcessTarget, InputMap)>,
+    apps: Vec<(AppSource, ProcessTarget, InputMap)>,
     vocal: VocalChain,
     pitch: PitchConfig,
     output_gain_db: f32,
@@ -127,7 +127,7 @@ impl Prepared {
         let apps = if options.apps.is_empty() { Vec::new() } else {
             let targets = resolve_apps(&options.apps, &process_capture::app_catalog())?;
             options.apps.iter().zip(targets).map(|(app, target)| -> Result<_> {
-                Ok((app.path.clone(), target, InputMap::new(&app.channels, 2)?))
+                Ok((app.clone(), target, InputMap::new(&app.channels, 2)?))
             }).collect::<Result<Vec<_>>>()?
         };
         let vocal = VocalChain::new(input_config.sample_rate(), options.vocal_config())?;
@@ -177,10 +177,10 @@ impl Prepared {
                 else { "separate capture stream; buffered/resampled to the microphone clock (additional AUX delay)" }));
             text.push_str("AUX must carry only the intended MR/line audio, not MixLive output or call return. No app filtering or external feedback detection. Enable output/both only when AUX is not already heard through another path.\n");
         }
-        for (index, (path, target, map)) in self.apps.iter().enumerate() {
+        for (index, (app, target, map)) in self.apps.iter().enumerate() {
             let gain = self.controls.source_trim_db(RouteSource::App(index)).expect("configured app");
-            text.push_str(&format!("App {}: {path}\n  PID {} and descendants; 48000 Hz float32 stereo, channels {},{}; trim {gain} dB\n  Independent clock bridge. Original application playback is unchanged; no automatic rebind or whole-desktop capture.\n",
-                index + 1, target.pid, map.left + 1, map.right + 1));
+            text.push_str(&format!("Initial app {}: {}\n  PID {} and descendants; 48000 Hz float32 stereo, channels {},{}; trim {gain} dB\n  Independent clock bridge. Original application playback is unchanged; no automatic rebind or whole-desktop capture.\n",
+                index + 1, app.path, target.pid, map.left + 1, map.right + 1));
         }
         text.push_str(&format!("Initial mixer: {}\n", self.controls.describe()));
         text.push_str("Device bindings are fixed for this run. GPUI can apply live vocal preset, reverb pre-delay and echo time settings, as well as pitch settings and their delay compensation. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
@@ -243,26 +243,29 @@ impl Prepared {
         };
         // Each app retains its own clock/queue. Prepare all clients before starting any of them.
         let mut app_readers = Vec::with_capacity(self.apps.len());
-        let mut app_clock_stats = Vec::with_capacity(self.apps.len());
+        let mut apps = Vec::with_capacity(self.apps.len());
         let mut app_captures = Vec::with_capacity(self.apps.len());
-        for (index, (path, target, map)) in self.apps.into_iter().enumerate() {
+        let app_timing = timing.len();
+        timing.push(String::new());
+        for (app, target, map) in self.apps {
             let (writer, reader) = bridge::channel(process_capture::RATE, self.input_config.sample_rate(), self.queue_ms, 1, health.clone())?;
-            timing.push(format!("App {} boundary: queue target {:.2} ms + resampler delay {:.2} ms (excludes OS/hardware)", index + 1, reader.queue_ms, reader.resampler_delay_ms));
-            app_clock_stats.push(reader.stats.clone());
-            app_captures.push(ProcessCapture::prepare(path, target, map, writer, health.clone())?);
+            let capture = ProcessCapture::prepare(app.path.clone(), target, map, writer, health.clone())?;
+            app_captures.push(ActiveAppCapture { capture, target, stats: reader.stats.clone(),
+                queue_ms: reader.queue_ms, resampler_delay_ms: reader.resampler_delay_ms });
+            apps.push(app);
             app_readers.push(reader);
         }
         let rate = self.input_config.sample_rate();
         let mut capture = Capture::new(self.vocal, rate, writers, health.clone(), controls.clone())?;
         capture.prepare_pitch(rate, self.pitch)?;
         let vocal_stats = capture.vocal_stats.clone();
-        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, controls.has_aux(), health.clone(), &controls)?;
+        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, health.clone(), &controls, app_readers)?;
         let plugin_timing = timing.len();
         timing.push(plugin_worker.description.clone());
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
         let (pitch_tap, pitch_monitor) = pitch::channel(self.input_config.sample_rate())?;
-        let feeds = InputFeeds { aux: aux_feed, apps: app_readers, pitch: pitch_tap };
+        let feeds = InputFeeds { aux: aux_feed, pitch: pitch_tap };
         let input_stream = match format {
             SampleFormat::F32 => input::<f32>(&self.input, config, self.input_channel, capture, feeds, health.clone())?,
             SampleFormat::F64 => input::<f64>(&self.input, config, self.input_channel, capture, feeds, health.clone())?,
@@ -273,19 +276,31 @@ impl Prepared {
         };
         timing.push(format!("input driver buffer query: {:?} frames", input_stream.buffer_size()));
         // Activation of every app completed above. Start them only now, alongside the device streams.
-        for app in &mut app_captures { app.start()?; }
+        for app in &mut app_captures { app.capture.start()?; }
+        for app in &mut app_captures { app.capture.attach()?; }
         // Output emits silence until each queue is primed. Any startup error drops every stream.
         for stream in &streams { stream.play()?; }
         if let Some(stream) = &aux_stream { stream.play()?; }
         input_stream.play()?;
-        Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, _app_captures: app_captures, plugin_worker, health, outputs: stats,
-            aux_enabled: controls.has_aux(), controls, aux_clock_stats, app_clock_stats, vocal_stats, pitch_monitor, plugin_timing, timing })
+        let mut active = Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, app_captures, apps,
+            input_rate: self.input_config.sample_rate(), queue_ms: self.queue_ms, plugin_worker, health, outputs: stats,
+            aux_enabled: controls.has_aux(), controls, aux_clock_stats, vocal_stats, pitch_monitor, plugin_timing, app_timing, timing };
+        active.refresh_app_timing();
+        Ok(active)
     }
 }
 
 struct PlaybackStats {
     mixes: Vec<usize>,
     stats: Arc<OutputStats>,
+}
+
+struct ActiveAppCapture {
+    capture: ProcessCapture,
+    target: ProcessTarget,
+    stats: Arc<OutputStats>,
+    queue_ms: f64,
+    resampler_delay_ms: f64,
 }
 
 /// One control-thread read of actual sample maxima; absent optional sources/mixes stay absent.
@@ -306,7 +321,10 @@ pub struct Active {
     _input: Stream,
     _aux_input: Option<Stream>,
     _outputs: Vec<Stream>,
-    _app_captures: Vec<ProcessCapture>,
+    app_captures: Vec<ActiveAppCapture>,
+    apps: Vec<AppSource>,
+    input_rate: u32,
+    queue_ms: u32,
     plugin_worker: PluginWorker,
     pub health: Arc<Health>,
     pub controls: Arc<LiveControls>,
@@ -314,16 +332,15 @@ pub struct Active {
     outputs: Vec<PlaybackStats>,
     aux_enabled: bool,
     aux_clock_stats: Option<Arc<OutputStats>>,
-    app_clock_stats: Vec<Arc<OutputStats>>,
     pub vocal_stats: Arc<VocalStats>,
     pitch_monitor: PitchMonitor,
     plugin_timing: usize,
+    app_timing: usize,
     pub timing: Vec<String>,
 }
 
 struct InputFeeds {
     aux: AuxFeed,
-    apps: Vec<OutputReader>,
     pitch: PitchTap,
 }
 
@@ -334,8 +351,6 @@ where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
     let mut mono = [0.0_f32; CAPTURE_BLOCK];
     let mut auxiliary = [[0.0_f32; 2]; CAPTURE_BLOCK];
     let has_aux = !matches!(&feeds.aux, AuxFeed::Disabled);
-    let app_count = feeds.apps.len();
-    let mut applications = [[[0.0_f32; 2]; CAPTURE_BLOCK]; MAX_APPS];
     Ok(device.build_input_stream::<T, _, _>(config, move |data, _| {
         if health.failed() { return; }
         if data.len() % channels != 0 { health.fail(Fault::Input); return; }
@@ -348,13 +363,9 @@ where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
                     AuxFeed::Shared(map) => map.read(frame).map(f32::from_sample),
                     AuxFeed::Independent(reader) => reader.next_source_frame(),
                 };
-                for (buffer, reader) in applications.iter_mut().zip(&mut feeds.apps) {
-                    buffer[index] = reader.next_source_frame();
-                }
             }
-            let apps: [&[[f32; 2]]; MAX_APPS] = std::array::from_fn(|slot| &applications[slot][..frames]);
             feeds.pitch.push(&mono[..frames]);
-            capture.push(&mono[..frames], has_aux.then_some(&auxiliary[..frames]), &apps[..app_count]);
+            capture.push(&mono[..frames], has_aux.then_some(&auxiliary[..frames]));
         }
     }, move |_| error_health.fail(Fault::Device), None)?)
 }
@@ -393,6 +404,73 @@ where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
 }
 
 impl Active {
+    pub fn apps(&self) -> &[AppSource] { &self.apps }
+
+    /// Prepare an exact new process tree while the current path keeps running.
+    /// Existing bindings are compared with this fresh snapshot, never rebound.
+    pub fn add_app(&mut self, app: AppSource) -> Result<()> {
+        if self.health.failed() { return Err("audio path has failed; stop before adding an application".into()); }
+        if self.apps.len() == MAX_APPS { return Err("at most eight application sources are supported".into()); }
+        app.validate(self.controls.has_mix(RouteMix::Send), self.controls.has_mix(RouteMix::Broadcast))?;
+        let mut proposed = self.apps.clone();
+        proposed.push(app.clone());
+        let targets = resolve_apps(&proposed, &process_capture::app_catalog())?;
+        if self.app_captures.iter().zip(&targets).any(|(current, target)| current.target != *target) {
+            return Err("an existing application process changed; remove that source before adding another application".into());
+        }
+        let target = *targets.last().expect("newly resolved application");
+        let map = InputMap::new(&app.channels, 2)?;
+        let controls = Arc::new(AppControls::new(&app)?);
+        let (writer, reader) = bridge::channel(process_capture::RATE, self.input_rate, self.queue_ms, 1, self.health.clone())?;
+        let mut added = ActiveAppCapture {
+            capture: ProcessCapture::prepare(app.path.clone(), target, map, writer, self.health.clone())?,
+            target, stats: reader.stats.clone(), queue_ms: reader.queue_ms, resampler_delay_ms: reader.resampler_delay_ms,
+        };
+        // Start succeeds before the source is committed. The client parks before
+        // writing, so rejected preparation leaves the running sources untouched.
+        added.capture.start()?;
+        let result = self.plugin_worker.add_app(reader, controls, &self.controls);
+        if self.plugin_worker.app_count() == self.apps.len() + 1 {
+            let attached = added.capture.attach();
+            self.apps.push(app);
+            self.app_captures.push(added);
+            self.publish_apps();
+            result?;
+            attached?;
+        } else { result?; }
+        Ok(())
+    }
+
+    /// Removal uses the actual running slot even if its application has exited.
+    pub fn remove_app(&mut self, index: usize) -> Result<()> {
+        let stop = self.app_captures.get(index).ok_or("application source is outside the running list")?.capture.stop_signal();
+        let result = self.plugin_worker.remove_app(index, stop, &self.controls);
+        if self.plugin_worker.app_count() + 1 == self.apps.len() {
+            self.apps.remove(index);
+            let removed = self.app_captures.remove(index);
+            self.publish_apps();
+            drop(removed); // join on the control thread after the worker detached its reader
+        }
+        result?;
+        if let Some(error) = self.health.error() { return Err(error.into()); }
+        Ok(())
+    }
+
+    fn publish_apps(&mut self) {
+        self.controls.publish_apps(self.plugin_worker.app_controls());
+        self.timing[self.plugin_timing] = self.plugin_worker.description.clone();
+        self.refresh_app_timing();
+    }
+
+    fn refresh_app_timing(&mut self) {
+        let mut text = format!("Current application sources: {}. Original playback is unchanged.\n", self.apps.len());
+        for (index, (app, capture)) in self.apps.iter().zip(&self.app_captures).enumerate() {
+            text.push_str(&format!("App {}: {}\n  PID {} and descendants; channels {:?}; queue target {:.2} ms + resampler delay {:.2} ms (excludes OS/hardware).\n",
+                index + 1, app.path, capture.target.pid, app.channels, capture.queue_ms, capture.resampler_delay_ms));
+        }
+        self.timing[self.app_timing] = text;
+    }
+
     /// Service plugin/editor requests on the loading/control thread, outside UI borrows.
     /// The caller owns message dispatch. Return whether any editor was dismissed.
     pub fn poll_plugin(&mut self) -> Result<bool> {
@@ -466,6 +544,7 @@ impl Active {
     /// No file is published here; failure tears down the route and yields no partial Scene.
     pub fn finish_scene(self, mut route: RouteOptions) -> Result<crate::scene::AudioScene> {
         route.set_pitch_config(self.pitch_config());
+        route.apps = self.apps.clone();
         let settings = self.controls.snapshot_into(&mut route);
         let (worker, health) = self.stop_devices();
         settings?;
@@ -476,17 +555,18 @@ impl Active {
     }
 
     fn stop_devices(self) -> (PluginWorker, Arc<Health>) {
-        let Self { _input, _aux_input, _outputs, _app_captures, plugin_worker, health, .. } = self;
+        let Self { _input, _aux_input, _outputs, app_captures, plugin_worker, health, .. } = self;
         drop(_input);
         drop(_aux_input);
         drop(_outputs);
-        drop(_app_captures);
+        drop(app_captures);
         (plugin_worker, health)
     }
 
     /// Single consumer on the control thread. Peak intervals are independent of callback blocks.
     pub fn take_levels(&mut self) -> LevelReadings {
         let pitch = self.pitch_config();
+        let apps = self.controls.app_controls();
         let mut outputs = [None; MAX_MIXES];
         let mut limiters = [None; MAX_MIXES];
         for endpoint in &self.outputs {
@@ -498,8 +578,7 @@ impl Active {
         LevelReadings {
             mic_input: f32::from_bits(self.health.input_peak.swap(0, Ordering::Relaxed)),
             aux_input: self.aux_enabled.then(|| f32::from_bits(self.health.aux_peak.swap(0, Ordering::Relaxed))),
-            app_inputs: std::array::from_fn(|index| (index < self.controls.app_count())
-                .then(|| f32::from_bits(self.health.app_peaks[index].swap(0, Ordering::Relaxed)))),
+            app_inputs: std::array::from_fn(|index| apps.get(index).map(|app| app.take_peak())),
             vocal: self.vocal_stats.take(),
             voice: f32::from_bits(self.health.voice_peak.swap(0, Ordering::Relaxed)),
             outputs, limiters, pitch: self.pitch_monitor.take(pitch.key, pitch.scale),
@@ -521,7 +600,8 @@ impl Active {
                     stats.underruns.load(Ordering::Relaxed)));
             }
         }
-        for (index, stats) in self.app_clock_stats.iter().enumerate() {
+        for (index, app) in self.app_captures.iter().enumerate() {
+            let stats = &app.stats;
             let peak = levels.app_inputs[index].unwrap_or(0.0);
             text.push_str(&format!(" | app{}: peak={peak:.3} queue={} frames correction={}ppm underruns={}",
                 index + 1, stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed), stats.underruns.load(Ordering::Relaxed)));

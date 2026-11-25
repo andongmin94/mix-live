@@ -15,9 +15,10 @@ use gpui_deck::{
     Button, Root, ScrollArea, SelectItem, SelectState, Slider, SliderEvent, SliderState, SliderThumb, StyledExt as _, Switch,
 };
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
-use mixlive_audio_windows::config::PitchConfig;
+use mixlive_audio_windows::config::{AppSource, PitchConfig, MAX_APPS};
+use mixlive_audio_windows::devices::AppInfo;
 use mixlive_audio_windows::plugin::{ChainEdit, EffectSpec, LiveParameter};
-use mixlive_audio_windows::windows::device_catalog;
+use mixlive_audio_windows::windows::{device_catalog, list_apps};
 use mixlive_effects::{VocalParameter, VocalSettings};
 
 use crate::{
@@ -95,6 +96,13 @@ struct InstalledPlugins {
     _subscription: Subscription,
 }
 
+struct AvailableApps {
+    catalog: Vec<AppInfo>,
+    picker: Entity<SelectState>,
+    channels: Entity<SelectState>,
+    _subscriptions: Vec<Subscription>,
+}
+
 enum Operation {
     Devices,
     EditDevices,
@@ -107,6 +115,9 @@ enum Operation {
     EditChain(ChainEdit),
     SetPitch(PitchConfig),
     SetVocalSettings(VocalSettings),
+    RefreshApps,
+    AddApp(AppSource),
+    RemoveApp(usize),
     Close,
 }
 
@@ -127,6 +138,7 @@ pub struct MixLive {
     vocal_editor: Option<Entity<VocalEditor>>,
     vocal_subscription: Option<Subscription>,
     installed_plugins: Option<InstalledPlugins>,
+    available_apps: Option<AvailableApps>,
     scanning_plugins: bool,
     workspace_scroll: ScrollHandle,
 }
@@ -216,6 +228,7 @@ impl MixLive {
             vocal_editor: None,
             vocal_subscription: None,
             installed_plugins: None,
+            available_apps: None,
             scanning_plugins: false,
             workspace_scroll: ScrollHandle::new(),
         }
@@ -489,6 +502,48 @@ impl MixLive {
         self.add_effect(path, window, cx);
     }
 
+    fn install_app_picker(&mut self, catalog: Vec<AppInfo>, cx: &mut Context<Self>) {
+        let items = std::iter::once(SelectItem::new("", "추가할 앱 선택"))
+            .chain(catalog.iter().map(|app| {
+                let label = match &app.target {
+                    Ok(target) => format!("{} · PID {}", app.path, target.pid),
+                    Err(error) => format!("{} · {error}", app.path),
+                };
+                SelectItem::new(app.path.clone(), label).disabled(app.target.is_err())
+            })).collect::<Vec<_>>();
+        let picker = cx.new(|cx| SelectState::new(items, cx).default_value(""));
+        let channels = cx.new(|cx| SelectState::new([
+            SelectItem::new("1,2", "1, 2 · 스테레오"),
+            SelectItem::new("1", "1 · 모노"),
+            SelectItem::new("2", "2 · 모노"),
+            SelectItem::new("2,1", "2, 1 · 좌우 교환"),
+        ], cx).default_value("1,2"));
+        let subscriptions = vec![
+            cx.observe(&picker, |_, _, cx| cx.notify()),
+            cx.observe(&channels, |_, _, cx| cx.notify()),
+        ];
+        self.available_apps = Some(AvailableApps { catalog, picker, channels, _subscriptions: subscriptions });
+    }
+
+    fn selected_app(&self, cx: &App) -> Option<AppSource> {
+        let available = self.available_apps.as_ref()?;
+        let path = selected(&available.picker, cx)?;
+        let current = self.session.apps();
+        if current.len() >= MAX_APPS || current.iter().any(|app| app.path.eq_ignore_ascii_case(&path))
+            || !available.catalog.iter().any(|app| app.path == path && app.target.is_ok()) {
+            return None;
+        }
+        let mut source = AppSource::new(path);
+        source.channels = crate::draft::channels(&selected(&available.channels, cx)?).ok()?;
+        Some(source)
+    }
+
+    fn add_selected_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(source) = self.selected_app(cx) {
+            self.perform(Operation::AddApp(source), window, cx);
+        }
+    }
+
     fn install_parameters(&mut self, index: usize, parameters: Vec<LiveParameter>, window: &mut Window, cx: &mut Context<Self>) {
         let already_open = self.parameter_editor.as_ref().is_some_and(|editor| editor.read(cx).index == index);
         let selected = self.parameter_editor.as_ref().filter(|editor| editor.read(cx).index == index)
@@ -584,7 +639,7 @@ impl MixLive {
         {
             return;
         }
-        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_) | Operation::SetVocalSettings(_));
+        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_) | Operation::SetVocalSettings(_) | Operation::RefreshApps | Operation::AddApp(_) | Operation::RemoveApp(_));
         if live_operation && (!self.session.running() || self.picking) {
             return;
         }
@@ -599,6 +654,9 @@ impl MixLive {
             Operation::EditChain(_) => "VST3 체인 변경 중",
             Operation::SetPitch(_) => "음정 설정 적용 중",
             Operation::SetVocalSettings(_) => "보컬 설정 적용 중",
+            Operation::RefreshApps => "앱 목록 조회 중",
+            Operation::AddApp(_) => "앱 추가 중",
+            Operation::RemoveApp(_) => "앱 삭제 중",
         });
         if matches!(operation, Operation::EditChain(_)) {
             // Parameter events capture a slot index. A topology change invalidates that selection.
@@ -614,6 +672,7 @@ impl MixLive {
             self.pitch_subscription = None;
             self.vocal_editor = None;
             self.vocal_subscription = None;
+            self.available_apps = None;
         } else if let Some(editor) = &self.parameter_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
@@ -623,12 +682,19 @@ impl MixLive {
         if let Some(editor) = &self.vocal_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
+        if let Some(available) = &self.available_apps {
+            for select in [&available.picker, &available.channels] {
+                select.update(cx, |state, cx| state.set_disabled(true, window, cx));
+            }
+        }
         let previous_preset = self.session.vocal_settings().map(|settings| settings.preset);
+        let previous_apps = self.session.apps().to_vec();
         let mut session = std::mem::take(&mut self.session);
         cx.notify();
         cx.spawn_in(window, async move |owner, cx| {
             // These synchronous native calls MUST be outside App/entity update.
             let mut parameters = None;
+            let mut apps = None;
             let catalog = match &operation {
                 Operation::Devices | Operation::EditDevices => {
                     Some(device_catalog().map_err(|error| error.to_string()))
@@ -659,6 +725,20 @@ impl MixLive {
                 }
                 Operation::SetVocalSettings(settings) => {
                     let _ = session.set_vocal_settings(*settings);
+                    None
+                }
+                Operation::RefreshApps => {
+                    apps = Some(list_apps());
+                    session.error = None;
+                    session.message = "앱 목록 조회 완료 · 캡처할 앱을 선택한 뒤 추가하세요.".into();
+                    None
+                }
+                Operation::AddApp(source) => {
+                    let _ = session.add_app(source.clone());
+                    None
+                }
+                Operation::RemoveApp(index) => {
+                    let _ = session.remove_app(*index);
                     None
                 }
                 Operation::StopAndSave(path) => {
@@ -702,6 +782,14 @@ impl MixLive {
                     } else if let Some(editor) = &this.parameter_editor {
                         editor.update(cx, |editor, cx| editor.set_busy(false, window, cx));
                     }
+                    if let Some(apps) = apps {
+                        this.install_app_picker(apps, cx);
+                    }
+                    if let Some(available) = &this.available_apps {
+                        for select in [&available.picker, &available.channels] {
+                            select.update(cx, |state, cx| state.set_disabled(false, window, cx));
+                        }
+                    }
                     if let Some(editor) = &this.pitch_editor {
                         editor.update(cx, |editor, cx| {
                             if let Some(config) = this.session.pitch_config() { editor.set_current(config, cx); }
@@ -714,10 +802,10 @@ impl MixLive {
                             editor.set_busy(false, window, cx);
                         });
                     }
-                    // A committed preset may change fader availability even if a later
-                    // error is reported. Delay-only edits keep the existing controls.
+                    // Rebind compacted app indices and changed preset availability even
+                    // if a later error is reported after the worker acknowledged the edit.
                     let current_preset = this.session.vocal_settings().map(|settings| settings.preset);
-                    if !live_operation || current_preset != previous_preset {
+                    if !live_operation || current_preset != previous_preset || this.session.apps() != previous_apps {
                         this.install_faders(cx);
                     }
                     cx.notify();
@@ -1019,6 +1107,25 @@ impl MixLive {
         picker
     }
 
+    fn live_app_picker(&self, window: &Window, cx: &Context<Self>) -> Div {
+        let disabled = self.busy.is_some() || self.picking;
+        let mut picker = div().flex().flex_col().gap_3().pt_3().border_t_1().border_color(rgb(BORDER))
+            .child(div().text_sm().font_semibold().child(format!("실행 중 앱 소스 · {} / {MAX_APPS}", self.session.apps().len())))
+            .child(button("refresh-live-apps", "앱 목록 새로고침", false)
+                .disabled(disabled)
+                .on_click(cx.listener(|this, _, window, cx| this.perform(Operation::RefreshApps, window, cx))));
+        if let Some(available) = &self.available_apps {
+            picker = picker
+                .child(select_control("live-app-picker", "실행 중 추가할 앱", &available.picker, None, window, cx))
+                .child(select_control("live-app-channels", "새 앱의 입력 채널", &available.channels, None, window, cx))
+                .child(button("add-live-app", "선택한 앱 추가", true)
+                    .disabled(disabled || self.selected_app(cx).is_none())
+                    .on_click(cx.listener(|this, _, window, cx| this.add_selected_app(window, cx))));
+        }
+        picker.child(div().text_xs().text_color(rgb(MUTED))
+            .child("새 앱은 모든 출력 연결이 꺼진 상태로 추가됩니다. 소스별 보내기에서 연결할 출력을 켜세요. 앱 단위로 캡처하며 브라우저 탭은 구분하지 않습니다."))
+    }
+
     fn scene_summary(&self, window: &Window, cx: &Context<Self>) -> gpui::AnyElement {
         let Some(scene) = self.session.scene() else {
             let (title, description) = if self.busy.is_some() {
@@ -1073,9 +1180,15 @@ impl MixLive {
             );
         }
 
-        for (index, app) in route.apps.iter().enumerate() {
+        for (index, app) in self.session.apps().iter().enumerate() {
+            let trim = self.session.controls().map_or(app.gain_db, |controls| {
+                controls.source_trim_db(RouteSource::App(index)).expect("configured app")
+            });
             sources = sources.child(device("앱 캡처", &app.path,
-                format!("App {} · 채널 {} · {:+.1} dB", index + 1, channels(&app.channels), app.gain_db)));
+                format!("App {} · 채널 {} · {trim:+.1} dB", index + 1, channels(&app.channels))));
+        }
+        if self.session.running() {
+            sources = sources.child(self.live_app_picker(window, cx));
         }
 
         let vocal = self.session.controls().map_or_else(|| route.vocal_config(), |controls| controls.vocal_config());
@@ -1396,7 +1509,7 @@ impl MixLive {
     fn mixer(&self, cx: &Context<Self>) -> gpui::AnyElement {
         let controls = self.session.controls().expect("running session");
         let levels = self.session.levels.as_ref();
-        let scene = self.session.scene().expect("running Scene");
+        let apps = self.session.apps();
         let pitch_config = self.session.pitch_config().expect("running pitch configuration");
         let mut source_mutes = div().flex().items_center().gap_5().child(
             div()
@@ -1454,12 +1567,16 @@ impl MixLive {
                         l.vocal.compression_db, l.vocal.deessing_db))
                 })),
         );
-        for (index, app) in scene.route.apps.iter().enumerate() {
-            let label = source_name(RouteSource::App(index), scene);
+        for (index, app) in apps.iter().enumerate() {
+            let label = source_name(RouteSource::App(index), apps);
             routing = routing.child(div().flex().flex_col().gap_2().pt_3().border_t_1().border_color(rgb(BORDER))
                 .child(div().flex().items_center().justify_between().gap_2()
                     .child(div().flex_1().min_w_0().font_semibold().child(label.clone()))
-                    .child(self.mute(("mute-app", index), &format!("{label} 음소거"), MuteTarget::App(index), cx)))
+                    .child(self.mute(("mute-app", index), &format!("{label} 음소거"), MuteTarget::App(index), cx))
+                    .child(button(("remove-live-app", index), "삭제", false)
+                        .accessibility_label(format!("{label} 삭제"))
+                        .disabled(self.busy.is_some() || self.picking)
+                        .on_click(cx.listener(move |this, _, window, cx| this.perform(Operation::RemoveApp(index), window, cx)))))
                 .child(peak_meter("앱 입력 · trim/mute 전", levels.and_then(|l| l.app_inputs[index])))
                 .child(div().text_sm().child("입력 trim"))
                 .child(self.fader(("app-trim", index), &format!("{label} 입력 trim"),
@@ -1484,7 +1601,7 @@ impl MixLive {
                         .child(format!("{destination}에 보내기")),
                 );
             for (source_index, source) in controls.sources().enumerate() {
-                let source_label = source_name(source, scene);
+                let source_label = source_name(source, apps);
                 let (enabled, db) = controls
                     .route_state(source, mix)
                     .expect("configured route exists");
@@ -1645,7 +1762,7 @@ impl MixLive {
         }
         if self.details {
             if !self.session.device_details.is_empty() {
-                content = content.child(detail_text("장치 설정", &self.session.device_details));
+                content = content.child(detail_text("시작 시 장치·소스 설정", &self.session.device_details));
             }
             if !self.session.timing.is_empty() {
                 content = content.child(detail_text(
@@ -1726,7 +1843,7 @@ impl Render for MixLive {
             .child(self.header(cx))
             .child(body)
             .child(div().flex_shrink_0().px_7().py_3().border_t_1().border_color(rgb(BORDER)).text_xs().text_color(rgb(MUTED))
-                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 믹서·보컬 설정과 VST3 상태를 보존합니다."))
+                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 앱 소스·믹서·보컬 설정과 VST3 상태를 보존합니다."))
     }
 }
 
@@ -1769,12 +1886,12 @@ fn channels(values: &[u16]) -> String {
         .join(", ")
 }
 
-fn source_name(source: RouteSource, scene: &mixlive_audio_windows::scene::AudioScene) -> String {
+fn source_name(source: RouteSource, apps: &[AppSource]) -> String {
     match source {
         RouteSource::Mic => "내 목소리".into(),
         RouteSource::Aux => "AUX / MR".into(),
         RouteSource::App(index) => {
-            let app = &scene.route.apps[index];
+            let app = &apps[index];
             let name = std::path::Path::new(&app.path).file_name().and_then(|name| name.to_str()).unwrap_or(&app.path);
             format!("App {} · {name}", index + 1)
         }

@@ -83,6 +83,8 @@ pub(crate) fn resolve(path: &str) -> Result<ProcessTarget, String> {
 pub(crate) struct ProcessCapture {
     stop: Arc<AtomicBool>,
     start: Option<SyncSender<()>>,
+    attach: Option<SyncSender<()>>,
+    attached: Arc<AtomicBool>,
     ready: Receiver<Result<(), String>>,
     thread: Option<JoinHandle<()>>,
     health: Arc<Health>,
@@ -94,16 +96,20 @@ impl ProcessCapture {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (start_tx, start_rx) = mpsc::sync_channel(1);
+        let (attach_tx, attach_rx) = mpsc::sync_channel(1);
+        let attached = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread_health = health.clone();
+        let thread_attached = attached.clone();
         let thread = thread::Builder::new().name("mixlive-app-capture".into()).spawn(move || {
-            let result = capture((&path, target, map), writer, &thread_stop, &thread_health, &ready_tx, &start_rx);
+            let result = capture((&path, target, map), writer, &thread_stop, &thread_health, &ready_tx, &start_rx, &attach_rx);
             if let Err(error) = result {
                 let _ = ready_tx.try_send(Err(error));
-                thread_health.fail(Fault::Application);
+                if thread_attached.load(Ordering::Acquire) { thread_health.fail(Fault::Application); }
             }
         }).map_err(|error| error.to_string())?;
-        let owner = Self { stop, start: Some(start_tx), ready: ready_rx, thread: Some(thread), health };
+        let owner = Self { stop, start: Some(start_tx), attach: Some(attach_tx), attached,
+            ready: ready_rx, thread: Some(thread), health };
         owner.wait_ready()?;
         Ok(owner)
     }
@@ -117,20 +123,34 @@ impl ProcessCapture {
             .map_err(|_| "application capture thread exited before start")?;
         self.wait_ready()
     }
+
+    /// The worker has accepted the reader/source. Only now may this capture pump
+    /// packets and report failures to the running path.
+    pub fn attach(&mut self) -> Result<(), String> {
+        let attach = self.attach.take().ok_or("application capture already attached")?;
+        self.attached.store(true, Ordering::Release);
+        attach.send(()).map_err(|_| {
+            self.health.fail(Fault::Application);
+            "application capture thread exited before attachment".into()
+        })
+    }
+
+    pub fn stop_signal(&self) -> Arc<AtomicBool> { self.stop.clone() }
 }
 
 impl Drop for ProcessCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         drop(self.start.take()); // also wake a prepared but unstarted client
+        drop(self.attach.take()); // or a started client not yet accepted by the worker
         if let Some(thread) = self.thread.take() {
-            if thread.join().is_err() { self.health.fail(Fault::Application); }
+            if thread.join().is_err() && self.attached.load(Ordering::Acquire) { self.health.fail(Fault::Application); }
         }
     }
 }
 
 fn capture(binding: (&str, ProcessTarget, InputMap), mut writer: OutputWriter,
-    stop: &AtomicBool, health: &Health, ready: &SyncSender<Result<(), String>>, start: &Receiver<()>) -> Result<(), String> {
+    stop: &AtomicBool, health: &Health, ready: &SyncSender<Result<(), String>>, start: &Receiver<()>, attach: &Receiver<()>) -> Result<(), String> {
     let (path, target, map) = binding;
     // Recheck the resolved identity immediately before opening the process-loopback client.
     if resolve(path)? != target { return Err("application process changed before capture started; start again".into()); }
@@ -151,6 +171,9 @@ fn capture(binding: (&str, ProcessTarget, InputMap), mut writer: OutputWriter,
         client.start_stream().map_err(|error| error.to_string())?;
         let running = (|| -> Result<(), String> {
             ready.send(Ok(())).map_err(|_| "application capture startup was cancelled")?;
+            // A successfully started but unpublished source cannot overflow its
+            // bridge or invalidate the existing route while the edit is prepared.
+            if attach.recv().is_err() || stop.load(Ordering::Relaxed) || health.failed() { return Ok(()); }
             let mut received_packet = false;
             while !stop.load(Ordering::Relaxed) && !health.failed() {
                 let pending = capture.get_next_packet_size().map_err(|error| error.to_string())?
@@ -169,6 +192,7 @@ fn capture(binding: (&str, ProcessTarget, InputMap), mut writer: OutputWriter,
                 received_packet = true;
                 // The library zeroes silent packets. Only read the returned frames.
                 for frame in packet[..frames as usize * FRAME_BYTES].chunks_exact(FRAME_BYTES) {
+                    if stop.load(Ordering::Relaxed) { break; }
                     let [left, right] = decode_frame(frame, map);
                     writer.push([left, right, 0.0, 0.0, 0.0, 0.0]);
                     if health.failed() { break; }
@@ -196,6 +220,17 @@ fn decode_frame(bytes: &[u8], map: InputMap) -> [f32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unpublished_capture_failure_does_not_fail_the_running_route() {
+        let health = Arc::new(Health::default());
+        let (writer, _reader) = crate::bridge::channel(RATE, RATE, 10, 1, health.clone()).unwrap();
+        let path = format!("C:\\mixlive-missing-process-{}\\never-started.exe", std::process::id());
+        let error = ProcessCapture::prepare(path, ProcessTarget { pid: 0, started: 0 },
+            InputMap::new(&[1, 2], 2).unwrap(), writer, health.clone()).err().unwrap();
+        assert!(error.contains("not running"));
+        assert!(!health.failed());
+    }
 
     #[test]
     fn catalog_groups_children_rejects_ambiguity_and_own_tree_and_ignores_reused_parent() {

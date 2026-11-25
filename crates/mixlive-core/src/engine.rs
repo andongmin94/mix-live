@@ -183,6 +183,26 @@ impl Engine {
         Ok(())
     }
 
+    /// Move selected histories from a previous routing plan into this prepared one.
+    /// Pairs are (new send index, previous send index), using original Scene indices.
+    /// Validate the entire mapping before changing either plan. Swaps allocate or
+    /// destroy nothing; the caller retires the previous plan on its control thread.
+    pub fn swap_retained_send_delays(&mut self, previous: &mut Self,
+        retained: &[(usize, usize)]) -> Result<(), ConfigError> {
+        for (index, &(next, old)) in retained.iter().enumerate() {
+            if next >= self.send_count || old >= previous.send_count
+                || retained[..index].iter().any(|&(other_next, other_old)| other_next == next || other_old == old) {
+                return Err(ConfigError::InvalidSendDelayMapping);
+            }
+        }
+        for &(next, old) in retained {
+            std::mem::swap(&mut self.delays.lines[next], &mut previous.delays.lines[old]);
+        }
+        self.rendered_frames = 0;
+        previous.rendered_frames = 0;
+        Ok(())
+    }
+
     /// Render synchronized input buffers into independent stereo mixes.
     ///
     /// No allocation, locking, logging, device access, or serialization occurs here. These
@@ -391,5 +411,50 @@ mod send_gain_tests {
         assert!(engine.output(1).is_none());
         engine.render_with_send_gains(4, &inputs, &[&[1.0; 4], &[1.0; 4]]).unwrap();
         assert!(engine.output(1).unwrap().sample_peak() > 0.0);
+    }
+
+    #[test]
+    fn routing_replacement_moves_only_retained_send_histories_after_full_validation() {
+        let scene = Scene {
+            sources: (0..3).map(|index| Source {
+                name: format!("source {index}"), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false,
+            }).collect(),
+            mixes: vec![Mix { name: "send".into(), gain_db: 0.0, muted: false, excluded_sources: vec![] }],
+            // A disabled original send precedes the active ones.
+            sends: (0..3).map(|source| Send { source, mix: 0, gain_db: 0.0, enabled: source != 0 }).collect(),
+        };
+        let mut previous = Engine::new(&scene, 4).unwrap();
+        previous.swap_send_delays(&mut SendDelays::new(&[0, 5, 3])).unwrap();
+        let silence = Input::Stereo { left: &[0.0; 4], right: &[0.0; 4] };
+        previous.render(2, &[silence,
+            Input::Stereo { left: &[0.5, 0.75], right: &[-0.5, -0.75] },
+            Input::Stereo { left: &[0.125, 0.25], right: &[-0.125, -0.25] },
+        ]).unwrap();
+        let retained_pointer = previous.delays.lines[2].samples.as_ptr();
+        let removed_pointer = previous.delays.lines[1].samples.as_ptr();
+        let mut next = Engine::new(&scene, 4).unwrap();
+        next.swap_send_delays(&mut SendDelays::new(&[0, 0, 4])).unwrap();
+        let added_pointer = next.delays.lines[2].samples.as_ptr();
+        for invalid in [vec![(1, 2), (3, 1)], vec![(1, 2), (2, 3)],
+            vec![(1, 2), (2, 2)], vec![(1, 2), (1, 1)]] {
+            assert_eq!(next.swap_retained_send_delays(&mut previous, &invalid), Err(ConfigError::InvalidSendDelayMapping));
+            assert_eq!(previous.delays.lines[2].samples.as_ptr(), retained_pointer);
+            assert_eq!(previous.delays.lines[2].cursor, 2);
+            assert_eq!(previous.output(0).unwrap().left, &[0.0; 2]);
+        }
+        next.swap_retained_send_delays(&mut previous, &[(0, 0), (1, 2)]).unwrap();
+        assert_eq!(next.delays.lines[1].samples.as_ptr(), retained_pointer);
+        assert_eq!(previous.delays.lines[1].samples.as_ptr(), removed_pointer);
+        assert!(previous.delays.lines[2].samples.is_empty());
+        assert_eq!(next.delays.lines[2].samples.as_ptr(), added_pointer);
+        assert!(previous.output(0).is_none());
+        next.render(4, &[silence, silence,
+            Input::Stereo { left: &[1.0, 0.0, 0.0, 0.0], right: &[-1.0, 0.0, 0.0, 0.0] },
+        ]).unwrap();
+        assert_eq!(next.output(0).unwrap().left, &[0.0, 0.125, 0.25, 0.0]);
+        assert_eq!(next.output(0).unwrap().right, &[0.0, -0.125, -0.25, 0.0]);
+        next.render(1, &[silence; 3]).unwrap();
+        assert_eq!(next.output(0).unwrap().left, &[1.0]);
+        assert_eq!(next.output(0).unwrap().right, &[-1.0]);
     }
 }

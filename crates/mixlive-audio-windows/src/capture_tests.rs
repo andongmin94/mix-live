@@ -147,7 +147,7 @@ fn live_routes_keep_call_vocals_while_removing_only_monitor_vocals() {
     controls.apply("route aux send on".parse().unwrap()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
         vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
-    assert_eq!(controls.route_targets()[..6], [1.0, 1.0, 0.0, 0.0, 1.0, 0.0]);
+    assert_eq!(controls.route_targets(&controls.app_controls())[..6], [1.0, 1.0, 0.0, 0.0, 1.0, 0.0]);
     controls.apply("route mic output off".parse().unwrap()).unwrap();
     controls.apply("route aux output on".parse().unwrap()).unwrap();
     controls.apply("level aux output -6".parse().unwrap()).unwrap();
@@ -278,8 +278,8 @@ fn separate_app_sources_keep_stereo_and_mix_minus_with_and_without_physical_aux(
         assert!((monitor.right[255] - (0.2 + aux[1] + 0.4 * attenuation)).abs() < 1e-6);
         assert!((send.left[255] - (0.5 + aux[0])).abs() < 1e-6);
         assert!((send.right[255] - (0.1 + aux[1])).abs() < 1e-6);
-        assert_eq!(f32::from_bits(health.app_peaks[0].load(Ordering::Relaxed)), 0.3);
-        assert_eq!(f32::from_bits(health.app_peaks[1].load(Ordering::Relaxed)), 0.4);
+        assert_eq!(capture.app_controls[0].take_peak(), 0.3);
+        assert_eq!(capture.app_controls[1].take_peak(), 0.4);
         controls.apply("mute app2".parse().unwrap()).unwrap();
         controls.apply("route app1 send off".parse().unwrap()).unwrap();
         let aux_frames = [aux; 256];
@@ -403,7 +403,7 @@ fn reported_vst3_delay_aligns_stereo_sends_across_blocks_without_delaying_monito
         }
         assert_eq!(position, mic.len());
         assert_eq!(f32::from_bits(health.aux_peak.load(Ordering::Relaxed)), 0.125);
-        assert_eq!(f32::from_bits(health.app_peaks[0].load(Ordering::Relaxed)), 0.25);
+        assert_eq!(capture.app_controls[0].take_peak(), 0.25);
         assert!(!health.failed());
     }
 }
@@ -634,9 +634,178 @@ fn supplemental_trim_ramps_once_before_send_delay_and_keeps_input_meters_raw() {
     assert!((broadcast.left[239] - (0.25 * gain(-20.0) + 0.125)).abs() < 1e-6);
     assert!((broadcast.right[239] - (-0.125 * gain(-20.0) + 0.25)).abs() < 1e-6);
     assert_eq!(f32::from_bits(health.aux_peak.load(Ordering::Relaxed)), 0.25);
-    assert_eq!(f32::from_bits(health.app_peaks[0].load(Ordering::Relaxed)), 0.25);
-    assert_eq!(f32::from_bits(health.app_peaks[1].load(Ordering::Relaxed)), 0.125);
+    assert_eq!(capture.app_controls[0].take_peak(), 0.25);
+    assert_eq!(capture.app_controls[1].take_peak(), 0.125);
     assert!(!health.failed());
+}
+
+#[test]
+fn live_app_removal_preserves_partial_ramps_and_retained_send_histories() {
+    use crate::config::AppSource;
+    let setup = || {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 2, VocalConfig::default()).unwrap());
+        for command in ["route app1 broadcast on", "route app2 output on", "route app2 broadcast on",
+            "route aux output on", "route aux broadcast on"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        let (writer, reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
+        let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+            vec![(writer, vec![0, 2])], health, controls.clone()).unwrap();
+        capture.prepare_voice_delay(512, 48000).unwrap();
+        (capture, controls, reader)
+    };
+    let (mut edited, controls, _edited_reader) = setup();
+    let (mut reference, reference_controls, _reference_reader) = setup();
+    let mut removed = vec![[0.0; 2]; 1000];
+    removed[17] = [1.0, -1.0];
+    let retained = vec![[0.125, -0.0625]; 1000];
+    let mut aux = vec![[0.0; 2]; 1000];
+    aux[23] = [0.03125, -0.015625];
+    let silence = vec![[0.0; 2]; 1000];
+    let mic = vec![0.0; 1000];
+    let retained_identity = controls.app_controls()[1].clone();
+    for bounds in [0, 64, 137, 154, 200, 256, 512, 768, 1000].windows(2) {
+        let (start, end) = (bounds[0], bounds[1]);
+        if start == 64 {
+            for target in [&controls, &reference_controls] {
+                for command in ["trim app2 -12", "level app2 output -6", "level app2 broadcast -6", "mute app2"] {
+                    target.apply(command.parse().unwrap()).unwrap();
+                }
+            }
+        }
+        if start == 137 {
+            let mut change = PreparedAppChange::new(&controls, &edited.app_controls(),
+                vec![retained_identity.clone()], 48000, edited.voice_latency).unwrap();
+            assert_eq!(change.compensation(), 512);
+            edited.apply_app_change(&mut change);
+            assert!(Arc::ptr_eq(&edited.app_controls[0], &retained_identity));
+            // Publication is deliberately delayed through one audio block. The
+            // worker must use its own retained identities, not the UI's old order.
+            assert_eq!(controls.app_count(), 2);
+        }
+        if start == 154 { controls.publish_apps(edited.app_controls()); }
+        if start == 200 {
+            controls.apply("unmute app1".parse().unwrap()).unwrap();
+            reference_controls.apply("unmute app2".parse().unwrap()).unwrap();
+        }
+        let apps: Vec<_> = if start < 137 { vec![&removed[start..end], &retained[start..end]] }
+            else { vec![&retained[start..end]] };
+        edited.push(&mic[start..end], Some(&aux[start..end]), &apps);
+        reference.push(&mic[start..end], Some(&aux[start..end]), &[&silence[start..end], &retained[start..end]]);
+        if start >= 137 {
+            for mix in 0..2 {
+                let actual = edited.engine.output(mix).unwrap();
+                let expected = reference.engine.output(mix).unwrap();
+                assert_eq!(actual.left, expected.left, "left at frame {start}, mix {mix}");
+                assert_eq!(actual.right, expected.right, "right at frame {start}, mix {mix}");
+            }
+        }
+        if start == 512 {
+            // The retained source's old, unity-trim samples arrive on their
+            // original due frame; the removed source's pending impulse does not.
+            let expected = 0.125 * 10.0_f32.powf(-6.0 / 20.0);
+            assert!((edited.engine.output(1).unwrap().left[17] - expected).abs() < 1e-7);
+        }
+    }
+    // Delete all apps with audio still pending, then reuse the compact index for
+    // a new source. No removed history or requested gain/route may carry over.
+    let mut empty = PreparedAppChange::new(&controls, &edited.app_controls(), vec![], 48000, 512).unwrap();
+    edited.apply_app_change(&mut empty);
+    controls.publish_apps(vec![]);
+    let added = Arc::new(AppControls::new(&AppSource::new("added.exe".into())).unwrap());
+    let mut add = PreparedAppChange::new(&controls, &[], vec![added], 48000, 512).unwrap();
+    assert_eq!(add.delay_layout().prepare(512, 48000).unwrap().compensation(), 512);
+    edited.apply_app_change(&mut add);
+    controls.publish_apps(edited.app_controls());
+    assert_eq!(controls.route_state(RouteSource::App(0), RouteMix::Broadcast).unwrap(), (false, 0.0));
+    assert!((controls.source_trim_db(RouteSource::App(0)).unwrap() + 12.0).abs() < 1e-5);
+    edited.push(&[0.0; 256], Some(&[[0.0; 2]; 256]), &[&[[0.25; 2]; 256]]);
+    assert_eq!(edited.engine.output(0).unwrap().sample_peak(), 0.0);
+    assert_eq!(edited.engine.output(1).unwrap().sample_peak(), 0.0);
+    controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
+    // Samples captured while the new route was off remain the new source's
+    // current delay history. Retired source audio must never be replayed.
+    for _ in 0..3 {
+        edited.push(&[0.0; 256], Some(&[[0.0; 2]; 256]), &[&[[0.25; 2]; 256]]);
+        assert_eq!(edited.engine.output(0).unwrap().sample_peak(), 0.0);
+    }
+    let expected = 0.25 * 10.0_f32.powf(-12.0 / 20.0);
+    assert!(edited.engine.output(1).unwrap().left.iter().all(|sample| (*sample - expected).abs() < 1e-7));
+    assert!(!edited.health.failed() && !reference.health.failed());
+}
+
+#[test]
+fn live_app_edits_keep_running_pitch_vocal_state_and_reject_invalid_preparation() {
+    use crate::config::AppSource;
+    use mixlive_effects::{EchoConfig, ReverbConfig};
+    let config = VocalConfig { preset: Preset::Warm,
+        reverb: ReverbConfig { mix: 0.4, decay_secs: 1.2, predelay_ms: 0.0 },
+        echo: EchoConfig { mix: 0.25, time_ms: 10.0, feedback: 0.3 }, ..VocalConfig::default() };
+    let pitch = PitchConfig { strength: 0.7, ..PitchConfig::default() };
+    let setup = || {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], false, 1, config).unwrap());
+        let (writer, reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
+        let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+            vec![(writer, vec![0, 2])], health, controls.clone()).unwrap();
+        capture.prepare_pitch(48000, pitch).unwrap();
+        capture.prepare_voice_delay(71, 48000).unwrap();
+        (capture, controls, reader)
+    };
+    let (mut edited, controls, _edited_reader) = setup();
+    let (mut reference, reference_controls, _reference_reader) = setup();
+    let total = edited.voice_latency;
+    assert_eq!(total, 2048 + 71);
+    let mut peak = 0.0_f32;
+    let mic: Vec<f32> = (0..4300).map(|index| if index < 3000 { 0.08 * (index as f32 * 0.031).sin() } else { 0.0 }).collect();
+    for start in (0..mic.len()).step_by(137) {
+        if [137, 274, 2192, 2466, 2740].contains(&start) {
+            let mut next = edited.app_controls();
+            match start {
+                137 | 2740 => next.clear(),
+                2466 => { next.remove(0); }
+                _ => next.push(Arc::new(AppControls::new(&AppSource::new(format!("app-{start}.exe"))).unwrap())),
+            }
+            let mut change = PreparedAppChange::new(&controls, &edited.app_controls(), next, 48000, total).unwrap();
+            let expected_compensation = if change.app_controls.is_empty() { 0 } else { total };
+            assert_eq!(change.compensation(), expected_compensation);
+            assert_eq!(change.delay_layout().prepare(total as u64, 48000).unwrap().compensation(), expected_compensation);
+            edited.apply_app_change(&mut change);
+            controls.publish_apps(edited.app_controls());
+            assert_eq!(edited.compensation, expected_compensation);
+        }
+        if start == 411 {
+            for target in [&controls, &reference_controls] { target.apply("vocal trim -6".parse().unwrap()).unwrap(); }
+        }
+        let end = (start + 137).min(mic.len());
+        let silent = vec![[0.0; 2]; end - start];
+        edited.push(&mic[start..end], None, &vec![silent.as_slice(); edited.app_controls.len()]);
+        reference.push(&mic[start..end], None, &[&silent]);
+        for mix in 0..2 {
+            let actual = edited.engine.output(mix).unwrap();
+            let expected = reference.engine.output(mix).unwrap();
+            assert_eq!(actual.left, expected.left, "left at frame {start}, mix {mix}");
+            assert_eq!(actual.right, expected.right, "right at frame {start}, mix {mix}");
+            peak = peak.max(actual.sample_peak());
+        }
+        assert_eq!(edited.pitch_config(), pitch);
+        assert_eq!(edited.voice_latency, total);
+    }
+    assert!(peak > 0.005);
+    let app = Arc::new(AppControls::default());
+    for (next, rate, latency) in [
+        (vec![app.clone(), app], 48000, total),
+        ((0..=MAX_APPS).map(|_| Arc::new(AppControls::default())).collect(), 48000, total),
+        (vec![], 7999, total),
+        (vec![], 48000, 96001),
+    ] {
+        assert!(PreparedAppChange::new(&controls, &edited.app_controls(), next, rate, latency).is_err());
+    }
+    assert!(edited.app_controls.is_empty());
+    assert_eq!(edited.voice_latency, total);
+    assert_eq!(edited.pitch_config(), pitch);
+    assert!(!edited.health.failed() && !reference.health.failed());
 }
 
 #[test]

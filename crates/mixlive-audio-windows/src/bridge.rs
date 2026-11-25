@@ -1,7 +1,7 @@
-//! Bounded SPSC clock transport. Output mixes share a bridge; AUX uses one at its input boundary.
+//! Bounded SPSC clock transport. Output mixes share a bridge; AUX/apps use their input boundaries.
 //! Rubato owns the anti-alias filter; we only steer its ratio from queue occupancy.
 use std::sync::{Arc, atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering}};
-use crate::config::{MAX_APPS, MAX_MIXES};
+use crate::config::MAX_MIXES;
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::{Adjustable, Async, FixedAsync, Resampler, SincInterpolationParameters};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
@@ -54,7 +54,6 @@ pub struct Health {
     pub captured_frames: AtomicU64,
     pub input_peak: AtomicU32,
     pub aux_peak: AtomicU32,
-    pub app_peaks: [AtomicU32; MAX_APPS],
     pub voice_peak: AtomicU32,
 }
 impl Health {
@@ -198,7 +197,7 @@ impl OutputReader {
         frame
     }
 
-    /// Input-clock boundary for AUX. Preserve float headroom until source gain and mixing.
+    /// Input-clock boundary for AUX/apps. Preserve float headroom until source gain and mixing.
     /// Silence on starvation; a latched device/format/overflow error stops the entire route.
     pub fn next_source_frame(&mut self) -> [f32; 2] {
         let frame = self.read_frame();
