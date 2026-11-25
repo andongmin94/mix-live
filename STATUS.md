@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실행 중 음정 설정 변경 구현 · Windows 통합 검증 준비**
+단계: **실행 중 음정 설정 변경 검증 완료 · main 병합**
 
 ## 현재 구현
 
@@ -105,25 +105,26 @@
 
 ## 검증
 
-- 이번 음정 설정 변경의 로컬 DSP retarget/블록 독립성, 활성 전환/PDC 정렬, observer 기준 변경
-  검사는 통과했다. Windows workspace/native VST3/Clippy/release/GPUI 통합 검사는 아직 실행 전이다.
-- [Audio #51](https://github.com/andongmin94/mix-live/actions/runs/45623727270) `f6b5b79` 전체 성공:
-  Windows workspace 검사 131개와 실제 native VST3 fixture 검사 13개, 총 **144개 성공**.
+- [Audio #54](https://github.com/andongmin94/mix-live/actions/runs/45630152738) `5342a4c` 전체 성공:
+  Windows workspace 검사 134개와 실제 native VST3 fixture 검사 13개, 총 **147개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
-  PR #4의 병합 tree가 검증한 source tree와 동일함을 확인했다.
-- 직전 변경에서 같은 지연의 PDC 이력 유지, 마지막 지연 제거, 잘못된 준비의 무변경 거절,
+  PR #5의 병합 tree가 검증한 source tree와 동일함을 확인했다.
+- 음정 설정 변경의 목표 주파수·retune, 분석 이력 유지, block 1/17/137/256 독립성,
+  켜기·끄기와 합성 VST 지연 0/71 samples에서 마이크·AUX/앱 송출 정렬을 확인했다.
+  모니터 보상 제외, 이전 보정기 반환, 잘못된 설정·합산 지연 초과의 무변경 거절도 통과했다.
+  입력 없는 worker의 설정 승인, 현재 observer 기준, UI 입력 파싱과 후속 VST3 지연 재준비도 검사했다.
+- VST3 체인은 같은 지연의 PDC 이력 유지, 마지막 지연 제거, 잘못된 준비의 무변경 거절,
   bypass 목록 재배치를 검사했다. native fixture에서는 입력 없는 첫 슬롯 추가, 서로 다른
   파라미터의 인스턴스 동일성·순서 유지, 잘못된 경로/레이아웃/인덱스 거절, 전체 삭제 후
   오디오 처리·AUX/앱 격리·빈 체인 snapshot 및 편집한 순서/bypass의 snapshot을 확인했다.
-  기존 state fixture의 파라미터 저장/복원과 음정 보정·라이브 EQ·limiter·Scene 13 검사도 통과했다.
-- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45623727270/artifacts/15028093063):
+  기존 state fixture의 파라미터 저장/복원과 라이브 EQ·limiter·Scene 13 검사도 통과했다.
+- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45630152738/artifacts/15032475037):
   `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe`와 의존성/라이선스 고지.
-  실장비 라이브 체인 UI 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
+  실장비의 실행 중 음정/체인 UI 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
 - [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) `08d0007` 성공:
   세 고정 INF/PnP ID, transport 격리, WDK/INF/unsigned catalog 및 미서명 거절·부재 검사 완료.
   드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는 미검증이다.
-- 로컬 core 지연 교체, capture 경로 18개 및 bypass 목록 재배치 검사도 통과했다.
 
 ## 남은 작업과 제한
 
