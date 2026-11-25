@@ -41,7 +41,7 @@ pub enum SceneCommand {
     Save {
         file: PathBuf,
         #[command(flatten)]
-        route: RouteOptions,
+        route: Box<RouteOptions>,
     },
     /// Read and validate saved settings, then print JSON. Does not open audio devices.
     Show { file: PathBuf },
@@ -146,7 +146,7 @@ pub struct RouteOptions {
     pub queue_ms: u32,
     /// Explicit initial mixer state in the Scene. Direct CLI runs use the normal defaults.
     #[arg(skip)]
-    pub mix: Box<MixSettings>,
+    pub mix: MixSettings,
 }
 
 impl RouteOptions {

@@ -161,7 +161,7 @@ impl LiveControls {
     pub fn from_route(route: &RouteOptions) -> Result<Self, String> {
         route.validate()?;
         let controls = Self::new(route.output_gain_db, route.send.as_ref().map(|_| route.send_gain_db), route.aux_input.is_some())?;
-        let settings = *route.mix;
+        let settings = route.mix;
         for (target, muted) in [(MuteTarget::Mic, settings.mute_mic), (MuteTarget::Output, settings.mute_output), (MuteTarget::All, settings.mute_all)] {
             controls.apply(LiveCommand::Mute { target, muted })?;
         }

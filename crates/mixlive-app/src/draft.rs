@@ -82,7 +82,7 @@ impl SceneDraft {
             }
             .into(),
             queue_ms: route.queue_ms.to_string(),
-            mix: *route.mix,
+            mix: route.mix,
             sound: SoundDraft::from_scene(scene),
         }
     }
@@ -145,7 +145,7 @@ impl SceneDraft {
                 vocal_strength: vocal.strength,
                 vocal_threshold_db: vocal.compressor_threshold_db,
                 deess_threshold_db: vocal.deess_threshold_db,
-                mix: Box::new(self.mix),
+                mix: self.mix,
                 queue_ms: self.queue_ms.trim().parse().map_err(|_| {
                     "Queue 목표에는 10~100 범위의 정수(ms)를 입력하세요.".to_owned()
                 })?,

@@ -35,7 +35,7 @@ fn run(cli: Cli, plugin: PluginArgs) -> Result<()> {
                 if !plugin.vst3_editor.is_empty() || plugin.vst3_chain_out.is_some() {
                     return Err("scene save does not run plugins; editor/chain-out options belong to run".into());
                 }
-                let scene = AudioScene::new(route, plugin.resolve()?.effects)?;
+                let scene = AudioScene::new(*route, plugin.resolve()?.effects)?;
                 scene.save_new(&file)?;
                 println!("Saved {} with {} embedded VST3 slot(s). No audio device or native plugin was opened; use scene check before scene run.", file.display(), scene.effects.len());
                 Ok(())
