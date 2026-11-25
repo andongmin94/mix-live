@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실행 상태를 포함하는 Scene 저장/복원 구현 · Windows 통합 검증 대기**
+단계: **실행 중 VST3 원본 창 열기·닫기·재열기 구현 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -21,6 +21,10 @@
 - 실행 중 정지 후 새 Scene 저장은 경로를 먼저 선택하고, 확정 후 장치 중지·worker join·모든 VST3 상태 수집을 수행한다.
   현재 mute, master/send gain, 네 연결과 gain을 다음 시작 전에 복원한다. 일반 정지/닫기는 변경을 버린다.
   실패 시 이전 Scene 선택 유지, 기존 파일 덮어쓰기 없음. 저장된 믹서 값은 보컬·장치 편집에서도 보존한다.
+- 실행 중 각 VST3 슬롯에서 원본 창 열기/닫기·재열기를 지원한다. 기존 인스턴스를 사용하며
+  창을 열 수 없으면 해당 요청을 거절하고, 종료/저장 시 기존 native teardown을 사용한다.
+  GPUI 메시지 루프에서 Win32 pump를 제거하고 native poll/창 조작은 UI 변경 참조 밖에서 실행한다.
+  CLI는 자체 pump를 유지한다. 창 조작 시 기존 fader 엔티티를 유지한다.
 - schema 4의 원자적 새 파일 저장을 사용한다. 덮어쓰기 없음, 취소/저장 실패는 이전 Scene 유지,
   성공은 새 파일 선택 후 명시적 시작 대기다. 실행 중 설정 편집은 막는다.
 - native 장치 조회/시작/종료는 GPUI foreground의 UI 객체 변경 참조 밖에서 실행한다.
@@ -47,13 +51,16 @@ Windows 검사 **88개**(workspace 79 + native VST3 fixture 9) 성공. Clippy의
 CLI Scene Save에 발생하여 release/GUI 검사는 실행되지 않았다.
 `6290cf91c828bff2dd9762d1af62cb8b473a3e0e`에서 Save의 큰 RouteOptions만 Box로 두고
 mix 설정은 인라인으로 유지하도록 수정했다. 린트 억제 없음.
-수정 후 [Audio #29](https://github.com/andongmin94/mix-live/actions/runs/45550324761)는 실행 중이다.
+수정 후 [Audio #29](https://github.com/andongmin94/mix-live/actions/runs/45550324761) 전체 성공:
+workspace/native fixture, Clippy, release 빌드 및 실제 Scene 편집·저장 GUI 검사 통과.
+이번 native 원본 창 변경의 Windows 통합 검증은 대기 중이다. 기존 instrumented synth fixture의
+창 attach/detach 및 동일 슬롯 재열기 검사를 추가했다(라이브 마이크용 stereo effect는 아님).
 실제 장치와 라이브 fader는 미검증이다.
 
 ## 남은 작업과 제한
 
-- GUI 원본 VST3 editor 통합/재열기와 CLI 전체 Scene snapshot 출력은 남아 있다.
-  실제 장치에서 정지 후 저장 및 재실행하는 전체 경로는 미검증이다.
+- CLI 전체 Scene snapshot 출력은 남아 있다. 실제 장치에서 정지 후 저장 및 재실행,
+  GPUI에서 상용 VST3 원본 창 열기/닫기와 실시간 오디오를 함께 사용하는 경로는 미검증이다.
 - 실제 MiniFuse/가상 케이블/상용 VST3 GUI·청취·왕복 지연·장시간 안정성은 미검증이다.
   실제 장치 교체 후 GUI 저장·시작도 실장비에서 확인해야 한다. 자동 검사/native fixture를
   실장비·음질·상용 호환성 검증으로 부르지 않는다.

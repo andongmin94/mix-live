@@ -122,6 +122,10 @@ mod device {
         let mut next_report = Duration::ZERO;
         let poll_interval = Duration::from_millis(if plugin.editors.is_empty() { 50 } else { 16 });
         while started.elapsed() < Duration::from_secs(seconds) && !active.controls.stop_requested() {
+            // The console owns its Win32 message loop. The GPUI caller never pumps here.
+            if !plugin.editors.is_empty() && !mixlive_vst3::editor::pump_editor_messages() {
+                return Err("native editor message loop was interrupted".into());
+            }
             active.poll_plugin()?;
             if let Some(error) = active.health.error() { return Err(error.into()); }
             if started.elapsed() >= next_report {

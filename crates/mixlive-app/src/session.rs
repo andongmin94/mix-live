@@ -55,7 +55,7 @@ impl Session {
         self.active.as_ref().map(|active| active.controls.as_ref())
     }
 
-    fn fail(&mut self, message: &str, error: impl ToString) -> Result<(), String> {
+    fn fail<T>(&mut self, message: &str, error: impl ToString) -> Result<T, String> {
         let error = error.to_string();
         self.message = message.into();
         self.error = Some(error.clone());
@@ -124,8 +124,8 @@ impl Session {
         let Some(scene) = self.scene() else {
             return self.fail("먼저 Scene을 열어 주세요.", "no scene is selected");
         };
-        // No native editor in this screen yet: GPUI owns the Windows message loop.
-        // The existing CLI editor pump must not dispatch GPUI messages during an entity update.
+        // GPUI owns the Windows message loop. Editors open later on explicit request,
+        // on the loading thread outside App/entity updates.
         let prepared = (|| {
             let plugins = PluginArgs::default().resolve_scene(scene.effects.clone())?;
             let prepared = Prepared::new(&scene.route).map_err(|error| error.to_string())?;
@@ -158,16 +158,36 @@ impl Session {
         }
     }
 
-    /// No sleeping or device I/O here. Native polling has no editor/global message pump.
-    pub fn poll(&mut self) -> Result<(), String> {
+    pub fn editor_is_open(&self, index: usize) -> bool {
+        self.active.as_ref().is_some_and(|active| active.editor_is_open(index))
+    }
+
+    /// Call outside a mutable GPUI update. An unavailable editor is not an audio-path fault.
+    pub fn set_editor_open(&mut self, index: usize, open: bool) -> Result<(), String> {
         let Some(active) = &mut self.active else {
-            return Ok(());
+            return self.fail("오디오 시작 후 원본 창을 열 수 있습니다.", "audio is not running");
         };
-        let result = active.poll_plugin().map_err(|error| error.to_string());
-        if let Err(error) = result {
-            // The view schedules stop outside its mutable update after this error.
-            return self.fail("오디오 경로 오류 · 정지 중입니다.", error);
+        match active.set_editor_open(index, open) {
+            Ok(()) => {
+                self.error = None;
+                self.message = format!("VST3 {} 원본 창 {} · 오디오 실행 중", index + 1,
+                    if open { "열림" } else { "닫힘" });
+                Ok(())
+            }
+            Err(error) => self.fail("VST3 원본 창을 변경하지 못했습니다.", error),
         }
+    }
+
+    /// Native editor servicing can resize/detach windows. Call outside mutable GPUI updates.
+    /// GPUI owns message dispatch; there is no Win32 pump here.
+    pub fn poll(&mut self) -> Result<bool, String> {
+        let Some(active) = &mut self.active else {
+            return Ok(false);
+        };
+        let dismissed = match active.poll_plugin() {
+            Ok(dismissed) => dismissed,
+            Err(error) => return self.fail("오디오 경로 오류 · 정지 중입니다.", error),
+        };
         if let Some(error) = active.health.error() {
             return self.fail("오디오 경로 오류 · 정지 중입니다.", error);
         }
@@ -175,7 +195,10 @@ impl Session {
             self.report = active.report();
             self.last_report = Instant::now();
         }
-        Ok(())
+        if dismissed {
+            self.message = "VST3 원본 창 닫힘 · 오디오 실행 중".into();
+        }
+        Ok(dismissed)
     }
 
     /// Explicitly finish and save a new Scene. Failure or an occupied path keeps the old selection.
@@ -204,11 +227,8 @@ impl Session {
         let result = active.finish(None).map_err(|error| error.to_string());
         match result {
             Ok(()) => {
-                self.message = if self.error.is_some() {
-                    "오류로 정지했습니다. 다시 시작하면 저장된 Scene 설정을 사용합니다.".into()
-                } else {
-                    "정지됨 · 다시 시작하면 저장된 Scene 설정을 사용합니다.".into()
-                };
+                self.error = None;
+                self.message = "정지됨 · 다시 시작하면 저장된 Scene 설정을 사용합니다.".into();
                 Ok(())
             }
             Err(error) => {
@@ -299,6 +319,8 @@ mod tests {
                 .is_err()
         );
         assert!(session.controls().is_none());
+        assert!(!session.editor_is_open(0));
+        assert!(session.set_editor_open(0, true).is_err());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("no-live-scene.json");
         assert!(session.stop_and_save(path.clone()).is_err());

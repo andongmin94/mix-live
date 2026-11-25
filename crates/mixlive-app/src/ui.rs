@@ -51,19 +51,19 @@ struct Fader {
     state: Entity<SliderState>,
 }
 
-#[derive(Clone)]
 enum Operation {
     Devices,
     EditDevices,
     Start,
     Stop,
     StopAndSave(PathBuf),
+    Editor { index: usize, open: bool },
     Close,
 }
 
 pub struct MixLive {
     session: Session,
-    busy: Option<Operation>,
+    busy: Option<&'static str>,
     picking: bool,
     details: bool,
     selected_name: String,
@@ -100,15 +100,42 @@ impl MixLive {
                 .unwrap_or(true)
         });
 
-        // The timer waits in the scheduler; poll/update itself remains on the
-        // foreground thread that loaded the native chain. No audio callback UI.
+        // Poll on the loading/foreground thread, but release App and entity borrows
+        // before native editor resize/detach can synchronously dispatch window messages.
         cx.spawn_in(window, async move |owner, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(50))
                     .await;
-                let alive = cx.update(|window, cx| {
-                    owner.update(cx, |this, cx| this.poll(window, cx)).is_ok()
+                let taken = cx.update(|_, cx| {
+                    owner.update(cx, |this, _| {
+                        if this.busy.is_some() || !this.session.running() {
+                            return None;
+                        }
+                        this.busy = Some("플러그인 상태 확인 중");
+                        Some(std::mem::take(&mut this.session))
+                    })
+                });
+                let mut session = match taken {
+                    Ok(Ok(Some(session))) => session,
+                    Ok(Ok(None)) => continue,
+                    _ => break,
+                };
+                let result = session.poll();
+                let alive = cx.update(move |window, cx| {
+                    owner.update(cx, |this, cx| {
+                        this.session = session;
+                        this.busy = None;
+                        match result {
+                            Err(_) => this.perform(Operation::Stop, window, cx),
+                            Ok(dismissed) => {
+                                if dismissed || this.last_refresh.elapsed() >= Duration::from_secs(1) {
+                                    this.last_refresh = Instant::now();
+                                    cx.notify();
+                                }
+                            }
+                        }
+                    }).is_ok()
                 });
                 if !matches!(alive, Ok(true)) {
                     break;
@@ -129,20 +156,6 @@ impl MixLive {
             form_subscription: None,
             workspace_scroll: ScrollHandle::new(),
             last_refresh: Instant::now(),
-        }
-    }
-
-    fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy.is_some() || !self.session.running() {
-            return;
-        }
-        if self.session.poll().is_err() {
-            self.perform(Operation::Stop, window, cx);
-            return;
-        }
-        if self.last_refresh.elapsed() >= Duration::from_secs(1) {
-            self.last_refresh = Instant::now();
-            cx.notify();
         }
     }
 
@@ -337,9 +350,21 @@ impl MixLive {
         {
             return;
         }
-        self.busy = Some(operation.clone());
-        self.faders.clear();
-        self.subscriptions.clear();
+        let editor_only = matches!(operation, Operation::Editor { .. });
+        if editor_only && (!self.session.running() || self.picking) {
+            return;
+        }
+        self.busy = Some(match &operation {
+            Operation::Devices | Operation::EditDevices => "장치 조회 중",
+            Operation::Start => "시작 중",
+            Operation::Stop | Operation::Close => "정지 중",
+            Operation::StopAndSave(_) => "정지 및 저장 중",
+            Operation::Editor { .. } => "VST3 원본 창 변경 중",
+        });
+        if !editor_only {
+            self.faders.clear();
+            self.subscriptions.clear();
+        }
         let mut session = std::mem::take(&mut self.session);
         cx.notify();
         cx.spawn_in(window, async move |owner, cx| {
@@ -350,6 +375,10 @@ impl MixLive {
                 }
                 Operation::Start => {
                     let _ = session.start();
+                    None
+                }
+                Operation::Editor { index, open } => {
+                    let _ = session.set_editor_open(*index, *open);
                     None
                 }
                 Operation::StopAndSave(path) => {
@@ -388,7 +417,9 @@ impl MixLive {
                             }
                         }
                     }
-                    this.install_faders(cx);
+                    if !editor_only {
+                        this.install_faders(cx);
+                    }
                     cx.notify();
                 });
                 if matches!(operation, Operation::Close) {
@@ -539,11 +570,8 @@ impl MixLive {
 
     fn header(&self, cx: &Context<Self>) -> Div {
         let running = self.session.running();
-        let (status, color) = match &self.busy {
-            Some(Operation::Devices | Operation::EditDevices) => ("장치 조회 중", MUTED),
-            Some(Operation::Start) => ("시작 중", MUTED),
-            Some(Operation::Stop | Operation::Close) => ("정지 중", MUTED),
-            Some(Operation::StopAndSave(_)) => ("정지 및 저장 중", MUTED),
+        let (status, color) = match self.busy {
+            Some(status) => (status, MUTED),
             None if running => ("오디오 실행 중", ACCENT),
             None if self.form.is_some() => ("Scene 설정", MUTED),
             None if self.session.error.is_some() => ("확인 필요", DANGER),
@@ -773,11 +801,21 @@ impl MixLive {
                             .child(div().truncate().text_sm().child(name))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(
                                 if effect.state.is_some() {
-                                    "저장된 상태"
+                                    "저장된 시작 상태"
                                 } else {
-                                    "플러그인 기본 상태"
+                                    "플러그인 기본 시작 상태"
                                 },
-                            )),
+                            ))
+                            .children(self.session.running().then(|| {
+                                let open = !self.session.editor_is_open(index);
+                                let label = if open { "원본 창 열기" } else { "원본 창 닫기" };
+                                button(("vst3-editor", index), label, false)
+                                    .accessibility_label(format!("VST3 {} {label}", index + 1))
+                                    .disabled(self.busy.is_some() || self.picking)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.perform(Operation::Editor { index, open }, window, cx);
+                                    }))
+                            })),
                     ),
             );
         }
@@ -1306,7 +1344,7 @@ fn detail_text(label: &'static str, text: &str) -> Div {
         .child(div().text_xs().child(text.to_owned()))
 }
 
-pub(crate) fn button(id: &'static str, label: &'static str, primary: bool) -> Button {
+pub(crate) fn button(id: impl Into<ElementId>, label: &'static str, primary: bool) -> Button {
     Button::new(id)
         .accessibility_label(label)
         .child(label)

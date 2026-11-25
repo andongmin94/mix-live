@@ -319,10 +319,23 @@ where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
 }
 
 impl Active {
-    /// Service plugin/editor requests on the loading/control thread, never a device callback.
-    pub fn poll_plugin(&mut self) -> Result<()> {
-        if let Some(worker) = &mut self.plugin_worker { worker.poll()?; }
-        Ok(())
+    /// Service plugin/editor requests on the loading/control thread, outside UI borrows.
+    /// The caller owns message dispatch. Return whether any editor was dismissed.
+    pub fn poll_plugin(&mut self) -> Result<bool> {
+        match &mut self.plugin_worker {
+            Some(worker) => Ok(worker.poll()?),
+            None => Ok(false),
+        }
+    }
+
+    pub fn editor_is_open(&self, index: usize) -> bool {
+        self.plugin_worker.as_ref().is_some_and(|worker| worker.editor_is_open(index))
+    }
+
+    /// Use the existing live instance, never open a separate inspection/edit copy.
+    pub fn set_editor_open(&mut self, index: usize, open: bool) -> Result<()> {
+        let worker = self.plugin_worker.as_mut().ok_or("no active VST3 chain")?;
+        Ok(worker.set_editor_open(index, open)?)
     }
 
     /// Explicit normal completion. Stop all devices before joining/snapshotting the plugin.

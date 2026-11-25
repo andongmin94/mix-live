@@ -47,7 +47,10 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
         Some((0.0, AuxDestination::Send)), vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
     let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, true, health.clone()).unwrap();
     assert!(worker.description.contains("Serial chain: 2 effects"));
-    assert!(open_editor(worker.slots[0].plugin.clone()).err().unwrap().contains("no native editor"));
+    assert!(worker.set_editor_open(0, true).unwrap_err().contains("no native editor"));
+    assert!(!worker.editor_is_open(0));
+    assert!(worker.set_editor_open(2, true).is_err());
+    assert!(!health.failed());
     for count in [1, 137, 256, 219, 923] { input.push(&vec![0.4; count], Some(&vec![[0.1, -0.2]; count])); }
     wait_for(&mut worker, &health, 1536);
     for _ in 0..512 { reader.next_frame([1.0; 2]); }
@@ -96,6 +99,59 @@ fn native_serial_stages_preserve_distinct_stereo_and_partial_blocks() {
         assert!(right.iter().all(|value| (value + 0.05).abs() < 1e-6));
     }
     for processor in processors { processor.plugin.lock().unwrap().stop_processing().unwrap(); }
+}
+
+#[test]
+#[ignore = "requires existing MIXLIVE_STATE_VST3 editor fixture; native windows, no devices"]
+fn native_editors_reopen_on_the_same_slots_and_detach_independently() {
+    let health = Arc::new(Health::default());
+    let spec = fixture("MIXLIVE_STATE_VST3");
+    // This instrumented synth is NOT a supported stereo vocal effect. Exercise only
+    // the native editor/slot lifecycle, without constructing a live capture route.
+    let slots = [0.23, 0.61].into_iter().map(|gain| {
+        let mut plugin = load_effect(&spec, 48000).unwrap();
+        let _ = plugin.take_restart_flags();
+        plugin.start_processing().unwrap();
+        plugin.set_parameter(0, gain).unwrap();
+        Slot { plugin: Arc::new(Mutex::new(plugin)), editor: None }
+    }).collect();
+    let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
+        stopped: false, health: health.clone(), description: String::new() };
+    // Upstream's documented Editor Attached instrumentation (read-only parameter 1000).
+    let attached = |worker: &PluginWorker, index: usize| {
+        worker.slots[index].plugin.lock().unwrap().get_parameter(1000).unwrap()
+    };
+    assert_eq!(attached(&worker, 0), 0.0);
+    worker.set_editor_open(0, true).unwrap();
+    worker.set_editor_open(0, true).unwrap(); // idempotent; no replacement view
+    worker.set_editor_open(1, true).unwrap();
+    assert!(worker.editor_is_open(0) && worker.editor_is_open(1));
+    for _ in 0..5 {
+        assert!(mixlive_vst3::editor::pump_editor_messages());
+        assert!(!worker.poll().unwrap());
+    }
+    assert_eq!(attached(&worker, 0), 1.0);
+    assert_eq!(attached(&worker, 1), 1.0);
+    worker.set_editor_open(0, false).unwrap();
+    assert!(!worker.editor_is_open(0) && worker.editor_is_open(1));
+    assert_eq!(attached(&worker, 0), 0.0);
+    assert_eq!(attached(&worker, 1), 1.0);
+    worker.set_editor_open(0, true).unwrap();
+    assert!(mixlive_vst3::editor::pump_editor_messages());
+    worker.poll().unwrap();
+    assert!(worker.editor_is_open(0));
+    assert_eq!(attached(&worker, 0), 1.0);
+    // A normal stop detaches both windows, then saves every slot.
+    let instances: Vec<_> = worker.slots.iter().map(|slot| slot.plugin.clone()).collect();
+    let snapshot = worker.snapshot().unwrap();
+    assert_eq!(snapshot.effects.len(), 2);
+    for (instance, effect, expected) in instances.iter().zip(&snapshot.effects)
+        .zip([0.23, 0.61]).map(|((instance, effect), expected)| (instance, effect, expected)) {
+        assert_eq!(instance.lock().unwrap().get_parameter(1000).unwrap(), 0.0);
+        let restored = load_effect(effect, 48000).unwrap();
+        assert!((restored.get_parameter(0).unwrap() - expected).abs() < 1e-6);
+    }
+    assert!(!health.failed());
 }
 
 #[test]

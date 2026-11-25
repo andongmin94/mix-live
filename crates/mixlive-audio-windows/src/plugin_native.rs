@@ -1,7 +1,7 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
 use super::{ChainFile, EffectSpec, ResolvedPlugins};
 use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}};
-use mixlive_vst3::editor::{flush_editor_changes, pump_editor_messages};
+use mixlive_vst3::editor::flush_editor_changes;
 use rtrb::{Producer, RingBuffer};
 use std::{path::Path, sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
 use vst3_host::{Plugin, PluginWindow, Vst3Host, audio::BusAudioBuffers, plugin::ProcessMode};
@@ -79,15 +79,14 @@ pub fn connect(capture: Capture, setup: &ResolvedPlugins, rate: u32, queue_ms: u
     }).collect::<Result<Vec<_>, _>>()?;
     let (input, mut worker) = spawn(capture, plugins, rate, queue_ms, has_aux, health)?;
     for &index in &setup.editors {
-        let slot = &mut worker.slots[index as usize - 1];
-        slot.editor = Some(open_editor(slot.plugin.clone()).map_err(|e| format!("VST3 slot {index}: {e}"))?);
+        worker.set_editor_open(index as usize - 1, true)?;
     }
     Ok((CaptureSink::Queued(input), Some(worker)))
 }
 
 fn open_editor(plugin: Arc<Mutex<Plugin>>) -> Result<PluginWindow, String> {
     if !plugin.lock().map_err(|_| "VST3 processing state was poisoned")?.has_editor() {
-        return Err("this VST3 has no native editor; omit this --vst3-editor slot".into());
+        return Err("this VST3 has no native editor".into());
     }
     let mut window = PluginWindow::new(plugin);
     window.open().map_err(|e| e.to_string())?;
@@ -183,19 +182,39 @@ fn stop_and_snapshot(plugin: &mut Plugin, save: bool) -> Result<Option<EffectSpe
 }
 
 impl PluginWorker {
-    pub fn poll(&mut self) -> Result<(), String> {
-        // Pump once per host iteration, never with a plugin mutex held.
-        if self.slots.iter().any(|slot| slot.editor.is_some()) && !pump_editor_messages() {
-            self.health.fail(Fault::Routing);
-            return Err("native editor message loop was interrupted".into());
+    pub fn editor_is_open(&self, index: usize) -> bool {
+        self.slots.get(index).and_then(|slot| slot.editor.as_ref()).is_some_and(PluginWindow::is_open)
+    }
+
+    /// Explicit request on the loading thread. Closing/reopening never reloads the effect.
+    pub fn set_editor_open(&mut self, index: usize, open: bool) -> Result<(), String> {
+        let slot = self.slots.get_mut(index).ok_or("VST3 slot is outside the active chain")?;
+        if !open {
+            drop(slot.editor.take());
+            return Ok(());
         }
+        if self.health.failed() { return Err("audio path has failed; stop before opening an editor".into()); }
+        if slot.editor.as_ref().is_some_and(PluginWindow::is_open) { return Ok(()); }
+        // A dismissed window still owns an attached view until it is dropped.
+        drop(slot.editor.take());
+        slot.editor = Some(open_editor(slot.plugin.clone()).map_err(|e| format!("VST3 slot {}: {e}", index + 1))?);
+        Ok(())
+    }
+
+    /// The application owns message dispatch (GPUI's loop or the CLI's explicit pump).
+    /// Service native requests outside UI borrows. Return whether any window was dismissed.
+    pub fn poll(&mut self) -> Result<bool, String> {
+        let mut dismissed = false;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if let Some(editor) = &mut slot.editor {
                 if let Err(error) = editor.service_platform_events() {
                     self.health.fail(Fault::Routing);
                     return Err(format!("VST3 slot {}: {error}", index + 1));
                 }
-                if editor.closed_by_user() { drop(slot.editor.take()); }
+                if editor.closed_by_user() {
+                    drop(slot.editor.take());
+                    dismissed = true;
+                }
             }
         }
         if self.thread.as_ref().is_some_and(|worker| worker.is_finished()) && !self.stop.load(Ordering::Relaxed) && !self.health.failed() {
@@ -219,7 +238,7 @@ impl PluginWorker {
             let _ = plugin.take_host_notifications();
             let _ = plugin.take_parameter_edits();
         }
-        Ok(())
+        Ok(dismissed)
     }
 
     fn shutdown(&mut self, save: bool) -> Result<Option<ChainFile>, String> {
