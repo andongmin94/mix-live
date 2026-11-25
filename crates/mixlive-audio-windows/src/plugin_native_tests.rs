@@ -1,5 +1,5 @@
 use super::*;
-use crate::{bridge::channel, config::AuxDestination, control::LiveControls};
+use crate::{bridge::channel, control::LiveControls};
 use mixlive_effects::{VocalChain, VocalConfig};
 use std::time::Instant;
 
@@ -47,8 +47,9 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
     controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
     controls.apply("route app2 broadcast on".parse().unwrap()).unwrap();
     let (writer, mut reader) = channel(48000, 48000, 10, 3, health.clone()).unwrap();
+    controls.apply("route aux send on".parse().unwrap()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        Some((0.0, AuxDestination::Send)), &[0.0, 0.0], vec![(writer, vec![0, 1, 2])], health.clone(), controls.clone()).unwrap();
+        vec![(writer, vec![0, 1, 2])], health.clone(), controls.clone()).unwrap();
     let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, true, health.clone()).unwrap();
     assert!(worker.description.contains("Serial chain: 2 effects"));
     // The existing native gain fixture reports zero latency; it must not acquire an artificial delay.
@@ -89,7 +90,7 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap());
     let (writer, _reader) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        None, &[], vec![(writer, vec![0])], health.clone(), controls).unwrap();
+        vec![(writer, vec![0])], health.clone(), controls).unwrap();
     let plugins = vec![load_effect(&spec, 48000).unwrap(), load_effect(&fixture("MIXLIVE_STATE_VST3"), 48000).unwrap()];
     let error = spawn(capture, plugins, 48000, 30, false, health).err().unwrap();
     assert!(error.contains("slot 2") && error.contains("stereo"));
@@ -105,7 +106,7 @@ fn built_in_room_reaches_the_live_native_effect_as_stereo() {
         let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0, config).unwrap());
         let (writer, reader) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
         let capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
-            None, &[], vec![(writer, vec![0])], health.clone(), controls).unwrap();
+            vec![(writer, vec![0])], health.clone(), controls).unwrap();
         (capture, reader, health)
     };
     let (capture, mut reader, health) = prepare();

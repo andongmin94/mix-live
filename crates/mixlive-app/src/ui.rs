@@ -36,6 +36,7 @@ pub(crate) const DANGER: u32 = 0xff8997;
 enum FaderTarget {
     Gain(GainTarget),
     Route(RouteSource, RouteMix),
+    Trim(RouteSource),
     Vocal(VocalParameter),
 }
 
@@ -44,6 +45,7 @@ impl FaderTarget {
         match self {
             Self::Gain(target) => LiveCommand::Gain { target, db: value },
             Self::Route(source, mix) => LiveCommand::RouteGain { source, mix, db: value },
+            Self::Trim(source) => LiveCommand::SourceTrim { source, db: value },
             Self::Vocal(parameter) => LiveCommand::Vocal { parameter, value },
         }
     }
@@ -468,6 +470,9 @@ impl MixLive {
             values.push((FaderTarget::Gain(target), controls.gain_db(target).expect("configured mix")));
         }
         for source in controls.sources() {
+            if source != RouteSource::Mic {
+                values.push((FaderTarget::Trim(source), controls.source_trim_db(source).expect("configured source")));
+            }
             for mix in controls.mixes() {
                 let (_, db) = controls
                     .route_state(source, mix)
@@ -1033,7 +1038,13 @@ impl MixLive {
                 .child(peak_meter("마이크 입력 · trim 전", levels.map(|l| l.mic_input)))
                 .child(peak_meter("내장 보정 후 · VST3 전", levels.map(|l| l.vocal.output_peak)))
                 .child(peak_meter("보컬 체인 후 · mute 전", levels.map(|l| l.voice)))
-                .children(controls.has_aux().then(|| peak_meter("AUX 입력 · trim/mute 전", levels.and_then(|l| l.aux_input))))
+                .children(controls.has_aux().then(|| {
+                    div().flex().flex_col().gap_2()
+                        .child(peak_meter("AUX 입력 · trim/mute 전", levels.and_then(|l| l.aux_input)))
+                        .child(div().text_sm().child("AUX / MR 입력 trim"))
+                        .child(self.fader("aux-trim", "AUX / MR 입력 trim", FaderTarget::Trim(RouteSource::Aux),
+                            controls.source_trim_db(RouteSource::Aux).expect("configured AUX"), cx))
+                }))
                 .children(levels.map(|l| {
                     div().text_xs().text_color(rgb(MUTED)).child(format!(
                         "내장 보정 GR · 컴프레서 {:.1} / 디에서 {:.1} dB",
@@ -1047,6 +1058,10 @@ impl MixLive {
                     .child(div().flex_1().min_w_0().font_semibold().child(label.clone()))
                     .child(self.mute(("mute-app", index), &format!("{label} 음소거"), MuteTarget::App(index), cx)))
                 .child(peak_meter("앱 입력 · trim/mute 전", levels.and_then(|l| l.app_inputs[index])))
+                .child(div().text_sm().child("입력 trim"))
+                .child(self.fader(("app-trim", index), &format!("{label} 입력 trim"),
+                    FaderTarget::Trim(RouteSource::App(index)),
+                    controls.source_trim_db(RouteSource::App(index)).expect("configured app"), cx))
                 .child(div().text_xs().text_color(rgb(MUTED)).truncate().child(app.path.clone())));
         }
         for mix in controls.mixes() {

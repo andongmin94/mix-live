@@ -4,7 +4,7 @@ use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, 
 use mixlive_effects::VocalChain;
 use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget, resolve_apps};
 use crate::process_capture::{self, ProcessCapture};
-use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{LiveControls, PlaybackGains}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
+use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{InputMap, OutputMap, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{LiveControls, PlaybackGains, RouteSource}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -70,8 +70,7 @@ pub struct Prepared {
     input_config: SupportedStreamConfig,
     input_channel: usize,
     auxiliary: Option<AuxiliaryEndpoint>,
-    apps: Vec<(String, ProcessTarget, InputMap, f32)>,
-    aux_mix: Option<(f32, AuxDestination)>,
+    apps: Vec<(String, ProcessTarget, InputMap)>,
     vocal: VocalChain,
     output_gain_db: f32,
     mix_gains_db: [f32; MAX_MIXES],
@@ -126,7 +125,7 @@ impl Prepared {
         let apps = if options.apps.is_empty() { Vec::new() } else {
             let targets = resolve_apps(&options.apps, &process_capture::app_catalog())?;
             options.apps.iter().zip(targets).map(|(app, target)| -> Result<_> {
-                Ok((app.path.clone(), target, InputMap::new(&app.channels, 2)?, app.gain_db))
+                Ok((app.path.clone(), target, InputMap::new(&app.channels, 2)?))
             }).collect::<Result<Vec<_>>>()?
         };
         let vocal = VocalChain::new(input_config.sample_rate(), options.vocal_config())?;
@@ -153,7 +152,7 @@ impl Prepared {
         };
         for (mix, id, channels) in options.playback_bindings() { add(id, channels, mix)?; }
         Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal,
-            auxiliary, apps, aux_mix: options.has_aux().then_some((options.aux_gain_db, options.aux_to)),
+            auxiliary, apps,
             output_gain_db: options.output_gain_db, mix_gains_db: [options.monitor_gain_db, options.send_gain_db, options.broadcast_gain_db],
             queue_ms: options.queue_ms, controls: Arc::new(LiveControls::from_route(options)?), outputs })
     }
@@ -168,13 +167,14 @@ impl Prepared {
             }
         }
         if let Some(aux) = &self.auxiliary {
-            text.push_str(&format!("AUX input: {}\n  {:?}; channels {},{}; mix settings {:?}\n  {}\n",
-                aux.device, aux.config, aux.map.left + 1, aux.map.right + 1, self.aux_mix,
+            text.push_str(&format!("AUX input: {}\n  {:?}; channels {},{}; trim {:.1} dB\n  {}\n",
+                aux.device, aux.config, aux.map.left + 1, aux.map.right + 1, self.controls.source_trim_db(RouteSource::Aux).expect("configured AUX"),
                 if aux.device == self.input { "shares the microphone capture stream and clock" }
                 else { "separate capture stream; buffered/resampled to the microphone clock (additional AUX delay)" }));
             text.push_str("AUX must carry only the intended MR/line audio, not MixLive output or call return. No app filtering or external feedback detection. Enable output/both only when AUX is not already heard through another path.\n");
         }
-        for (index, (path, target, map, gain)) in self.apps.iter().enumerate() {
+        for (index, (path, target, map)) in self.apps.iter().enumerate() {
+            let gain = self.controls.source_trim_db(RouteSource::App(index)).expect("configured app");
             text.push_str(&format!("App {}: {path}\n  PID {} and descendants; 48000 Hz float32 stereo, channels {},{}; trim {gain} dB\n  Independent clock bridge. Original application playback is unchanged; no automatic rebind or whole-desktop capture.\n",
                 index + 1, target.pid, map.left + 1, map.right + 1));
         }
@@ -239,18 +239,16 @@ impl Prepared {
         let mut app_readers = Vec::with_capacity(self.apps.len());
         let mut app_clock_stats = Vec::with_capacity(self.apps.len());
         let mut app_captures = Vec::with_capacity(self.apps.len());
-        let mut app_gains = Vec::with_capacity(self.apps.len());
-        for (index, (path, target, map, gain)) in self.apps.into_iter().enumerate() {
+        for (index, (path, target, map)) in self.apps.into_iter().enumerate() {
             let (writer, reader) = bridge::channel(process_capture::RATE, self.input_config.sample_rate(), self.queue_ms, 1, health.clone())?;
             timing.push(format!("App {} boundary: queue target {:.2} ms + resampler delay {:.2} ms (excludes OS/hardware)", index + 1, reader.queue_ms, reader.resampler_delay_ms));
             app_clock_stats.push(reader.stats.clone());
             app_captures.push(ProcessCapture::prepare(path, target, map, writer, health.clone())?);
             app_readers.push(reader);
-            app_gains.push(gain);
         }
-        let capture = Capture::new(self.vocal, self.input_config.sample_rate(), self.aux_mix, &app_gains, writers, health.clone(), controls.clone())?;
+        let capture = Capture::new(self.vocal, self.input_config.sample_rate(), writers, health.clone(), controls.clone())?;
         let vocal_stats = capture.vocal_stats.clone();
-        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, self.aux_mix.is_some(), health.clone())?;
+        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, controls.has_aux(), health.clone())?;
         if let Some(worker) = &plugin_worker { timing.push(worker.description.clone()); }
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
@@ -271,7 +269,7 @@ impl Prepared {
         if let Some(stream) = &aux_stream { stream.play()?; }
         input_stream.play()?;
         Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, _app_captures: app_captures, plugin_worker, health, outputs: stats,
-            controls, aux_enabled: self.aux_mix.is_some(), aux_clock_stats, app_clock_stats, vocal_stats, timing })
+            aux_enabled: controls.has_aux(), controls, aux_clock_stats, app_clock_stats, vocal_stats, timing })
     }
 }
 

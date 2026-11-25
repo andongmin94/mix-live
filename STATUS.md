@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **가상 장치 개발 패키지 빌드 완료 · CLI 전체 Scene snapshot 추가**
+단계: **가상 장치 개발 패키지 빌드 완료 · 라이브 소스 trim 추가**
 
 ## 현재 구현
 
@@ -16,6 +16,8 @@
   제공한다. 새 앱은 모든 경로 off. 물리 AUX도 함께 사용할 수 있다. 중복/겹치는 프로세스 트리,
   모호한 루트, MixLive를 포함한 트리는 거절한다. 앱 이름이나 PID를 추정해 자동 선택하지 않는다.
 - 실행 중 mic/AUX/앱별 mute 및 각 목적지로의 send·gain, master/믹스별 감쇠·출력 mute를 조절한다.
+  AUX/앱 공통 trim은 기존 Scene 필드에서 시작하고 GUI/CLI에서 실시간 조절한다.
+  입력 clock에서 5 ms ramp를 한 번 적용하고 PDC 이후 mute/send gain을 유지한다.
   실제 입력 peak·보컬 체인 전후·gain reduction·출력별 peak를 약 100ms마다 읽는다.
   앱별 peak와 clock 진단도 독립적이다. callback/worker 버퍼는 준비 시 고정 용량으로 만든다.
 - 정지 상태의 장치·출력 설정은 기존 장치/앱·채널·보컬·플러그인 설정과 모든 앱의 mixer 값을
@@ -72,8 +74,10 @@
   미서명 거절·부재 검사 workflow 완료.
   드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는
   검증하지 않았다.
-- CLI 전체 Scene snapshot: 종료 이후 명령 차단/저장값 복원과 두 CLI 경로의 충돌·실패 시 미게시
-  회귀 테스트를 추가했다. 변경된 Rust/CLI의 Audio CI 결과는 아직 확인하지 않았다.
+- [Audio #38](https://github.com/andongmin94/mix-live/actions/runs/45571558178) 성공:
+  `9817ec6`의 CLI 전체 Scene snapshot/종료 입력 차단을 포함한 Windows 통합 검사 통과.
+- 라이브 AUX/앱 trim: stereo ramp, 지연 이전 적용, raw meter 및 snapshot/입력 검증 회귀 테스트를
+  추가했다. 변경된 Rust/GPUI의 Audio CI 결과는 아직 확인하지 않았다.
 
 ## 남은 작업과 제한
 

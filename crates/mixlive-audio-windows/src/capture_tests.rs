@@ -1,5 +1,5 @@
 use super::*;
-use crate::{bridge::{channel, QUANTUM}, control::PlaybackGains};
+use crate::{bridge::{channel, QUANTUM}, config::AuxDestination, control::{LiveCommand, PlaybackGains}};
 use mixlive_effects::{Preset, VocalConfig};
 
 #[test]
@@ -12,7 +12,7 @@ fn one_capture_feeds_two_independent_mixes_without_dry_bypass() {
     let mut a_gain = PlaybackGains::new(48000, &[0], controls.clone()).unwrap();
     let mut b_gain = PlaybackGains::new(48000, &[1], controls.clone()).unwrap();
     let vocal = VocalChain::new(48000, config).unwrap();
-    let mut capture = Capture::new(vocal, 48000, None, &[], vec![(first, vec![0]), (second, vec![1])], health.clone(), controls).unwrap();
+    let mut capture = Capture::new(vocal, 48000, vec![(first, vec![0]), (second, vec![1])], health.clone(), controls).unwrap();
     let prime = (monitor.queue_ms * 48.0).round() as usize + 1024;
     capture.push(&vec![0.4; prime], None, &[]);
     for _ in 0..4 * QUANTUM { monitor.next_frame(a_gain.next_gains()); send.next_frame(b_gain.next_gains()); }
@@ -36,7 +36,7 @@ fn vocal_is_processed_once_before_sends_and_playback_attenuation() {
     let controls = Arc::new(LiveControls::new(-18.0, [Some(0.0), Some(-6.0), None], false, 0, config).unwrap());
     let (first, _a) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let (second, _b) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
-    let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000, None, &[],
+    let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
         vec![(first, vec![0]), (second, vec![1])], health.clone(), controls).unwrap();
     capture.push(&input, None, &[]);
     assert!(!health.failed());
@@ -64,7 +64,7 @@ fn shared_endpoint_applies_independent_gains_after_one_resampler() {
     let (writer, mut reader) = channel(48_000, 48_000, 10, 2, health.clone()).unwrap();
     let mut gains = PlaybackGains::new(48000, &[0, 1], controls.clone()).unwrap();
     let vocal = VocalChain::new(48000, VocalConfig::default()).unwrap();
-    let mut capture = Capture::new(vocal, 48000, None, &[], vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
+    let mut capture = Capture::new(vocal, 48000, vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
     let prime = (reader.queue_ms * 48.0).round() as usize + 1024;
     for chunk in vec![0.4; prime].chunks(137) { capture.push(chunk, None, &[]); }
     for _ in 0..4 * QUANTUM { reader.next_frame(gains.next_gains()); }
@@ -97,8 +97,12 @@ fn aux_is_stereo_selective_and_never_passes_through_vocal_processing() {
         let aux = vec![[2.0, -1.0]; input.len()];
         let mut expected = vec![0.0; input.len()];
         VocalChain::new(48000, config).unwrap().process(&input, &mut expected, &mut vec![0.0; input.len()]).unwrap();
+        controls.apply(LiveCommand::SourceTrim { source: RouteSource::Aux, db: -12.0 }).unwrap();
+        for mix in controls.mixes() {
+            controls.apply(LiveCommand::Route { source: RouteSource::Aux, mix, enabled: destination.includes(mix.index()) }).unwrap();
+        }
         let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
-            Some((-12.0, destination)), &[], vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+            vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
         let mut start = 0;
         for count in [1, 137, 256, 219] {
             capture.push(&input[start..start + count], Some(&aux[start..start + count]), &[]);
@@ -140,8 +144,9 @@ fn live_routes_keep_call_vocals_while_removing_only_monitor_vocals() {
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, config).unwrap());
     let (writer, _reader) = channel(48_000, 48_000, 30, 2, health.clone()).unwrap();
     let mut reference = VocalChain::new(48000, config).unwrap();
+    controls.apply("route aux send on".parse().unwrap()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
-        Some((0.0, AuxDestination::Send)), &[], vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+        vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
     assert_eq!(controls.route_targets()[..6], [1.0, 1.0, 0.0, 0.0, 1.0, 0.0]);
     controls.apply("route mic output off".parse().unwrap()).unwrap();
     controls.apply("route aux output on".parse().unwrap()).unwrap();
@@ -184,8 +189,11 @@ fn single_output_route_fades_are_block_invariant_and_keep_inactive_routes_off() 
             let health = Arc::new(Health::default());
             let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], has_aux, 0, VocalConfig::default()).unwrap());
             let (writer, _reader) = channel(48_000, 48_000, 30, 1, health.clone()).unwrap();
+            if has_aux {
+                controls.apply("route aux output on".parse().unwrap()).unwrap();
+            }
             let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-                has_aux.then_some((0.0, AuxDestination::Output)), &[], vec![(writer, vec![0])], health.clone(), controls.clone()).unwrap();
+                vec![(writer, vec![0])], health.clone(), controls.clone()).unwrap();
             controls.apply("route mic output off".parse().unwrap()).unwrap();
             controls.apply("level mic output -6".parse().unwrap()).unwrap();
             let mut result = Vec::new();
@@ -216,8 +224,9 @@ fn external_effect_preserves_stereo_and_never_processes_aux_or_falls_back_to_dry
     let health = Arc::new(Health::default());
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, VocalConfig::default()).unwrap());
     let (writer, mut reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+    controls.apply("route aux send on".parse().unwrap()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        Some((0.0, AuxDestination::Send)), &[], vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
+        vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
     let mut calls = 0;
     capture.push_with_effect(&[0.4; 613], Some(&[[0.1, -0.2]; 613]), &[], &mut |left, right| {
         calls += 1;
@@ -243,8 +252,12 @@ fn separate_app_sources_keep_stereo_and_mix_minus_with_and_without_physical_aux(
         controls.apply("route app2 output on".parse().unwrap()).unwrap();
         controls.apply("level app2 output -6".parse().unwrap()).unwrap();
         let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+        if has_aux {
+            for mix in controls.mixes() {
+                controls.apply(LiveCommand::Route { source: RouteSource::Aux, mix, enabled: AuxDestination::Both.includes(mix.index()) }).unwrap();
+            }
+        }
         let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-            has_aux.then_some((0.0, AuxDestination::Both)), &[0.0, 0.0],
             vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
         let mic = [0.1; 256];
         let aux = [[0.05, 0.02]; 256];
@@ -293,7 +306,7 @@ fn broadcast_and_monitor_route_independently_with_or_without_call() {
         let (writer, mut reader) = channel(48000, 48000, 10, bindings.len(), health.clone()).unwrap();
         let mut gains = PlaybackGains::new(48000, &bindings, controls.clone()).unwrap();
         let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-            None, &[0.0, 0.0], vec![(writer, bindings)], health.clone(), controls.clone()).unwrap();
+            vec![(writer, bindings)], health.clone(), controls.clone()).unwrap();
         let mic = vec![0.1; 1536];
         let music = vec![[0.2, -0.1]; 1536];
         let return_audio = vec![[-0.05, 0.3]; 1536];
@@ -340,8 +353,11 @@ fn reported_vst3_delay_aligns_stereo_sends_across_blocks_without_delaying_monito
         let bindings: Vec<_> = controls.mixes().map(RouteMix::index).collect();
         let (writer, _reader) = channel(48000, 48000, 30, bindings.len(), health.clone()).unwrap();
         let aux_to = if call { AuxDestination::All } else { AuxDestination::OutputBroadcast };
+        for mix in controls.mixes() {
+            controls.apply(LiveCommand::Route { source: RouteSource::Aux, mix, enabled: aux_to.includes(mix.index()) }).unwrap();
+        }
         let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-            Some((0.0, aux_to)), &[0.0, 0.0], vec![(writer, bindings.clone())], health.clone(), controls).unwrap();
+            vec![(writer, bindings.clone())], health.clone(), controls).unwrap();
         assert!(capture.prepare_vst3_delay(96_001, 48000).is_err());
         assert_eq!(capture.prepare_vst3_delay(LATENCY as u64, 48000).unwrap(), LATENCY);
 
@@ -398,8 +414,9 @@ fn source_mute_applies_after_compensation_and_route_reenable_keeps_current_histo
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, VocalConfig::default()).unwrap());
     controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
     let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+    controls.apply("route aux broadcast on".parse().unwrap()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        Some((0.0, AuxDestination::Broadcast)), &[0.0], vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
+        vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
     assert_eq!(capture.prepare_vst3_delay(512, 48000).unwrap(), 512);
     let silence = [0.0; 256];
     let aux = [[0.125, -0.25]; 256];
@@ -434,8 +451,9 @@ fn room_is_processed_once_before_vst3_and_never_affects_aux_or_apps() {
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0); 3], true, 1, config).unwrap());
     controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
     let (writer, _reader) = channel(48000, 48000, 30, 3, health.clone()).unwrap();
+    controls.apply("route aux send on".parse().unwrap()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
-        Some((0.0, AuxDestination::Send)), &[0.0], vec![(writer, vec![0, 1, 2])], health.clone(), controls).unwrap();
+        vec![(writer, vec![0, 1, 2])], health.clone(), controls).unwrap();
     let mut position = 0;
     let mut saw_stereo = false;
     for block in mic.chunks(137) {
@@ -470,8 +488,9 @@ fn live_vocal_controls_reach_the_audio_thread_without_touching_other_sources() {
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, config).unwrap());
     controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
     let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+    controls.apply("route aux broadcast on".parse().unwrap()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
-        Some((0.0, AuxDestination::Broadcast)), &[0.0], vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
+        vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
     let mic = [0.25; 256];
     let aux = [[0.125, -0.25]; 256];
     let app = [[-0.0625, 0.125]; 256];
@@ -488,5 +507,46 @@ fn live_vocal_controls_reach_the_audio_thread_without_touching_other_sources() {
     assert!((broadcast.left[255] - (expected + aux[255][0] + app[255][0])).abs() < 1e-6);
     assert!((broadcast.right[255] - (expected + aux[255][1] + app[255][1])).abs() < 1e-6);
     assert_eq!(capture.vocal.config().parameter(VocalParameter::Trim), -6.0);
+    assert!(!health.failed());
+}
+
+#[test]
+fn supplemental_trim_ramps_once_before_send_delay_and_keeps_input_meters_raw() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 2, VocalConfig::default()).unwrap());
+    for command in ["route aux output on", "route aux broadcast on", "route app1 broadcast on",
+        "route app2 output on", "trim aux -6", "trim app1 -12", "trim app2 -18"] {
+        controls.apply(command.parse().unwrap()).unwrap();
+    }
+    let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
+    assert_eq!(capture.prepare_vst3_delay(256, 48000).unwrap(), 256);
+    let mic = [0.0; 256];
+    let aux = [[0.25, -0.125]; 256];
+    let app1 = [[0.125, 0.25]; 256];
+    let app2 = [[-0.0625, 0.125]; 256];
+    let gain = |db: f32| 10.0_f32.powf(db / 20.0);
+    capture.push(&mic, Some(&aux), &[&app1, &app2]);
+    let monitor = capture.engine.output(0).unwrap();
+    assert!((monitor.left[0] - (0.25 * gain(-6.0) - 0.0625 * gain(-18.0))).abs() < 1e-6);
+    assert_eq!(capture.engine.output(1).unwrap().sample_peak(), 0.0);
+    controls.apply("trim aux -20".parse().unwrap()).unwrap();
+    controls.apply("trim app1 0".parse().unwrap()).unwrap();
+    capture.push(&mic, Some(&aux), &[&app1, &app2]);
+    // Delayed samples retain their original source trim, unlike post-delay mute.
+    let broadcast = capture.engine.output(1).unwrap();
+    assert!((broadcast.left[255] - (0.25 * gain(-6.0) + 0.125 * gain(-12.0))).abs() < 1e-6);
+    let monitor = capture.engine.output(0).unwrap();
+    assert!(monitor.left[0] > monitor.left[239]);
+    assert!((monitor.left[239] - (0.25 * gain(-20.0) - 0.0625 * gain(-18.0))).abs() < 1e-6);
+    capture.push(&mic, Some(&aux), &[&app1, &app2]);
+    let broadcast = capture.engine.output(1).unwrap();
+    assert!(broadcast.right[0] < broadcast.right[239]);
+    assert!((broadcast.left[239] - (0.25 * gain(-20.0) + 0.125)).abs() < 1e-6);
+    assert!((broadcast.right[239] - (-0.125 * gain(-20.0) + 0.25)).abs() < 1e-6);
+    assert_eq!(f32::from_bits(health.aux_peak.load(Ordering::Relaxed)), 0.25);
+    assert_eq!(f32::from_bits(health.app_peaks[0].load(Ordering::Relaxed)), 0.25);
+    assert_eq!(f32::from_bits(health.app_peaks[1].load(Ordering::Relaxed)), 0.125);
     assert!(!health.failed());
 }

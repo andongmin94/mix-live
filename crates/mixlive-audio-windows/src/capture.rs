@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, Source};
 use mixlive_effects::{Meters, VocalChain};
-use crate::{bridge::{Fault, Health, OutputWriter}, config::{AuxDestination, MAX_APPS, MAX_MIXES}, control::{GainRamp, LiveCommand, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
+use crate::{bridge::{Fault, Health, OutputWriter}, config::{MAX_APPS, MAX_MIXES}, control::{GainRamp, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
 
 pub const CAPTURE_BLOCK: usize = 256;
 
@@ -41,6 +41,7 @@ pub struct Capture {
     source_slots: Vec<usize>,
     mix_slots: Vec<usize>,
     source_mutes: [GainRamp; MAX_SOURCES],
+    source_trims: [GainRamp; MAX_SOURCES],
     route_count: usize,
     route_ramps: [GainRamp; MAX_ROUTES],
     route_envelopes: [[f32; CAPTURE_BLOCK]; MAX_ROUTES],
@@ -49,12 +50,11 @@ pub struct Capture {
     pub vocal_stats: Arc<VocalStats>,
 }
 impl Capture {
-    pub fn new(vocal: VocalChain, sample_rate: u32, aux: Option<(f32, AuxDestination)>, app_gains: &[f32], mut outputs: Vec<(OutputWriter, Vec<usize>)>, health: Arc<Health>, controls: Arc<LiveControls>) -> Result<Self, String> {
+    pub fn new(vocal: VocalChain, sample_rate: u32, mut outputs: Vec<(OutputWriter, Vec<usize>)>, health: Arc<Health>, controls: Arc<LiveControls>) -> Result<Self, String> {
         let mix_slots: Vec<_> = controls.mixes().map(RouteMix::index).collect();
         let mix_count = mix_slots.len();
-        if !(8_000..=192_000).contains(&sample_rate) || aux.is_some() != controls.has_aux()
-            || app_gains.len() != controls.app_count() {
-            return Err("source controls do not match the capture configuration".into());
+        if !(8_000..=192_000).contains(&sample_rate) {
+            return Err("unsupported capture sample rate".into());
         }
         if vocal.config() != controls.vocal_config() {
             return Err("vocal controls do not match the prepared processing configuration".into());
@@ -76,34 +76,27 @@ impl Capture {
             }).collect(),
             sends: (0..mix_count).map(|mix| Send { source: 0, mix, gain_db: 0.0, enabled: true }).collect(),
         };
-        if let Some((gain_db, destination)) = aux {
-            if RouteMix::ALL.into_iter().any(|mix| destination.includes(mix.index()) && !controls.has_mix(mix)) {
-                return Err("AUX destination is not configured".into());
-            }
-            scene.sources.push(Source { name: "AUX".into(), channels: ChannelLayout::Stereo, gain_db, muted: false });
+        if controls.has_aux() {
+            scene.sources.push(Source { name: "AUX".into(), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false });
             scene.sends.extend((0..mix_count).map(|mix| Send { source: 1, mix, gain_db: 0.0, enabled: true }));
         }
-        for (index, &gain_db) in app_gains.iter().enumerate() {
+        for index in 0..controls.app_count() {
             let source = scene.sources.len();
-            scene.sources.push(Source { name: format!("App {}", index + 1), channels: ChannelLayout::Stereo, gain_db, muted: false });
+            scene.sources.push(Source { name: format!("App {}", index + 1), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false });
             scene.sends.extend((0..mix_count).map(|mix| Send { source, mix, gain_db: 0.0, enabled: true }));
         }
         let engine = Engine::new(&scene, CAPTURE_BLOCK).map_err(|e| e.to_string())?;
-        if let Some((_, destination)) = aux {
-            for mix in controls.mixes() {
-                controls.apply(LiveCommand::Route { source: RouteSource::Aux, mix, enabled: destination.includes(mix.index()) })?;
-            }
-        }
         let source_slots: Vec<_> = controls.sources().map(RouteSource::index).collect();
         let route_count = scene.sends.len();
         let targets = controls.route_targets();
         let route_ramps = std::array::from_fn(|index| GainRamp::new(sample_rate,
             if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
         let source_mutes = controls.source_targets().map(|gain| GainRamp::new(sample_rate, gain));
+        let source_trims = controls.trim_targets().map(|gain| GainRamp::new(sample_rate, gain));
         Ok(Self { engine, vocal, voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
-            aux_enabled: aux.is_some(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
-            app_count: app_gains.len(), app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
-            controls, source_slots, mix_slots, source_mutes, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
+            aux_enabled: controls.has_aux(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
+            app_count: controls.app_count(), app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
+            controls, source_slots, mix_slots, source_mutes, source_trims, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
             vocal_stats: Arc::new(VocalStats::default()) })
     }
     #[cfg(windows)]
@@ -154,6 +147,7 @@ impl Capture {
                 }
             }
             for (ramp, target) in self.source_mutes.iter_mut().zip(self.controls.source_targets()) { ramp.set(target); }
+            for (ramp, target) in self.source_trims.iter_mut().zip(self.controls.trim_targets()) { ramp.set(target); }
             let targets = self.controls.route_targets();
             let mix_count = self.mix_slots.len();
             for (index, ramp) in self.route_ramps[..self.route_count].iter_mut().enumerate() {
@@ -190,8 +184,10 @@ impl Capture {
             if let Some(aux) = aux {
                 let mut peak = 0.0_f32;
                 for (index, frame) in aux[start..start + block.len()].iter().enumerate() {
-                    self.aux_left[index] = frame[0];
-                    self.aux_right[index] = frame[1];
+                    // Trim belongs to the source timeline, before per-send delay and mute.
+                    let gain = self.source_trims[RouteSource::Aux.index()].next_gain();
+                    self.aux_left[index] = frame[0] * gain;
+                    self.aux_right[index] = frame[1] * gain;
                     peak = peak.max(frame[0].abs()).max(frame[1].abs());
                 }
                 self.health.aux_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
@@ -203,8 +199,9 @@ impl Capture {
             for (slot, (buffer, app)) in self.app_buffers.iter_mut().zip(apps).enumerate() {
                 let mut peak = 0.0_f32;
                 for (index, frame) in app[start..start + block.len()].iter().enumerate() {
-                    buffer[0][index] = frame[0];
-                    buffer[1][index] = frame[1];
+                    let gain = self.source_trims[RouteSource::App(slot).index()].next_gain();
+                    buffer[0][index] = frame[0] * gain;
+                    buffer[1][index] = frame[1] * gain;
                     peak = peak.max(frame[0].abs()).max(frame[1].abs());
                 }
                 self.health.app_peaks[slot].fetch_max(peak.to_bits(), Ordering::Relaxed);

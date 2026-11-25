@@ -91,6 +91,8 @@ VST3는 **파일 추가** 또는 Windows bundle용 **폴더 추가**로 선택�
 - 고정 상단의 전체 출력 음소거, 소스별 mic/AUX/앱 음소거, 출력별 음소거.
 - 모든 출력에 공통으로 적용되는 master와 모니터/통화/방송의 독립 감쇠.
 - 각 소스를 어느 출력에 보낼지 선택하는 스위치와 경로별 음량.
+- AUX/MR·앱별 공통 입력 trim(-96..0 dB). 입력 peak는 trim 전이며, 소스 trim은
+  약 5 ms sample ramp로 적용하고 모든 연결된 목적지에 동일하게 반영한다. 장치·VST3는 다시 열지 않는다.
 - 라이브 보컬 trim·보정 비율·컴프레서/디에서 threshold·리버브 비율·잔향 시간 슬라이더.
   EQ/다이내믹스 프리셋이 off이면 trim과 리버브만 표시한다.
 - 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 모니터/통화/방송 sample peak.
@@ -105,7 +107,7 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 
 실행 중 **정지 후 새 Scene 저장**을 선택하면 파일명 선택을 취소할 때는 오디오를 계속 실행하고,
 확정하면 장치 중지 → worker join → 모든 VST3 슬롯 상태 수집 → 새 Scene 저장을 수행한다.
-저장된 전체/믹스별 음량, 소스·출력·전체 mute, 모든 경로의 연결·gain, 라이브 보컬 파라미터와 VST3 상태는 다음 명시적 시작부터
+저장된 전체/믹스별 음량, AUX/앱 입력 trim, 소스·출력·전체 mute, 모든 경로의 연결·gain, 라이브 보컬 파라미터와 VST3 상태는 다음 명시적 시작부터
 적용된다. 초기 mute는 스트림 시작 전에 복원한다. 오류·상태 수집 실패·기존 파일 충돌 시 이전 Scene 선택을
 유지하고 새 파일을 게시하지 않는다. 일반 정지/창 닫기는 저장하지 않는다.
 장치·출력, EQ/다이내믹스 프리셋, 리버브 pre-delay 및 VST3 체인 순서 편집은 정지 상태에서만 제공한다.
@@ -276,6 +278,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또�
 | `route mic output off`, `route mic output on` | 내 목소리의 첫 믹스 포함 여부 |
 | `route aux send off` | 두 번째 믹스의 MR만 제외 |
 | `level aux send -6`, `level mic output -9` | 지정 경로만 추가 감쇠 -96..0 dB |
+| `trim aux -12`, `trim app1 -6` | AUX/앱 전체 입력 trim -96..0 dB |
 | `vocal trim -3`, `vocal strength 0.75` | 입력 trim(dB) / EQ·다이내믹스 blend(0..1) |
 | `vocal compressor -28`, `vocal deesser -35` | threshold(-60..0 dBFS) |
 | `vocal reverb 0.15`, `vocal decay 1.5` | room blend(0..1) / 명목 잔향 시간(0.2..5초) |
@@ -285,6 +288,8 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또�
 `vocal` 명령의 값 범위는 시작 옵션과 같다. off 프리셋의 strength/compressor/deesser 제어는 거절하며,
 pre-delay 및 프리셋 전환은 실행 중 지원하지 않는다.
 꺼둔 경로의 level 변경은 켜짐이 아니고 전체 unmute도 개별 mute를 풀지 않는다.
+AUX/앱 trim은 입력 timeline에서 PDC 전에 적용되며, mute/경로별 gain은 PDC 뒤에서 적용된다.
+마이크는 `vocal trim`으로 조절한다. Scene 저장은 목표 trim을 기존 필드에 보존한다.
 source/route 제어는 합산 전이어서 출력 queue 지연이 남는다. 급한 송출 중단은 queue 뒤의
 `mute send`/`mute broadcast`/`mute all`을 사용한다. mute 중에도 queue를 소비해 오래된 소리를 재생하지 않는다.
 이미 OS에 보낸 소리/Direct Monitor는 제어하지 않는다. gain/route 전환은 약 5 ms sample ramp이며
