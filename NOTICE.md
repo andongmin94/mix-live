@@ -155,3 +155,32 @@ DEALINGS IN THE SOFTWARE.
   개발용 장치 등록은 DevGen(재배포 불가, 제품 설치용 사용 불가)과 OS의 PnPUtil을 이용한다.
   https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/devgen-command-syntax
   드라이버 서명/인증은 별도 요구사항이며 Microsoft 서명·인증서 구매·설치는 수행하지 않는다.
+
+## 마이크 음정 관측
+
+- pitch-detection 0.3.0 (MIT/Apache-2.0), Alessandro Genova:
+  https://crates.io/crates/pitch-detection/0.3.0
+  Registry checksum: `e086e70dfcfd46cd6097c501a66fb07cd73ee8c27844b0941d9b2b3e43dfbf92`.
+  McLeod detector의 기존 API를 control thread에서만 사용한다. 새로운 detector 구현을 복사하지 않는다.
+  RustFFT 6.4.1, primal-check 0.3.4, transpose 0.2.3, strength_reduce 0.2.4가 잠금 파일에 추가되며 기존 num-*를 재사용한다.
+  이 기능은 pitch correction이나 시프팅이 아니다. 원본 MIT 고지 blob: `005bb79429aa833730ce9fbc08da69c2411b9541`.
+
+Copyright (c) 2019-2022 Alessandro Genova
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

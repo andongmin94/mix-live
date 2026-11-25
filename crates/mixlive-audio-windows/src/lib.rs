@@ -8,6 +8,8 @@ pub mod control;
 pub mod devices;
 pub mod plugin;
 pub mod scene;
+#[cfg(any(windows, test))]
+pub mod pitch;
 #[cfg(windows)]
 pub(crate) mod process_capture;
 #[cfg(windows)]

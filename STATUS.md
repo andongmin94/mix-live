@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **가상 장치 개발 패키지 빌드 완료 · 보컬 EQ/다이내믹스 상세 제어 추가**
+단계: **가상 장치 개발 패키지 빌드 완료 · 출력 sample limiter 및 음정 관측 추가**
 
 ## 현재 구현
 
@@ -20,6 +20,11 @@
   입력 clock에서 5 ms ramp를 한 번 적용하고 PDC 이후 mute/send gain을 유지한다.
   실제 입력 peak·보컬 체인 전후·gain reduction·출력별 peak를 약 100ms마다 읽는다.
   앱별 peak와 clock 진단도 독립적이다. callback/worker 버퍼는 준비 시 고정 용량으로 만든다.
+  출력의 기존 개별 sample clamp를 믹스별 stereo-linked limiter로 교체했다. ceiling 0.98,
+  즉시 감쇠/최대 80 ms 선형 회복, lookahead 없음. 각 믹스의 pre-limit peak와 GR 및
+  endpoint의 감쇠 frame 수를 표시한다. true peak·청력 보호·피드백 방지는 아니다.
+  마이크 raw window를 기존 bounded SPSC로 control thread에 전달하여 McLeod pitch 추정
+  (70..1200 Hz, A440 note/cents/clarity)을 표시한다. 자동 보정·오디오 변경·녹음은 없다.
 - 정지 상태의 장치·출력 설정은 기존 장치/앱·채널·보컬·플러그인 설정과 모든 앱의 mixer 값을
   보존한다. 누락/지원 불가 장치와 앱을 명시하며 저장/시작을 거절하고 임의로 대체하지 않는다.
   보컬 설정은 장치 조회 없이 preset·trim·strength·threshold·VST3 순서와 상태를 편집한다.
@@ -94,7 +99,12 @@
 - [Audio #42](https://github.com/andongmin94/mix-live/actions/runs/45576006084) `9035d2f`:
   에코/VST3 검색 관련 테스트, native fixture, Clippy, Windows release 빌드 및 CLI 검사 통과.
   GUI 자동화에서 `VST3 검색 결과` 접근성 이름 조회가 실패했다. 검색 완료 후 다시 검색 버튼이
-  표시되는 계약으로 수정했다. 신규 EQ/다이내믹스 DSP·Scene·GUI 회귀 검사와 함께 통합 CI를 확인해야 한다.
+  표시되는 계약으로 수정했다.
+- [Audio #43](https://github.com/andongmin94/mix-live/actions/runs/45581536089) `561caff`:
+  EQ/다이내믹스 workspace 테스트 성공, 마지막 확인 당시 native/Clippy/release/GUI 통합 검사는 미완료.
+- 출력 리미터 및 pitch 관측: stereo 비율/회복/믹스 격리/계측, 합성 주파수·cent·침묵·window
+  경계/느린 관측기 테스트를 추가했다. 이전 CI를 취소하지 않도록 개발 브랜치에서 통합 검사한다.
+  새 변경의 실행 결과는 아직 확인하지 않았다.
 
 ## 남은 작업과 제한
 
@@ -102,7 +112,7 @@
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
 - 탭 선택·ASIO·실행 중
-  소스/체인 삽입/삭제·내장 음정 보정은 미구현이다.
+  소스/체인 삽입/삭제·내장 음정 보정은 미구현이다(마이크 음정 관측은 별도 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
   실행 중 EQ 계수/프리셋/pre-delay/에코 시간 변경은 미구현이다. 리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.

@@ -146,7 +146,7 @@ mod device {
         scene_out: Option<&Path>) -> Result<()> {
         let prepared = Prepared::new(route)?;
         println!("{}", prepared.describe());
-        println!("Use headphones at LOW hardware volume. Disable other monitoring paths.\nStarting a {seconds}s live mic route; no recording. Sample clipping guard is not a mastering limiter.");
+        println!("Use headphones at LOW hardware volume. Disable other monitoring paths.\nStarting a {seconds}s live mic route; no recording. The stereo-linked sample limiter is not a true-peak limiter, feedback suppressor or hearing protection.");
         if !plugin.effects.is_empty() {
             println!("Loading a trusted native VST3 chain in this process. A plugin crash/hang is not isolated. Reported VST3 latency is compensated on outgoing AUX/app sends, not monitoring; all processing must finish before shutdown can complete.");
         }
@@ -177,13 +177,15 @@ mod device {
             active.poll_plugin()?;
             if let Some(error) = active.health.error() { return Err(error.into()); }
             if started.elapsed() >= next_report {
-                println!("{} | {}", active.report(&active.take_levels()), active.controls.describe());
+                let levels = active.take_levels();
+                println!("{} | {}", active.report(&levels), active.controls.describe());
                 next_report += Duration::from_secs(1);
             }
             std::thread::sleep(poll_interval);
         }
         super::stop_console(&active.controls, &command_gate);
-        let report = active.report(&active.take_levels());
+        let levels = active.take_levels();
+        let report = active.report(&levels);
         let finished = match scene_out {
             Some(path) => active.finish_scene(route.clone()).and_then(|scene| scene.save_new(path)),
             None => active.finish(plugin.chain_out.as_deref()),

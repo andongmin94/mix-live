@@ -13,7 +13,7 @@ OBS 전용 플러그인이 아니다. 현재는 **GPUI Scene 실행 화면과 �
 마이크 → 입력 trim → 내장 EQ/다이내믹스 → stereo 리버브 → stereo 에코 → 순차 stereo VST3 체인 → 목적지별 보내기 ─┐
 AUX/MR → 필요 시 입력 clock bridge → AUX trim → 목적지별 보내기 ─────────┤
 앱 1..8 → 각각의 입력 clock bridge → 앱별 trim → 목적지별 보내기 ───────────┴→ 믹스
-믹스 → 출력 clock bridge → master/믹스별 음량·mute → sample clipping guard → 출력 장치
+믹스 → 출력 clock bridge → master/믹스별 음량·mute → 믹스별 stereo sample limiter → 출력 장치
 ```
 
 보컬은 한 번만 처리하고 AUX와 앱 소스에는 보컬 DSP/VST3를 걸지 않는다. 출력 믹스는 모니터·통화·방송의 최대 세 개다.
@@ -100,7 +100,8 @@ VST3는 **설치된 VST3 검색**에서 표준 설치 경로의 후보를 골라
   EQ/다이내믹스 프리셋이 off이면 trim과 리버브·에코만 표시한다.
 - 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 모니터/통화/방송 sample peak.
   약 100ms 간격의 최대값을 dBFS로 표시한다. 소스 peak는 mute 전, AUX와 앱은 입력 trim 전이며
-  출력 peak는 감쇠·mute·sample guard 후 장치 채널 매핑 전이다. 공유 endpoint의 각 믹스도 독립 계측한다.
+  출력 peak는 감쇠·mute·stereo sample limiter 후 장치 채널 매핑 전이다. 공유 endpoint의 각 믹스도 독립 계측한다.
+  리미터 전 peak와 해당 구간 최대 gain reduction(dB)을 각 출력에 함께 표시한다.
   내장 보정 gain reduction과 초당 갱신되는 진단 수치는 같은 계측값을 사용한다. 내장 보정 후 peak는 리버브·에코를 포함한 stereo 최대값이다. 가짜 level 애니메이션은 없다.
 
 **정지** 또는 창 닫기는 기존 장치 중지 → worker 종료 → native plugin 해제 경로를 사용한다.
@@ -140,7 +141,10 @@ Button/Switch/Slider/SliderThumb/Select/Input/ScrollArea/Root를 재사용하고
 채널은 선택한 WASAPI endpoint 내부 **1-based** 번호이며 MiniFuse ASIO/루프백/물리 단자와
 같다고 가정하지 않는다. 기본 실행은 30초, `--seconds`는 1..3600이다. 자동 녹음은 없다.
 **헤드폰 하드웨어 음량을 낮추고** DAW·Windows·인터페이스의 중복 모니터링을 끈다.
-sample clipping guard는 전문 리미터·true-peak·음향 피드백 방지·청력 보호 기능이 아니다.
+항상 적용되는 믹스별 스테레오 연동 sample limiter는 두 채널에 같은 감쇠를 적용하여
+0.98 sample ceiling을 지킨다. 추가 lookahead 없이 즉시 감쇠하며 최대 80 ms의 선형 회복으로
+unity에 복귀한다. 채널별 개별 클리핑 대신 gain을 낮추지만 완전한 무왜곡이나 true-peak,
+음향 피드백 방지·청력 보호 기능은 아니다. 입력 ADC clipping은 복원하지 않는다.
 
 ### 내장 보컬
 
@@ -202,6 +206,16 @@ off여도 리버브 비율이 0보다 크면 리버브가 동작한다. 보정 �
 에코 시간은 시작 시 고정하고 최대 1초 버퍼를 준비한다. 실행 중 blend/feedback은 10 ms ramp로
 변경한다. mix 0에서도 이력을 갱신하며, AUX/앱에는 적용하지 않는다. 반복음은 PDC의 고정 지연이
 아니다. 실제 노래 음질·장비 CPU 수용은 아직 미검증이다.
+
+### 마이크 음정 표시
+
+마이크 원신호(trim/EQ/VST3 전)의 40–80 ms 연속 window를 기존 SPSC 큐로 전달하고,
+control thread에서 pitch-detection 0.3.0의 McLeod 검출기로 추정한다. 70–1200 Hz 범위의
+단일 음높이·가까운 평균율 음이름(A4=440 Hz)·cent 편차·검출 명료도를 GUI 및 CLI에 표시한다.
+-50 dBFS 평균제곱 threshold와 0.80 명료도 기준을 사용한다. 불명확하거나 새 window가 없으면
+음정을 표시하지 않는다. 느린 표시기는 관측 window만 잃으며 오디오를 멈추지 않는다.
+분석은 오디오를 변경하지 않고 추가 처리 지연도 넣지 않는다. 입력/분석 데이터는 메모리에만
+존재한다. 실제 노래의 음높이 검출 정확도와 CPU는 미검증이며, 음정 보정/피치 시프팅은 아직 없다.
 
 ### 출력과 MR/AUX
 

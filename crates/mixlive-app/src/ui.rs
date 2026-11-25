@@ -1067,6 +1067,14 @@ impl MixLive {
                 .child(div().font_semibold().child("소스별 보내기"))
                 .child(source_mutes)
                 .child(peak_meter("마이크 입력 · trim 전", levels.map(|l| l.mic_input)))
+                .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child("마이크 음정 · A4 = 440 Hz · 검출 전용"))
+                    .child(match levels.and_then(|l| l.pitch) {
+                        Some(pitch) => div().flex().items_center().gap_3()
+                            .child(div().font_semibold().text_color(rgb(ACCENT)).child(pitch.note_name()))
+                            .child(div().text_sm().child(format!("{:.1} Hz · {:+.1} cent", pitch.frequency_hz, pitch.cents)))
+                            .child(div().text_xs().text_color(rgb(MUTED)).child(format!("명료도 {:.0}%", pitch.clarity * 100.0))),
+                        None => div().text_sm().text_color(rgb(MUTED)).child("명확한 음정 없음"),
+                    }))
                 .child(peak_meter("내장 보정 후 · VST3 전", levels.map(|l| l.vocal.output_peak)))
                 .child(peak_meter("보컬 체인 후 · mute 전", levels.map(|l| l.voice)))
                 .children(controls.has_aux().then(|| {
@@ -1184,6 +1192,8 @@ impl MixLive {
             output = output.child(div().flex().flex_col().gap_2()
                 .pt_4().border_t_1().border_color(rgb(BORDER))
                 .child(peak_meter(meter_label, levels.and_then(|l| l.outputs[slot])))
+                .child(peak_meter("리미터 전 peak", levels.and_then(|l| l.limiters[slot].map(|m| m.input_peak))))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(levels.and_then(|l| l.limiters[slot]).map_or_else(|| "리미터 GR —".to_owned(), |m| format!("리미터 GR {:.1} dB", m.reduction_db))))
                 .child(div().text_sm().font_semibold().child(name))
                 .child(self.fader(("mix-level", slot), &format!("{name} 추가 감쇠"),
                     FaderTarget::Gain(target), db, cx))
@@ -1193,7 +1203,7 @@ impl MixLive {
                     .child(self.mute(("mute-mix", slot), &format!("{name} 음소거"), mix.mute_target(), cx))));
         }
         output = output.child(div().text_xs().text_color(rgb(MUTED)).pt_3().child(
-            "출력 peak는 감쇠·mute·sample guard 후, 장치 채널 매핑 전입니다. 음소거와 경로 선택은 각각 유지됩니다.",
+            "믹스별 스테레오 리미터는 출력 sample peak를 0.98 이하로 제한합니다. true peak·피드백 방지·청력 보호 기능은 아닙니다. 음소거는 독립적으로 유지됩니다.",
         ));
 
         div()

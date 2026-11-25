@@ -10,7 +10,39 @@ pub const QUANTUM: usize = 128;
 /// At most three stereo mixes, packed in the endpoint's route order. Unused lanes stay zero.
 pub type OutputFrame = [f32; MAX_MIXES * 2];
 const MAX_CORRECTION: f64 = 0.001; // +/- 1000 ppm. This is not an audio device latency claim.
-const CEILING: f32 = 0.98; // Sample clipping guard, NOT a transparent or true-peak limiter.
+const CEILING: f32 = 0.98; // Digital sample ceiling, not true peak or hearing protection.
+const RELEASE_SECONDS: f32 = 0.080;
+
+/// Zero-lookahead, stereo-linked sample limiter. Reduce gain immediately to meet
+/// the ceiling, then recover with a bounded linear slope on this endpoint clock.
+/// The release slope reaches unity within 80 ms of uninterrupted quiet input.
+struct StereoLimiter {
+    gain: f32,
+    release_step: f32,
+}
+impl StereoLimiter {
+    fn new(rate: u32) -> Self {
+        Self { gain: 1.0, release_step: 1.0 / (RELEASE_SECONDS * rate as f32) }
+    }
+
+    fn apply(&mut self, stereo: &mut [f32]) -> f32 {
+        let peak = stereo[0].abs().max(stereo[1].abs());
+        let required = if peak > CEILING { CEILING / peak } else { 1.0 };
+        self.gain = (self.gain + self.release_step).min(required);
+        if self.gain != 1.0 {
+            // Same coefficient on both channels. The clamp only covers rounding at the ceiling.
+            for sample in stereo { *sample = (*sample * self.gain).clamp(-CEILING, CEILING); }
+        }
+        self.gain
+    }
+}
+
+/// Interval maxima on a physical playback endpoint's lane order.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LimiterReading {
+    pub input_peak: f32,
+    pub reduction_db: f32,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -43,19 +75,37 @@ impl Health {
     }
 }
 
-#[derive(Default)]
 pub struct OutputStats {
     pub underruns: AtomicU64,
-    pub clipped_frames: AtomicU64,
+    pub limited_frames: AtomicU64,
     pub queue_frames: AtomicU64,
     pub correction_ppm: AtomicI32,
     peaks: [AtomicU32; MAX_MIXES],
+    pre_limiter_peaks: [AtomicU32; MAX_MIXES],
+    minimum_gains: [AtomicU32; MAX_MIXES],
+}
+impl Default for OutputStats {
+    fn default() -> Self {
+        Self { underruns: AtomicU64::new(0), limited_frames: AtomicU64::new(0),
+            queue_frames: AtomicU64::new(0), correction_ppm: AtomicI32::new(0),
+            peaks: Default::default(), pre_limiter_peaks: Default::default(),
+            minimum_gains: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())) }
+    }
 }
 impl OutputStats {
-    /// One peak per stereo mix in endpoint lane order, after playback gain and clipping.
+    /// One peak per stereo mix in endpoint lane order, after playback gain and limiting.
     /// Only the control thread consumes these interval maxima.
     pub fn take_peaks(&self) -> [f32; MAX_MIXES] {
         std::array::from_fn(|lane| f32::from_bits(self.peaks[lane].swap(0, Ordering::Relaxed)))
+    }
+
+    /// The processing path only publishes linear values; dB conversion stays off callbacks.
+    pub fn take_limiters(&self) -> [LimiterReading; MAX_MIXES] {
+        std::array::from_fn(|lane| {
+            let input_peak = f32::from_bits(self.pre_limiter_peaks[lane].swap(0, Ordering::Relaxed));
+            let gain = f32::from_bits(self.minimum_gains[lane].swap(1.0_f32.to_bits(), Ordering::Relaxed));
+            LimiterReading { input_peak, reduction_db: if gain == 1.0 { 0.0 } else { -20.0 * gain.log10() } }
+        })
     }
 }
 
@@ -89,6 +139,7 @@ pub struct OutputReader {
     input_rate: f64,
     alpha: f64,
     filtered_error: f64,
+    limiters: [StereoLimiter; MAX_MIXES],
     pub queue_ms: f64,
     pub resampler_delay_ms: f64,
     pub stats: Arc<OutputStats>,
@@ -117,6 +168,7 @@ pub fn channel(input_rate: u32, output_rate: u32, queue_ms: u32, mixes: usize, h
         input_rate: f64::from(input_rate),
         alpha: 1.0 - (-(QUANTUM as f64) / f64::from(output_rate) / 0.5).exp(),
         filtered_error: 0.0,
+        limiters: std::array::from_fn(|_| StereoLimiter::new(output_rate)),
         queue_ms: target as f64 * 1000.0 / f64::from(input_rate),
         stats: Arc::new(OutputStats::default()),
         health: health.clone(),
@@ -126,20 +178,23 @@ pub fn channel(input_rate: u32, output_rate: u32, queue_ms: u32, mixes: usize, h
 
 impl OutputReader {
     /// All mixes for ONE output frame. Validated linear playback gains (0..=1) are
-    /// applied after resampling and before the final sample clipping guard and peak meter.
+    /// applied after resampling and before the independent stereo-linked sample limiters.
     pub(crate) fn next_frame(&mut self, gains: [f32; MAX_MIXES]) -> OutputFrame {
         let mut frame = self.read_frame();
-        for (lane, stereo) in frame.chunks_exact_mut(2).enumerate() {
-            for sample in stereo { *sample *= gains[lane]; }
-        }
-        if frame.iter().any(|x| x.abs() > CEILING) {
-            self.stats.clipped_frames.fetch_add(1, Ordering::Relaxed);
-            frame.iter_mut().for_each(|x| *x = x.clamp(-CEILING, CEILING));
-        }
-        for lane in 0..self.channels / 2 {
-            let peak = frame[lane * 2].abs().max(frame[lane * 2 + 1].abs());
+        let mut limited = false;
+        for (lane, stereo) in frame[..self.channels].chunks_exact_mut(2).enumerate() {
+            for sample in stereo.iter_mut() { *sample *= gains[lane]; }
+            let input_peak = stereo[0].abs().max(stereo[1].abs());
+            let gain = self.limiters[lane].apply(stereo);
+            if input_peak > 0.0 && gain < 1.0 {
+                limited = true;
+                self.stats.minimum_gains[lane].fetch_min(gain.to_bits(), Ordering::Relaxed);
+            }
+            self.stats.pre_limiter_peaks[lane].fetch_max(input_peak.to_bits(), Ordering::Relaxed);
+            let peak = stereo[0].abs().max(stereo[1].abs());
             self.stats.peaks[lane].fetch_max(peak.to_bits(), Ordering::Relaxed);
         }
+        if limited { self.stats.limited_frames.fetch_add(1, Ordering::Relaxed); }
         frame
     }
 
@@ -248,13 +303,13 @@ mod tests {
     }
 
     #[test]
-    fn starvation_overflow_and_clip_guard_are_explicit() {
+    fn starvation_overflow_and_sample_limiting_are_explicit() {
         let health = Arc::new(Health::default());
         let (mut writer, mut reader) = channel(48_000, 48_000, 30, 1, health.clone()).unwrap();
         assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
         for _ in 0..reader.target { writer.push([2.0, -2.0, 0.0, 0.0, 0.0, 0.0]); }
         for _ in 0..reader.target * 2 { assert!(reader.next_frame([1.0; 3]).iter().all(|x| x.abs() <= CEILING)); }
-        assert!(reader.stats.clipped_frames.load(Ordering::Relaxed) > 0);
+        assert!(reader.stats.limited_frames.load(Ordering::Relaxed) > 0);
         assert!(reader.stats.underruns.load(Ordering::Relaxed) > 0);
         assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
         for _ in 0..reader.target * 4 + 1 { writer.push([0.2, 0.2, 0.0, 0.0, 0.0, 0.0]); }
@@ -300,6 +355,51 @@ mod tests {
         assert_eq!(reader.next_frame([1.0; 3]), [0.0; 6]);
     }
     #[test]
+    fn linked_limiter_preserves_stereo_ratio_and_recovers_without_lookahead() {
+        for rate in [8000, 44100, 48000, 192000] {
+            let mut limiter = StereoLimiter::new(rate);
+            let mut frame = [0.3, -0.2];
+            assert_eq!(limiter.apply(&mut frame), 1.0);
+            assert_eq!(frame, [0.3, -0.2]);
+            frame = [2.0, -0.5];
+            let attacked = limiter.apply(&mut frame);
+            assert!((attacked - CEILING / 2.0).abs() < 1e-6);
+            assert_eq!(frame[0], CEILING);
+            assert!((frame[1] + CEILING * 0.25).abs() < 1e-6);
+            let mut previous = attacked;
+            for _ in 0..(rate / 10) {
+                frame = [0.2, -0.1];
+                let recovered = limiter.apply(&mut frame);
+                assert!(recovered >= previous && recovered <= 1.0);
+                assert!((frame[0] + 2.0 * frame[1]).abs() < 1e-7);
+                previous = recovered;
+            }
+            assert_eq!(previous, 1.0);
+            assert_eq!(frame, [0.2, -0.1]);
+        }
+    }
+
+    #[test]
+    fn shared_endpoint_limits_each_mix_independently_and_reports_actual_attenuation() {
+        let health = Arc::new(Health::default());
+        let (mut writer, mut reader) = channel(48000, 48000, 30, 3, health.clone()).unwrap();
+        let input = [2.0, -0.5, 0.25, -0.125, -1.5, 0.3];
+        for _ in 0..reader.target + 1024 { writer.push(input); }
+        let mut output = [0.0; 6];
+        for _ in 0..1024 { output = reader.next_frame([1.0; 3]); }
+        for (actual, expected) in output.into_iter().zip([CEILING, -CEILING * 0.25, 0.25, -0.125, -CEILING, CEILING * 0.2]) {
+            assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+        }
+        let meters = reader.stats.take_limiters();
+        assert!(meters[0].input_peak > 1.9 && meters[0].reduction_db > 6.0);
+        assert!(meters[1].input_peak < 0.4 && meters[1].reduction_db == 0.0);
+        assert!(meters[2].input_peak > 1.4 && meters[2].reduction_db > 3.0);
+        assert!(reader.stats.limited_frames.load(Ordering::Relaxed) > 0);
+        assert!(reader.stats.take_limiters().iter().all(|m| m.input_peak == 0.0 && m.reduction_db == 0.0));
+        assert!(!health.failed());
+    }
+
+    #[test]
     fn aux_clock_conversion_preserves_headroom_before_source_attenuation() {
         let health = Arc::new(Health::default());
         let (mut writer, mut reader) = channel(44_100, 48_000, 10, 1, health.clone()).unwrap();
@@ -311,7 +411,7 @@ mod tests {
             for _ in 0..QUANTUM { sample = reader.next_source_frame(); }
         }
         assert!((sample[0] - 2.0).abs() < 0.001 && (sample[1] + 1.5).abs() < 0.001);
-        assert_eq!(reader.stats.clipped_frames.load(Ordering::Relaxed), 0);
+        assert_eq!(reader.stats.limited_frames.load(Ordering::Relaxed), 0);
         for _ in 0..reader.target * 3 { reader.next_source_frame(); }
         assert!(reader.stats.underruns.load(Ordering::Relaxed) > 0);
         assert_eq!(reader.next_source_frame(), [0.0; 2]);

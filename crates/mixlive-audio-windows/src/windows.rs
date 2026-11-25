@@ -4,7 +4,8 @@ use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, 
 use mixlive_effects::VocalChain;
 use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget, resolve_apps};
 use crate::process_capture::{self, ProcessCapture};
-use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{InputMap, OutputMap, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{LiveControls, PlaybackGains, RouteSource}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
+use crate::pitch::{self, PitchMonitor, PitchReading, PitchTap};
+use crate::{bridge::{self, Fault, Health, LimiterReading, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{InputMap, OutputMap, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{LiveControls, PlaybackGains, RouteSource}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -254,7 +255,8 @@ impl Prepared {
         if let Some(worker) = &plugin_worker { timing.push(worker.description.clone()); }
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
-        let feeds = InputFeeds { aux: aux_feed, apps: app_readers };
+        let (pitch_tap, pitch_monitor) = pitch::channel(self.input_config.sample_rate())?;
+        let feeds = InputFeeds { aux: aux_feed, apps: app_readers, pitch: pitch_tap };
         let input_stream = match format {
             SampleFormat::F32 => input::<f32>(&self.input, config, self.input_channel, capture, feeds, health.clone())?,
             SampleFormat::F64 => input::<f64>(&self.input, config, self.input_channel, capture, feeds, health.clone())?,
@@ -271,7 +273,7 @@ impl Prepared {
         if let Some(stream) = &aux_stream { stream.play()?; }
         input_stream.play()?;
         Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, _app_captures: app_captures, plugin_worker, health, outputs: stats,
-            aux_enabled: controls.has_aux(), controls, aux_clock_stats, app_clock_stats, vocal_stats, timing })
+            aux_enabled: controls.has_aux(), controls, aux_clock_stats, app_clock_stats, vocal_stats, pitch_monitor, timing })
     }
 }
 
@@ -289,6 +291,8 @@ pub struct LevelReadings {
     pub vocal: mixlive_effects::Meters,
     pub voice: f32,
     pub outputs: [Option<f32>; MAX_MIXES],
+    pub limiters: [Option<LimiterReading>; MAX_MIXES],
+    pub pitch: Option<PitchReading>,
 }
 
 pub struct Active {
@@ -306,12 +310,14 @@ pub struct Active {
     aux_clock_stats: Option<Arc<OutputStats>>,
     app_clock_stats: Vec<Arc<OutputStats>>,
     pub vocal_stats: Arc<VocalStats>,
+    pitch_monitor: PitchMonitor,
     pub timing: Vec<String>,
 }
 
 struct InputFeeds {
     aux: AuxFeed,
     apps: Vec<OutputReader>,
+    pitch: PitchTap,
 }
 
 fn input<T>(device: &Device, config: StreamConfig, selected: usize, mut capture: CaptureSink, mut feeds: InputFeeds, health: Arc<Health>) -> Result<Stream>
@@ -340,6 +346,7 @@ where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
                 }
             }
             let apps: [&[[f32; 2]]; MAX_APPS] = std::array::from_fn(|slot| &applications[slot][..frames]);
+            feeds.pitch.push(&mono[..frames]);
             capture.push(&mono[..frames], has_aux.then_some(&auxiliary[..frames]), &apps[..app_count]);
         }
     }, move |_| error_health.fail(Fault::Device), None)?)
@@ -433,11 +440,13 @@ impl Active {
     }
 
     /// Single consumer on the control thread. Peak intervals are independent of callback blocks.
-    pub fn take_levels(&self) -> LevelReadings {
+    pub fn take_levels(&mut self) -> LevelReadings {
         let mut outputs = [None; MAX_MIXES];
+        let mut limiters = [None; MAX_MIXES];
         for endpoint in &self.outputs {
-            for (&mix, peak) in endpoint.mixes.iter().zip(endpoint.stats.take_peaks()) {
+            for ((&mix, peak), limiter) in endpoint.mixes.iter().zip(endpoint.stats.take_peaks()).zip(endpoint.stats.take_limiters()) {
                 outputs[mix] = Some(peak);
+                limiters[mix] = Some(limiter);
             }
         }
         LevelReadings {
@@ -447,7 +456,7 @@ impl Active {
                 .then(|| f32::from_bits(self.health.app_peaks[index].swap(0, Ordering::Relaxed)))),
             vocal: self.vocal_stats.take(),
             voice: f32::from_bits(self.health.voice_peak.swap(0, Ordering::Relaxed)),
-            outputs,
+            outputs, limiters, pitch: self.pitch_monitor.take(),
         }
     }
 
@@ -455,6 +464,9 @@ impl Active {
     pub fn report(&self, levels: &LevelReadings) -> String {
         let vocal = levels.vocal;
         let mut text = format!("captured={} input_peak={:.3} vocal_peak={:.3} voice_peak={:.3} comp_gr={:.1}dB deess_gr={:.1}dB", self.health.captured_frames.load(Ordering::Relaxed), levels.mic_input, vocal.output_peak, levels.voice, vocal.compression_db, vocal.deessing_db);
+        if let Some(pitch) = levels.pitch {
+            text.push_str(&format!(" pitch={}@{:.2}Hz({:+.1}c) clarity={:.2}", pitch.note_name(), pitch.frequency_hz, pitch.cents, pitch.clarity));
+        } else { text.push_str(" pitch=unvoiced"); }
         if let Some(aux) = levels.aux_input {
             text.push_str(&format!(" aux_peak={aux:.3}"));
             if let Some(stats) = &self.aux_clock_stats {
@@ -471,7 +483,12 @@ impl Active {
         for (index, endpoint) in self.outputs.iter().enumerate() {
             let stats = &endpoint.stats;
             let peak = endpoint.mixes.iter().filter_map(|&mix| levels.outputs[mix]).fold(0.0_f32, f32::max);
-            text.push_str(&format!(" | stream{index}: peak={peak:.3} queue={} frames correction={}ppm underruns={} clipped={}", stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed), stats.underruns.load(Ordering::Relaxed), stats.clipped_frames.load(Ordering::Relaxed)));
+            text.push_str(&format!(" | stream{index}: peak={peak:.3} queue={} frames correction={}ppm underruns={} limited={}", stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed), stats.underruns.load(Ordering::Relaxed), stats.limited_frames.load(Ordering::Relaxed)));
+            for &mix in &endpoint.mixes {
+                if let Some(limiter) = levels.limiters[mix] {
+                    text.push_str(&format!(" mix{mix}_pre_limit={:.3} limiter_gr={:.1}dB", limiter.input_peak, limiter.reduction_db));
+                }
+            }
         }
         text
     }

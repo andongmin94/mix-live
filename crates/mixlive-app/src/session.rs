@@ -219,11 +219,12 @@ impl Session {
     /// Explicitly finish and save a new Scene. Failure or an occupied path keeps the old selection.
     /// Like start/stop, call outside a mutable GPUI update.
     pub fn stop_and_save(&mut self, path: PathBuf) -> Result<(), String> {
-        let Some(active) = self.active.take() else {
+        let Some(mut active) = self.active.take() else {
             return self.fail("실행 중인 Scene이 없습니다.", "audio is not running");
         };
         let route = self.scene().expect("active session has a Scene").route.clone();
-        self.report = active.report(&active.take_levels());
+        let levels = active.take_levels();
+        self.report = active.report(&levels);
         self.levels = None;
         let scene = match active.finish_scene(route) {
             Ok(scene) => scene,
@@ -236,10 +237,11 @@ impl Session {
 
     /// Call outside a mutable GPUI update. All streams stop before the worker and plugins drop.
     pub fn stop(&mut self) -> Result<(), String> {
-        let Some(active) = self.active.take() else {
+        let Some(mut active) = self.active.take() else {
             return Ok(());
         };
-        self.report = active.report(&active.take_levels());
+        let levels = active.take_levels();
+        self.report = active.report(&levels);
         self.levels = None;
         let result = active.finish(None).map_err(|error| error.to_string());
         match result {
