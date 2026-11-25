@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **가상 장치 개발 패키지 빌드 완료 · 내장 스테레오 에코 추가**
+단계: **가상 장치 개발 패키지 빌드 완료 · 내장 에코 및 VST3 경로 검색 추가**
 
 ## 현재 구현
 
@@ -23,6 +23,8 @@
 - 정지 상태의 장치·출력 설정은 기존 장치/앱·채널·보컬·플러그인 설정과 모든 앱의 mixer 값을
   보존한다. 누락/지원 불가 장치와 앱을 명시하며 저장/시작을 거절하고 임의로 대체하지 않는다.
   보컬 설정은 장치 조회 없이 preset·trim·strength·threshold·VST3 순서와 상태를 편집한다.
+  기존 CLI의 filesystem-only VST3 표준 경로 검색을 GPUI에서 재사용해 발견 후보를 명시적으로
+  추가한다. native DLL 로딩·class/호환성 검증은 시작 시점이며 경로 검색 자체는 이를 보장하지 않는다.
 - 최종 활성화된 VST3 체인의 신고 latency 합으로 통화·방송의 AUX/앱 send를 정수 샘플 지연한다.
   모니터는 추가 보상하지 않는다. 지연 뒤에 소스 mute/route gain을 적용하며, 실제 보상이 필요할 때
   2초 상한을 넘으면 시작을 거절한다. 준비 시 할당하며 지연 변경 restart는 기존대로 경로를 중단한다.
@@ -84,9 +86,10 @@
   `9817ec6`의 CLI 전체 Scene snapshot/종료 입력 차단을 포함한 Windows 통합 검사 통과.
 - [Audio #40](https://github.com/andongmin94/mix-live/actions/runs/45574156346): `10961f2`의
   라이브 AUX/앱 trim 및 VST3 슬롯 우회 관련 workspace 테스트, native fixture, Clippy 성공.
-  마지막 확인 당시 릴리스 빌드와 GPUI 검사는 진행 중이었다.
-- 에코: 정확한 반복 간격/감쇠, 가변 블록, stereo 분리, ramp/reset, 실제 capture 경계의 mute 및
-  Scene/GPUI 저장 회귀 검사를 추가했다. 신규 변경의 통합 Audio CI 결과는 아직 확인하지 않았다.
+  최신 변경으로 대체되어 릴리스 빌드/GPUI 검사 완료 전에 취소됐다.
+- 에코와 VST3 설치 경로 검색: 반복 간격/감쇠, 가변 블록, stereo 분리, ramp/reset, capture 경계의 mute,
+  Scene/GPUI 저장, native 코드 미실행 경로 검색, GUI 검색/명시적 추가 계약을 검사하도록 추가했다.
+  신규 변경의 통합 Audio CI 결과는 아직 확인하지 않았다.
 
 ## 남은 작업과 제한
 

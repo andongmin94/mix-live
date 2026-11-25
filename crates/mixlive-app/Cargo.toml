@@ -12,6 +12,7 @@ mixlive-audio-windows = { path = "../mixlive-audio-windows" }
 mixlive-effects = { path = "../mixlive-effects" }
 
 [target.'cfg(windows)'.dependencies]
+mixlive-vst3 = { path = "../mixlive-vst3" }
 gpui = { package = "gpui-pre", version = "=0.3.12" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", default-features = false }
 gpui-deck = { git = "https://github.com/andongmin94/gpui-deck", rev = "78c0898ccb6feba03e3a3243ac7d4729fd80aee6" }

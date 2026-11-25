@@ -64,3 +64,20 @@ fn plugin_state_restores_in_a_fresh_process_and_never_crosses_class_ids() {
     assert!(inspect(std::path::Path::new(env!("CARGO_BIN_EXE_mixlive-plugins")), &args).is_err());
     assert_eq!(StateFile::read(&path).unwrap().schema, 1);
 }
+
+#[test]
+fn path_scan_lists_candidates_without_loading_native_code() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("not-a-library.vst3");
+    let bundle = directory.path().join("not-a-plugin.vst3");
+    let ignored = directory.path().join("not-vst3.dll");
+    std::fs::write(&file, b"not executable").unwrap();
+    std::fs::create_dir(&bundle).unwrap();
+    std::fs::write(&ignored, b"not executable").unwrap();
+    // Even a deliberately invalid candidate must be discoverable without opening a DLL.
+    let paths = mixlive_vst3::host::list(&[directory.path().to_owned()]).unwrap();
+    assert!(paths.contains(&file));
+    assert!(paths.contains(&bundle));
+    assert!(!paths.contains(&ignored));
+    assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+}

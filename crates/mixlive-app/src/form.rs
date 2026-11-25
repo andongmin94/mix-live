@@ -318,7 +318,7 @@ impl SceneForm {
 
     pub fn build_scene(&self, cx: &App) -> Result<AudioScene, String> {
         if self.is_busy(cx) {
-            return Err("파일 선택을 마친 뒤 저장하세요.".into());
+            return Err("파일 선택 또는 플러그인 검색을 마친 뒤 저장하세요.".into());
         }
         let sound = self.sound.read(cx).draft(cx);
         match &self.setup {

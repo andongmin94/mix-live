@@ -109,6 +109,9 @@ jobs:
           MIXLIVE_UI_ECHO_FEEDBACK: '에코 피드백'
           MIXLIVE_UI_BLEND: '보컬 보정 비율'
           MIXLIVE_UI_MOVE_SECOND: 'VST3 2 위로'
+          MIXLIVE_UI_SCAN_VST3: '설치된 VST3 검색'
+          MIXLIVE_UI_SCAN_RESULT: 'VST3 검색 결과'
+          MIXLIVE_UI_THIRD_SLOT: 'VST3 3 위로'
           MIXLIVE_UI_BYPASS_SECOND_ON: 'VST3 2 우회 켜기'
           MIXLIVE_UI_BYPASS_SECOND_OFF: 'VST3 2 우회 끄기'
           MIXLIVE_UI_WORKSPACE: 'Scene 작업 영역'
@@ -350,6 +353,10 @@ jobs:
             $null = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
             if ((Wait-UiName $env:MIXLIVE_UI_START).Current.IsEnabled) { throw 'Audio start must be disabled while editing' }
             if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '1.25') { throw 'Saved mic trim was not loaded into the editor' }
+            Invoke-UiName $env:MIXLIVE_UI_SCAN_VST3
+            $null = Wait-UiName $env:MIXLIVE_UI_SCAN_RESULT
+            $null = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
+            if (Find-UiName $env:MIXLIVE_UI_THIRD_SLOT) { throw 'Scanning unexpectedly appended a plugin slot' }
             Set-UiValue $env:MIXLIVE_UI_TRIM '3.5'
             if ((Read-UiValue $env:MIXLIVE_UI_REVERB) -cne '0.125') { throw 'Saved reverb was not loaded' }
             Set-UiValue $env:MIXLIVE_UI_REVERB '0.25'

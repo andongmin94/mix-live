@@ -1,4 +1,5 @@
 //! Startup vocal settings and an ordered VST3 chain. This view never loads native plugins.
+use std::path::PathBuf;
 
 use gpui::{
     App, AppContext as _, Context, Div, Entity, InteractiveElement, IntoElement, ParentElement,
@@ -20,6 +21,12 @@ enum Pick {
     Chain,
 }
 
+struct InstalledPlugins {
+    paths: Vec<PathBuf>,
+    picker: Entity<SelectState>,
+    _subscription: Subscription,
+}
+
 pub struct SoundEditor {
     draft: SoundDraft,
     preset: Entity<SelectState>,
@@ -35,6 +42,8 @@ pub struct SoundEditor {
     echo_feedback: Entity<InputState>,
     busy: bool,
     picking: bool,
+    scanning: bool,
+    installed: Option<InstalledPlugins>,
     error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -87,6 +96,8 @@ impl SoundEditor {
             echo_feedback,
             busy: false,
             picking: false,
+            scanning: false,
+            installed: None,
             error: None,
             _subscriptions: subscriptions,
         }
@@ -110,7 +121,7 @@ impl SoundEditor {
     }
 
     pub fn is_busy(&self) -> bool {
-        self.busy || self.picking
+        self.busy || self.picking || self.scanning
     }
 
     pub fn set_busy(&mut self, busy: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -122,6 +133,9 @@ impl SoundEditor {
         let disabled = self.is_busy();
         self.preset
             .update(cx, |state, cx| state.set_disabled(disabled, window, cx));
+        if let Some(installed) = &self.installed {
+            installed.picker.update(cx, |state, cx| state.set_disabled(disabled, window, cx));
+        }
         for input in [
             &self.input_gain,
             &self.strength,
@@ -182,6 +196,51 @@ impl SoundEditor {
         .detach();
     }
 
+    /// Search standard VST3 installation paths using the same filesystem-only list as the CLI.
+    /// No native DLL is loaded, even if a discovered candidate is not a valid plugin.
+    fn scan_installed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() { return; }
+        self.scanning = true;
+        self.installed = None;
+        self.error = None;
+        self.update_disabled(window, cx);
+        let scan = cx.background_executor().spawn(async {
+            mixlive_vst3::host::list(&[]).map_err(|error| error.to_string())
+        });
+        cx.spawn_in(window, async move |owner, cx| {
+            let result = scan.await;
+            let _ = cx.update(move |window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.scanning = false;
+                    match result {
+                        Ok(paths) => {
+                            let items = std::iter::once(SelectItem::new("", "추가할 VST3 선택"))
+                                .chain(paths.iter().enumerate().map(|(index, path)| {
+                                    // Keep the original OS path, not the lossy display string, as identity.
+                                    SelectItem::new(index.to_string(), path.to_string_lossy().into_owned())
+                                }))
+                                .collect::<Vec<_>>();
+                            let picker = cx.new(|cx| SelectState::new(items, cx).default_value(""));
+                            let subscription = cx.observe(&picker, |_, _, cx| cx.notify());
+                            this.installed = Some(InstalledPlugins { paths, picker, _subscription: subscription });
+                        }
+                        Err(error) => this.error = Some(error),
+                    }
+                    this.update_disabled(window, cx);
+                });
+            });
+        }).detach();
+    }
+
+    fn add_installed(&mut self, cx: &mut Context<Self>) {
+        if self.is_busy() { return; }
+        let Some(installed) = &self.installed else { return; };
+        let Some(index) = selected(&installed.picker, cx).and_then(|value| value.parse::<usize>().ok()) else { return; };
+        let Some(path) = installed.paths.get(index) else { return; };
+        self.error = self.draft.append_plugins(vec![path.clone()]).err();
+        cx.notify();
+    }
+
     fn move_slot(&mut self, index: usize, target: usize, cx: &mut Context<Self>) {
         if self.is_busy() {
             return;
@@ -198,7 +257,7 @@ impl SoundEditor {
         cx.notify();
     }
 
-    fn chain(&self, cx: &Context<Self>) -> Div {
+    fn chain(&self, window: &Window, cx: &Context<Self>) -> Div {
         let disabled = self.is_busy();
         let mut chain = panel().gap_4()
             .child(div().flex().items_center().justify_between().gap_3()
@@ -206,6 +265,8 @@ impl SoundEditor {
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child(format!("{}개", self.draft.effects.len()))))
             .child(div().flex().flex_wrap().gap_2()
+                .child(button("scan-vst3", "설치된 VST3 검색", false).disabled(disabled)
+                    .on_click(cx.listener(|this, _, window, cx| this.scan_installed(window, cx))))
                 .child(button("add-vst3-files", "VST3 파일 추가", false).disabled(disabled)
                     .on_click(cx.listener(|this, _, window, cx| this.pick(Pick::Plugins, window, cx))))
                 .child(button("add-vst3-bundle", "VST3 폴더 추가", false).disabled(disabled)
@@ -214,6 +275,25 @@ impl SoundEditor {
                     .on_click(cx.listener(|this, _, window, cx| this.pick(Pick::Chain, window, cx)))))
             .child(div().text_xs().text_color(rgb(MUTED))
                 .child("위에서 아래로 처리합니다. 체인 파일은 현재 목록 뒤에 추가되며, 같은 플러그인도 별도 슬롯입니다."));
+        if self.scanning {
+            chain = chain.child(div().text_sm().text_color(rgb(ACCENT)).child("VST3 설치 경로 조회 중"));
+        }
+        if let Some(installed) = &self.installed {
+            let count = installed.paths.len();
+            let mut results = div().flex().flex_col().gap_2()
+                .child(div().font_semibold().child("VST3 검색 결과"))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(format!("표준 설치 경로에서 발견한 후보 {count}개 · 실제 호환성은 시작할 때 확인")));
+            if count == 0 {
+                results = results.child(div().text_sm().child("발견된 후보가 없습니다. VST3 파일 또는 폴더를 직접 추가할 수 있습니다."));
+            } else {
+                results = results.child(div().flex().items_center().gap_2()
+                    .child(div().flex_1().min_w_0().child(select_control("installed-vst3", "설치된 VST3 선택", &installed.picker, None, window, cx)))
+                    .child(button("add-installed-vst3", "선택한 VST3 추가", false)
+                        .disabled(disabled || selected(&installed.picker, cx).is_none())
+                        .on_click(cx.listener(|this, _, _, cx| this.add_installed(cx)))));
+            }
+            chain = chain.child(results);
+        }
         if self.picking {
             chain = chain.child(
                 div()
@@ -364,7 +444,7 @@ impl Render for SoundEditor {
                 .role(Role::Alert).aria_label(error.clone()).gap_2().border_color(rgb(DANGER))
                 .child(div().font_semibold().text_color(rgb(DANGER)).child("플러그인 목록을 변경하지 못했습니다"))
                 .child(div().text_sm().child(error.clone()))))
-            .child(self.chain(cx))
+            .child(self.chain(window, cx))
     }
 }
 
