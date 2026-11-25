@@ -244,8 +244,8 @@ UX의 진단은 관측 가능한 사실만 표시한다. input meter 정상→FX
 다른 앱/OS의 기본 장치를 허락 없이 바꾸지 않는다. 장치가 빠지면 노트북 마이크로
 몰래 전환하지 않고 해당 경로의 중단을 보여준다.
 
-`andongmin94/gpui-design`의 실제 manifest에서 `gpui-pre = =0.3.11` 계열과 Apache-2.0을
-확인했다. 첫 UI 작업 때 저장소 HEAD와 API를 다시 읽고 commit을 고정한다.
+`andongmin94/gpui-deck`의 실제 manifest에서 `gpui-pre = =0.3.12` 계열과 Apache-2.0을
+확인했다. 앱은 확인한 Deck commit과 동일한 GPUI engine family를 고정한다.
 현재 core에는 GPUI 의존성을 추가하지 않는다. 오디오 계산은 UI toolkit과 무관하다.[R8]
 
 ## 9. 저장 구조·모듈 경계
@@ -330,5 +330,5 @@ float headroom은 보존한다. limiter/출력 보호가 없는 현재 예제를
   https://github.com/storytold/soundcraft/blob/main/crates/dsp/Cargo.toml
 - **[R7] Steinberg, VST 3 License** — SDK 3.8+ MIT, VST2 제외, 상표 규칙 별도.
   https://steinbergmedia.github.io/vst3_dev_portal/pages/VST%2B3%2BLicensing/VST3%2BLicense.html
-- **[R8] 사용자 GPUI Design manifest** — 조회 blob `82fdcb9be246624a9f366d200b8999d03edb5b37`.
-  https://github.com/andongmin94/gpui-design/blob/main/Cargo.toml
+- **[R8] 사용자 GPUI Deck manifest** — 고정 commit `78c0898ccb6feba03e3a3243ac7d4729fd80aee6`.
+  https://github.com/andongmin94/gpui-deck/blob/78c0898ccb6feba03e3a3243ac7d4729fd80aee6/Cargo.toml

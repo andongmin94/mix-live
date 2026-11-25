@@ -1,7 +1,7 @@
 # 현재 상태
 
-기준일: 2026-11-15
-단계: **GPUI 기존 Scene 장치·출력 편집 및 Windows 통합 검증 완료**
+기준일: 2026-11-25
+단계: **GPUI Deck 의존성·API 갱신 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -23,34 +23,21 @@
 - native 장치 조회/시작/종료는 GPUI foreground의 UI 객체 변경 참조 밖에서 실행한다.
   `Prepared::new/start`, `Active::poll_plugin/report/finish`, `LiveControls`와
   장치 중지 → worker join → plugin 해제 순서를 유지한다. 가짜 meter는 없다.
-- gpui-design 최신 `385b0178fbbaa3d30de79fe04329aab62a257dc0`, GPUI family `=0.3.11` 유지.
-  기존 Select/Input/Button/ScrollArea를 재사용하며 새 의존성·Cargo.lock 변경은 없다.
+- gpui-deck `78c0898ccb6feba03e3a3243ac7d4729fd80aee6` (0.0.1), GPUI family `=0.3.12`로 갱신했다.
+  기존 Select/Input/Button/ScrollArea를 유지하며 라이브 fader는 단일 값 SliderState와 SliderThumb을
+  사용한다. Deck과 GPUI 계열의 잠금 파일은 Cargo로 갱신했다.
 - 엔진: WASAPI mic + optional mono/stereo AUX → 내장 DSP → 순차 stereo VST3 → mix 1~2개.
   공유 endpoint는 한 스트림, 별도 clock은 bounded queue/Rubato sinc bridge다. AUX는 보컬 체인 우회.
-  이번 묶음은 엔진·CLI·파일 형식을 바꾸지 않는다. schema 1/2·DeviceScene 호환 경로는 없다.
+  이번 묶음은 UI 의존성과 API만 갱신하며 엔진·CLI·파일 형식을 바꾸지 않는다. schema 1/2·DeviceScene 호환 경로는 없다.
 
 ## 검증
 
-이번 로컬 환경은 Linux/Rust 1.100.0이며 실제 Windows 런타임은 없다.
-앱 검사 **15 passed**: 전체 저장 설정 보존(비활성 채널 포함), 장치/시작 음량 편집 후 파일
-왕복과 보컬·VST3 상태 보존, 누락 optional 장치의 명시적 유지/제거, 잘못된 음량/queue 거절을
-추가했다. 장치 catalog는 합성이며 장치나 DLL을 열지 않는다.
-Windows MSVC 대상 앱 all-targets Clippy(`--locked`, `-D warnings`)도 통과했다.
-
-검증 기준 코드: `af551409f292059c8ad87450ef7c83694f26db50`.
-[Audio #26](https://github.com/andongmin94/mix-live/actions/runs/43690650750) 전체 성공:
-Windows tests **87개**(workspace 78 + native fixture 9), 전체 Clippy(`-D warnings`),
-`mixlive.exe`/`mixlive-audio.exe`/`mixlive-plugins.exe` release 빌드와 CLI help 통과.
-
-실제 GUI에서 합성 저장 ID 네 개와 채널·시작값 유지, 누락 장치 저장 거절(파일 대화상자 없음),
-음량/queue 변경 후 취소·재열기와 원본 파일 SHA 보존을 확인했다. 기존 새 Scene 필수 장치 오류,
-보컬 편집·VST3 재정렬·포커스 스크롤·native 새 파일 저장·정상 종료도 통과했다.
-native 파일 저장은 기존 foreground 키보드·정확한 경로 복사 readback 검사를 유지했다.
-장치 목록만 조회하고 오디오/상용 plugin을 열지 않는다. 장치 교체 후 저장 성공은 모델 검사다.
-
-[Windows 개발용 ZIP](https://github.com/andongmin94/mix-live/actions/runs/43690650750/artifacts/14152935772)
-(CI 7일 보관)에 실행 파일 3개·의존성 잠금 파일·README·라이선스 고지를 포함한다.
-다운로드 ZIP의 게시 SHA256 일치·전체 CRC와 실행 파일 3개의 x64 PE 형식을 확인했다.
+[Cargo 의존성 갱신](https://github.com/andongmin94/mix-live/actions/runs/45548210980) 성공:
+`cargo update --workspace` 및 `cargo metadata --locked`, 생성된 Cargo.lock SHA256 일치.
+GPUI Deck 0.0.1과 GPUI family 0.3.12만 사용하며 기존 엔진 패키지 버전은 유지했다.
+이전 장치·보컬 편집 코드는 [Audio #26](https://github.com/andongmin94/mix-live/actions/runs/43690650750)에서
+Windows 검사 87개, Clippy, release 빌드 및 실제 Scene 편집·저장 검사를 통과했다.
+새 Deck revision의 Windows 통합 검증은 대기 중이다. 실제 장치와 라이브 fader는 미검증이다.
 
 ## 남은 작업과 제한
 

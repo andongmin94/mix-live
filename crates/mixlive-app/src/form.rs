@@ -5,7 +5,7 @@ use gpui::{
     InteractiveElement, IntoElement, ParentElement, Render, Role, StatefulInteractiveElement,
     Styled, Subscription, Window, div, prelude::FluentBuilder as _, px, rgb,
 };
-use gpui_design::{
+use gpui_deck::{
     Input, InputAccessibility, InputBase, InputEditorStyle, InputState, Select, SelectEvent,
     SelectItem, SelectOption, SelectState, StyledExt as _,
 };

@@ -133,7 +133,7 @@ jobs:
           function Invoke-UiName([string]$name) {
             $element = Wait-UiName $name -Enabled
             $element.SetFocus()
-            # GPUI Design buttons request native autoscroll on focus. Wait for the revealed frame.
+            # GPUI Deck buttons request native autoscroll on focus. Wait for the revealed frame.
             $limit = [DateTime]::UtcNow.AddSeconds(10)
             do {
               $element = Wait-UiName $name -Enabled

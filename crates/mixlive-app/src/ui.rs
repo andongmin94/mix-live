@@ -11,8 +11,8 @@ use gpui::{
     ParentElement, PathPromptOptions, Render, ScrollHandle, SharedString, Styled, Subscription,
     TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, relative, rgb, size,
 };
-use gpui_design::{
-    Button, Root, ScrollArea, Slider, SliderEvent, SliderState, StyledExt as _, Switch,
+use gpui_deck::{
+    Button, Root, ScrollArea, Slider, SliderEvent, SliderState, SliderThumb, StyledExt as _, Switch,
 };
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
 use mixlive_audio_windows::windows::device_catalog;
@@ -383,11 +383,11 @@ impl MixLive {
             }
         }
         for (target, value) in values {
-            let state = cx.new(|cx| SliderState::new(-96.0..=0.0, 0.1, cx).default_value(value));
+            let state = cx.new(|cx| SliderState::new(-96.0..=0.0, 0.1, [value], cx));
             self.subscriptions
                 .push(cx.subscribe(&state, move |this, _, event, cx| {
-                    let SliderEvent::Change(db) = event;
-                    let _ = this.session.apply(target.command(*db));
+                    let SliderEvent::Change(values) = event;
+                    let _ = this.session.apply(target.command(values[0]));
                     cx.notify();
                 }));
             self.faders.push(Fader { target, state });
@@ -429,7 +429,7 @@ impl MixLive {
             .find(|fader| fader.target == target)
             .expect("live fader installed")
             .state;
-        let percentage = state.read(cx).percentage();
+        let percentage = state.read(cx).percentage(0);
         div()
             .flex()
             .flex_shrink_0()
@@ -442,7 +442,6 @@ impl MixLive {
                     .flex_1()
                     .h(px(28.))
                     .rounded(px(5.))
-                    .focus_visible(|style| style.bg(rgb(RAISED)))
                     .child(
                         div()
                             .absolute()
@@ -466,7 +465,8 @@ impl MixLive {
                             .bg(rgb(ACCENT)),
                     )
                     .child(
-                        div()
+                        SliderThumb::new(state, 0)
+                            .accessibility_label(label.to_owned())
                             .absolute()
                             .left(relative(percentage))
                             .top(relative(0.5))
@@ -474,6 +474,9 @@ impl MixLive {
                             .mt(px(-6.))
                             .size(px(12.))
                             .rounded_full()
+                            .border_1()
+                            .border_color(rgb(TEXT))
+                            .focus_visible(|style| style.bg(rgb(ACCENT)))
                             .bg(rgb(TEXT)),
                     ),
             )
@@ -1296,7 +1299,7 @@ fn toggle(
 
 pub fn run(scene: Option<PathBuf>) {
     gpui_platform::application().run(move |cx| {
-        gpui_design::init(cx);
+        gpui_deck::init(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

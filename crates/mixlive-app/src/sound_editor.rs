@@ -5,7 +5,7 @@ use gpui::{
     PathPromptOptions, Render, Role, StatefulInteractiveElement, Styled, Subscription, Window, div,
     px, rgb,
 };
-use gpui_design::{InputState, SelectItem, SelectState, StyledExt as _};
+use gpui_deck::{InputState, SelectItem, SelectState, StyledExt as _};
 
 use crate::{
     form::{number_input, select_control, selected, text_input},

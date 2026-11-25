@@ -102,8 +102,8 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 음소거·음량·경로 변경은 이번 실행에만 적용되며 다시 시작하면 파일의 설정을 사용한다.
 표시된 endpoint 채널은 WASAPI 채널이고, 신고된 queue/plugin 지연은 실측 왕복 지연이 아니다.
 
-GPUI Design은 [고정 revision](https://github.com/andongmin94/gpui-design/tree/385b0178fbbaa3d30de79fe04329aab62a257dc0)의
-Button/Switch/Slider/Select/Input/Root를 재사용하고 GPUI engine family 0.3.11을 사용한다.
+GPUI Deck은 [고정 revision](https://github.com/andongmin94/gpui-deck/tree/78c0898ccb6feba03e3a3243ac7d4729fd80aee6)의
+Button/Switch/Slider/SliderThumb/Select/Input/ScrollArea/Root를 재사용하고 GPUI engine family 0.3.12를 사용한다.
 
 ### 장치 확인과 Scene 생성용 CLI
 
