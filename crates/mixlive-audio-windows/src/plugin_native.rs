@@ -1,6 +1,6 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
 use super::{ChainEdit, ChainFile, EffectSpec, LiveParameter, ResolvedPlugins};
-use crate::{bridge::{Fault, Health, OutputReader}, capture::{Capture, PreparedAppChange, PreparedPitchChange, PreparedVoiceDelay, VoiceDelayLayout, CAPTURE_BLOCK}, config::{PitchConfig, PitchScale, MAX_APPS}, control::{AppControls, GainRamp, LiveControls}};
+use crate::{bridge::{Fault, Health, OutputReader}, capture::{Capture, PreparedSourceChange, PreparedPitchChange, PreparedVoiceDelay, VoiceDelayLayout, CAPTURE_BLOCK}, config::{AuxSource, PitchConfig, PitchScale, MAX_APPS}, control::{AppControls, GainRamp, LiveControls}};
 use mixlive_effects::{PreparedVocalChange, VocalConfig, VocalSettings};
 use mixlive_vst3::editor::flush_editor_changes;
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -12,23 +12,25 @@ use vst3_host::{Parameter, Plugin, PluginWindow, Vst3Host, audio::BusAudioBuffer
 struct CaptureFrame {
     mic: f32,
     aux: [f32; 2],
+    aux_tag: u64,
 }
 
 pub(crate) struct QueuedInput {
     writer: Producer<CaptureFrame>,
-    has_aux: bool,
     health: Arc<Health>,
 }
 impl QueuedInput {
-    fn push(&mut self, mic: &[f32], aux: Option<&[[f32; 2]]>) {
+    fn push(&mut self, mic: &[f32], aux: Option<(u64, &[[f32; 2]])>) {
         if self.health.failed() { return; }
-        if aux.is_some() != self.has_aux || aux.is_some_and(|a| a.len() != mic.len()) {
+        if aux.is_some_and(|(_, frames)| frames.len() != mic.len()) {
             self.health.fail(Fault::Input); return;
         }
         for (i, &voice) in mic.iter().enumerate() {
-            let music = aux.map_or([0.0; 2], |a| a[i]);
-            let frame = CaptureFrame { mic: voice, aux: music };
-            if !voice.is_finite() || music.iter().any(|s| !s.is_finite()) {
+            let (aux_tag, music) = aux.map_or((0, [0.0; 2]), |(tag, frames)| (tag, frames[i]));
+            let frame = CaptureFrame { mic: voice, aux: music, aux_tag };
+            // Obsolete shared AUX pairs are ignored by the worker. Validate only
+            // the selected current source there, so stale NaNs cannot fail a new binding.
+            if !voice.is_finite() {
                 self.health.fail(Fault::Input); return;
             }
             if self.writer.push(frame).is_err() {
@@ -40,9 +42,44 @@ impl QueuedInput {
 
 pub(crate) struct CaptureSink(QueuedInput);
 impl CaptureSink {
-    pub fn push(&mut self, mic: &[f32], aux: Option<&[[f32; 2]]>) {
+    pub fn push(&mut self, mic: &[f32], aux: Option<(u64, &[[f32; 2]])>) {
         self.0.push(mic, aux);
     }
+}
+
+pub(crate) enum AuxFeed {
+    Disabled,
+    Shared(u64),
+    Independent { reader: Box<OutputReader>, health: Arc<Health>, enabled: Arc<AtomicBool> },
+}
+impl AuxFeed {
+    fn has_aux(&self) -> bool { !matches!(self, Self::Disabled) }
+
+    fn error(&self) -> Option<&'static str> {
+        match self { Self::Independent { health, .. } => health.error(), _ => None }
+    }
+
+    fn enable(&self, active: bool) {
+        if let Self::Independent { enabled, .. } = self { enabled.store(active, Ordering::Release); }
+    }
+
+    fn propagate_health(&self, route: &Health) {
+        if let Self::Independent { health, .. } = self { health.propagate_to(route); }
+    }
+
+    fn next_frame(&mut self, frame: &CaptureFrame) -> [f32; 2] {
+        match self {
+            Self::Shared(tag) if *tag == frame.aux_tag => frame.aux,
+            Self::Independent { reader, .. } => reader.next_source_frame(),
+            _ => [0.0; 2],
+        }
+    }
+}
+
+pub(crate) struct SourceFeeds {
+    pub aux: AuxFeed,
+    pub aux_source: Option<AuxSource>,
+    pub apps: Vec<OutputReader>,
 }
 
 struct Slot {
@@ -196,7 +233,7 @@ impl ChainChange {
 }
 
 struct AppChange {
-    capture: Box<PreparedAppChange>,
+    capture: Box<PreparedSourceChange>,
     readers: Vec<Option<OutputReader>>,
     retained: Vec<(usize, usize)>,
     stop_removed: Option<Arc<AtomicBool>>,
@@ -208,7 +245,23 @@ impl AppChange {
         if let Some(stop) = &self.stop_removed { stop.store(true, Ordering::Relaxed); }
         for &(from, to) in &self.retained { self.readers[to] = readers[from].take(); }
         std::mem::swap(&mut self.readers, readers);
-        capture.apply_app_change(&mut self.capture);
+        capture.apply_source_change(&mut self.capture);
+    }
+}
+
+struct AuxChange {
+    capture: Box<PreparedSourceChange>,
+    feed: AuxFeed,
+    applied: bool,
+}
+impl AuxChange {
+    fn apply(&mut self, capture: &mut Capture, feed: &mut AuxFeed) {
+        if self.feed.error().is_some() { return; }
+        feed.enable(false);
+        std::mem::swap(feed, &mut self.feed);
+        capture.apply_source_change(&mut self.capture);
+        feed.enable(true);
+        self.applied = true;
     }
 }
 
@@ -220,9 +273,10 @@ enum ProcessingChange {
     Pitch { pitch: Box<PreparedPitchChange>, delays: Option<PreparedVoiceDelay> },
     Vocal(Box<PreparedVocalChange>),
     Apps(AppChange),
+    Aux(AuxChange),
 }
 impl ProcessingChange {
-    fn apply(&mut self, capture: &mut Capture, processors: &mut Vec<Option<Processor>>, apps: &mut Vec<Option<OutputReader>>) {
+    fn apply(&mut self, capture: &mut Capture, processors: &mut Vec<Option<Processor>>, apps: &mut Vec<Option<OutputReader>>, aux: &mut AuxFeed) {
         match self {
             Self::Chain(change) => change.apply(capture, processors),
             Self::Pitch { pitch, delays } => {
@@ -231,6 +285,7 @@ impl ProcessingChange {
             }
             Self::Vocal(change) => capture.apply_vocal_change(change),
             Self::Apps(change) => change.apply(capture, apps),
+            Self::Aux(change) => change.apply(capture, aux),
         }
     }
 }
@@ -252,6 +307,7 @@ struct ProcessingState {
     capture: Capture,
     processors: Vec<Option<Processor>>,
     apps: Vec<Option<OutputReader>>,
+    aux: AuxFeed,
     input: Consumer<CaptureFrame>,
     requests: Consumer<ProcessingChange>,
     retired: Producer<ProcessingChange>,
@@ -270,6 +326,7 @@ pub(crate) struct PluginWorker {
     pitch_config: PitchConfig,
     vocal_settings: VocalSettings,
     apps: Vec<Arc<AppControls>>,
+    aux_source: Option<AuxSource>,
     pub description: String,
 }
 
@@ -290,7 +347,7 @@ fn load_effect(spec: &EffectSpec, rate: u32) -> Result<Plugin, String> {
     Ok(plugin)
 }
 
-pub fn connect(capture: Capture, setup: &ResolvedPlugins, rate: u32, queue_ms: u32, health: Arc<Health>, controls: &LiveControls, apps: Vec<OutputReader>)
+pub fn connect(capture: Capture, setup: &ResolvedPlugins, rate: u32, queue_ms: u32, health: Arc<Health>, controls: &LiveControls, feeds: SourceFeeds)
     -> Result<(CaptureSink, PluginWorker), String> {
     setup.validate()?;
     // Selection was resolved once, from CLI/chain or an embedded scene. Native loading happens here.
@@ -298,7 +355,7 @@ pub fn connect(capture: Capture, setup: &ResolvedPlugins, rate: u32, queue_ms: u
         let plugin = load_effect(spec, rate).map_err(|e| format!("VST3 slot {}: {e}", index + 1))?;
         Ok::<_, String>((plugin, controls.effect_flag(index)?))
     }).collect::<Result<Vec<_>, _>>()?;
-    let (input, mut worker) = spawn(capture, plugins, rate, queue_ms, health, apps)?;
+    let (input, mut worker) = spawn(capture, plugins, rate, queue_ms, health, feeds)?;
     for &index in &setup.editors {
         worker.set_editor_open(index as usize - 1, true)?;
     }
@@ -361,14 +418,17 @@ fn prepare_plugin(mut plugin: Plugin, bypassed: Arc<AtomicBool>, rate: u32, inde
     Ok((slot, processor))
 }
 
-fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u32, queue_ms: u32, health: Arc<Health>, apps: Vec<OutputReader>)
+fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u32, queue_ms: u32, health: Arc<Health>, feeds: SourceFeeds)
     -> Result<(QueuedInput, PluginWorker), String> {
     if !(8_000..=192_000).contains(&rate) || !(10..=100).contains(&queue_ms) {
         return Err("invalid VST3 rate/queue capacity".into());
     }
     let capacity = (rate as usize * queue_ms as usize / 1000).max(CAPTURE_BLOCK * 2);
-    if capture.app_count() != apps.len() { return Err("application readers do not match the capture sources".into()); }
-    let has_aux = capture.has_aux();
+    if capture.app_count() != feeds.apps.len() || capture.has_aux() != feeds.aux.has_aux()
+        || feeds.aux_source.is_some() != feeds.aux.has_aux() {
+        return Err("input feeds do not match the capture sources".into());
+    }
+    if let Some(error) = feeds.aux.error() { return Err(error.into()); }
     let (writer, reader) = RingBuffer::<CaptureFrame>::new(capacity);
     let (requests, changes) = RingBuffer::new(1);
     let (retired, acknowledgments) = RingBuffer::new(1);
@@ -379,7 +439,8 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
     let app_controls = capture.app_controls();
     let mut owner = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots: Vec::new(),
         stopped: false, health: health.clone(), chain: Some(ChainControl { requests, retired: acknowledgments,
-            layout, rate, capacity, latency: 0, pitch_latency, compensation: 0 }), pitch_config, vocal_settings, apps: app_controls, description: String::new() };
+            layout, rate, capacity, latency: 0, pitch_latency, compensation: 0 }), pitch_config, vocal_settings,
+        apps: app_controls, aux_source: feeds.aux_source, description: String::new() };
     let mut processors = Vec::new();
     let mut total_latency = 0_u64;
     for (index, (plugin, bypassed)) in plugins.into_iter().enumerate() {
@@ -397,16 +458,20 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
     owner.refresh_description();
     let stop = owner.stop.clone();
     let worker_health = health.clone();
-    let mut state = ProcessingState { capture, processors, apps: apps.into_iter().map(Some).collect(), input: reader, requests: changes, retired, unreturned: None };
+    feeds.aux.enable(true);
+    let mut state = ProcessingState { capture, processors, apps: feeds.apps.into_iter().map(Some).collect(),
+        aux: feeds.aux, input: reader, requests: changes, retired, unreturned: None };
     owner.thread = Some(thread::Builder::new().name("mixlive-vst3-audio".into()).spawn(move || {
         let mut mic = [0.0; CAPTURE_BLOCK];
         let mut aux = [[0.0; 2]; CAPTURE_BLOCK];
         let mut app_buffers = [[[0.0; 2]; CAPTURE_BLOCK]; MAX_APPS];
         while !stop.load(Ordering::Relaxed) && !worker_health.failed() {
+            state.aux.propagate_health(&worker_health);
+            if worker_health.failed() { break; }
             // An idle queue is still a valid boundary. Native loading and allocation
             // are already complete, and the PDC bank changes with the processor order.
             if let Ok(mut change) = state.requests.pop() {
-                change.apply(&mut state.capture, &mut state.processors, &mut state.apps);
+                change.apply(&mut state.capture, &mut state.processors, &mut state.apps, &mut state.aux);
                 if let Err(rtrb::PushError::Full(change)) = state.retired.push(change) {
                     // One edit is in flight, so this is a broken handoff invariant.
                     // Retain ownership for join instead of freeing buffers here.
@@ -419,20 +484,22 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
             if count == 0 { thread::sleep(Duration::from_millis(1)); continue; }
             for i in 0..count {
                 let Ok(frame) = state.input.pop() else { worker_health.fail(Fault::Routing); break; };
-                mic[i] = frame.mic; aux[i] = frame.aux;
+                mic[i] = frame.mic; aux[i] = state.aux.next_frame(&frame);
                 for (buffer, reader) in app_buffers.iter_mut().zip(&mut state.apps) {
                     buffer[i] = reader.as_mut().expect("prepared app reader").next_source_frame();
                 }
             }
+            state.aux.propagate_health(&worker_health);
             if worker_health.failed() { break; }
             let apps: [&[[f32; 2]]; MAX_APPS] = std::array::from_fn(|slot| &app_buffers[slot][..count]);
-            state.capture.push_with_effect(&mic[..count], has_aux.then_some(&aux[..count]), &apps[..state.apps.len()], &mut |left, right| {
+            state.capture.push_with_effect(&mic[..count], state.aux.has_aux().then_some(&aux[..count]), &apps[..state.apps.len()], &mut |left, right| {
                 process_chain(state.processors.iter_mut().map(|processor| processor.as_mut().expect("prepared processor slot")), left, right)
             });
         }
+        state.aux.enable(false);
         state
     }).map_err(|e| e.to_string())?);
-    Ok((QueuedInput { writer, has_aux, health }, owner))
+    Ok((QueuedInput { writer, health }, owner))
 }
 
 /// Worker is already joined. Always attempt stop, including when the final flush fails.
@@ -494,6 +561,41 @@ impl PluginWorker {
 
     pub fn app_count(&self) -> usize { self.apps.len() }
 
+    pub fn aux_source(&self) -> Option<&AuxSource> { self.aux_source.as_ref() }
+
+    /// Publish binding metadata only when the worker accepted both the new feed
+    /// and its prepared routing plan. A later runtime error does not undo a commit.
+    pub fn set_aux_source(&mut self, next: Option<AuxSource>, feed: AuxFeed, controls: &LiveControls) -> Result<(), String> {
+        if self.health.failed() || self.stopped { return Err("audio path has stopped; cannot edit AUX".into()); }
+        if next == self.aux_source { return Ok(()); }
+        if next.is_some() != feed.has_aux() || matches!(feed, AuxFeed::Shared(0)) {
+            return Err("AUX binding and prepared feed do not match".into());
+        }
+        let chain = self.chain.as_ref().ok_or("no running audio processor")?;
+        if self.thread.is_none() { return Err("no running audio processor".into()); }
+        let latency = usize::try_from(chain.latency + chain.pitch_latency as u64)
+            .map_err(|_| "combined voice latency is too large")?;
+        let capture = PreparedSourceChange::aux(controls, &self.apps, next.is_some(), chain.rate, latency)?;
+        let layout = capture.delay_layout();
+        let compensation = capture.compensation();
+        let change = AuxChange { capture: Box::new(capture), feed, applied: false };
+        let ProcessingChange::Aux(retired) = self.exchange_change(ProcessingChange::Aux(change))? else {
+            unreachable!("serialized AUX change acknowledgment");
+        };
+        if !retired.applied {
+            return Err(format!("new AUX capture failed before attachment: {}",
+                retired.feed.error().unwrap_or("AUX change was not applied")));
+        }
+        drop(retired);
+        self.aux_source = next;
+        let chain = self.chain.as_mut().expect("prepared chain control");
+        chain.layout = layout;
+        chain.compensation = compensation;
+        self.refresh_description();
+        if let Some(error) = self.health.error() { return Err(error.into()); }
+        Ok(())
+    }
+
     pub fn add_app(&mut self, reader: OutputReader, app: Arc<AppControls>, controls: &LiveControls) -> Result<(), String> {
         if self.apps.len() == MAX_APPS { return Err("at most eight application sources are supported".into()); }
         let mut next = self.apps.clone();
@@ -521,7 +623,7 @@ impl PluginWorker {
         if self.thread.is_none() { return Err("no running audio processor".into()); }
         let latency = usize::try_from(chain.latency + chain.pitch_latency as u64)
             .map_err(|_| "combined voice latency is too large")?;
-        let capture = PreparedAppChange::new(controls, &self.apps, next.clone(), chain.rate, latency)?;
+        let capture = PreparedSourceChange::apps(controls, &self.apps, next.clone(), chain.rate, latency)?;
         let layout = capture.delay_layout();
         let compensation = capture.compensation();
         let change = AppChange { capture: Box::new(capture), readers, retained, stop_removed };

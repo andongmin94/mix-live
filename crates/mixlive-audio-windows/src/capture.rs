@@ -78,12 +78,15 @@ impl PreparedPitchChange {
     }
 }
 
-/// A new app routing plan prepared without touching the running processing state.
+/// A new source routing plan prepared without touching the running processing state.
 /// Retained source identities carry their atomic targets, ramps and delay histories.
 /// After application this plan owns the retired engine/storage for control-thread drop.
 #[cfg(any(windows, test))]
-pub(crate) struct PreparedAppChange {
+pub(crate) struct PreparedSourceChange {
     engine: Engine,
+    aux_enabled: bool,
+    reset_aux: bool,
+    aux_changed: bool,
     app_controls: Vec<Arc<AppControls>>,
     source_slots: Vec<usize>,
     source_mutes: [GainRamp; MAX_SOURCES],
@@ -92,15 +95,31 @@ pub(crate) struct PreparedAppChange {
     route_ramps: [GainRamp; MAX_ROUTES],
     retained_sources: Vec<(usize, usize)>,
     retained_routes: Vec<(usize, usize)>,
+    retained_delays: Vec<(usize, usize)>,
     layout: VoiceDelayLayout,
     voice_latency: usize,
     compensation: usize,
 }
 
 #[cfg(any(windows, test))]
-impl PreparedAppChange {
-    pub(crate) fn new(controls: &LiveControls, current: &[Arc<AppControls>],
+impl PreparedSourceChange {
+    pub(crate) fn apps(controls: &LiveControls, current: &[Arc<AppControls>],
         next: Vec<Arc<AppControls>>, rate: u32, total_voice_latency: usize) -> Result<Self, String> {
+        let has_aux = controls.has_aux();
+        Self::prepare(controls, (has_aux, current), (has_aux, next), rate, total_voice_latency, true)
+    }
+
+    /// An AUX request always creates a new capture identity, including a change
+    /// between channels on the same device. Its old delay history must end here.
+    pub(crate) fn aux(controls: &LiveControls, apps: &[Arc<AppControls>],
+        next_aux: bool, rate: u32, total_voice_latency: usize) -> Result<Self, String> {
+        Self::prepare(controls, (controls.has_aux(), apps), (next_aux, apps.to_vec()), rate, total_voice_latency, false)
+    }
+
+    fn prepare(controls: &LiveControls, current: (bool, &[Arc<AppControls>]),
+        next: (bool, Vec<Arc<AppControls>>), rate: u32, total_voice_latency: usize, keep_aux_delay: bool) -> Result<Self, String> {
+        let (current_aux, current) = current;
+        let (next_aux, next) = next;
         if !(8_000..=192_000).contains(&rate) { return Err("unsupported capture sample rate".into()); }
         if current.len() > MAX_APPS || next.len() > MAX_APPS { return Err("too many application sources".into()); }
         if total_voice_latency as u64 > u64::from(rate) * 2 {
@@ -113,34 +132,46 @@ impl PreparedAppChange {
         }
         let mix_slots: Vec<_> = controls.mixes().map(RouteMix::index).collect();
         let mix_count = mix_slots.len();
-        let source_slots = source_slots(controls.has_aux(), next.len());
+        let source_slots = source_slots(next_aux, next.len());
         let route_count = source_slots.len() * mix_count;
         let mut retained_sources = vec![(0, 0)];
-        if controls.has_aux() { retained_sources.push((1, 1)); }
-        let first_app = 1 + usize::from(controls.has_aux());
+        if current_aux && next_aux { retained_sources.push((1, 1)); }
+        let first_current_app = 1 + usize::from(current_aux);
+        let first_next_app = 1 + usize::from(next_aux);
         for (index, app) in next.iter().enumerate() {
             if let Some(old) = current.iter().position(|other| Arc::ptr_eq(app, other)) {
-                retained_sources.push((first_app + index, first_app + old));
+                retained_sources.push((first_next_app + index, first_current_app + old));
             }
         }
         let retained_routes: Vec<_> = retained_sources.iter().flat_map(|&(next, old)| {
             (0..mix_count).map(move |mix| (next * mix_count + mix, old * mix_count + mix))
         }).collect();
+        let retained_delays: Vec<_> = retained_routes.iter().copied().filter(|&(next, _)| {
+            keep_aux_delay || source_slots[next / mix_count] != RouteSource::Aux.index()
+        }).collect();
         let layout = VoiceDelayLayout::from_sources(&source_slots, &mix_slots);
         let compensation = if layout.compensated.contains(&true) { total_voice_latency } else { 0 };
         let frames: Vec<_> = layout.compensated.iter().enumerate().map(|(index, &compensated)| {
-            // Retained lines are swapped in on the worker; only new apps need storage.
-            if compensated && !retained_routes.iter().any(|&(next, _)| next == index) { total_voice_latency } else { 0 }
+            // Retained lines are swapped in on the worker; only new or replaced
+            // sources need delay storage prepared on the control thread.
+            if compensated && !retained_delays.iter().any(|&(next, _)| next == index) { total_voice_latency } else { 0 }
         }).collect();
-        let mut engine = routing_engine(controls.has_aux(), next.len(), mix_count)?;
+        let mut engine = routing_engine(next_aux, next.len(), mix_count)?;
         engine.swap_send_delays(&mut SendDelays::new(&frames)).map_err(|error| error.to_string())?;
-        let targets = controls.route_targets(&next);
+        let reset_aux = !current_aux && next_aux;
+        let mut targets = controls.route_targets(&next);
+        let aux = RouteSource::Aux.index();
+        if reset_aux { targets[aux * MAX_MIXES..(aux + 1) * MAX_MIXES].fill(0.0); }
         let route_ramps = std::array::from_fn(|index| GainRamp::new(rate,
             if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
-        let source_mutes = controls.source_targets(&next).map(|gain| GainRamp::new(rate, gain));
-        let source_trims = controls.trim_targets(&next).map(|gain| GainRamp::new(rate, gain));
-        Ok(Self { engine, app_controls: next, source_slots, source_mutes, source_trims,
-            route_count, route_ramps, retained_sources, retained_routes, layout,
+        let mut source_mutes = controls.source_targets(&next).map(|gain| GainRamp::new(rate, gain));
+        let mut source_trims = controls.trim_targets(&next).map(|gain| GainRamp::new(rate, gain));
+        if reset_aux {
+            source_mutes[aux] = GainRamp::new(rate, 1.0);
+            source_trims[aux] = GainRamp::new(rate, 10.0_f32.powf(-12.0 / 20.0));
+        }
+        Ok(Self { engine, aux_enabled: next_aux, reset_aux, aux_changed: !keep_aux_delay, app_controls: next, source_slots, source_mutes, source_trims,
+            route_count, route_ramps, retained_sources, retained_routes, retained_delays, layout,
             voice_latency: total_voice_latency, compensation })
     }
 
@@ -268,9 +299,9 @@ impl Capture {
     /// Retained ramps are copied before swapping arrays so compacting indices cannot
     /// overwrite a later source. The prepared plan takes every retired allocation.
     #[cfg(any(windows, test))]
-    pub(crate) fn apply_app_change(&mut self, prepared: &mut PreparedAppChange) {
-        assert_eq!(self.voice_latency, prepared.voice_latency, "prepared app routing voice latency");
-        prepared.engine.swap_retained_send_delays(&mut self.engine, &prepared.retained_routes)
+    pub(crate) fn apply_source_change(&mut self, prepared: &mut PreparedSourceChange) {
+        assert_eq!(self.voice_latency, prepared.voice_latency, "prepared source routing voice latency");
+        prepared.engine.swap_retained_send_delays(&mut self.engine, &prepared.retained_delays)
             .expect("prepared retained source mapping");
         for &(next, old) in &prepared.retained_sources {
             let next = prepared.source_slots[next];
@@ -279,7 +310,10 @@ impl Capture {
             prepared.source_trims[next] = self.source_trims[old];
         }
         for &(next, old) in &prepared.retained_routes { prepared.route_ramps[next] = self.route_ramps[old]; }
+        if prepared.reset_aux { self.controls.reset_aux_for_add(); }
+        if prepared.aux_changed { self.health.aux_peak.store(0, Ordering::Relaxed); }
         std::mem::swap(&mut self.engine, &mut prepared.engine);
+        std::mem::swap(&mut self.aux_enabled, &mut prepared.aux_enabled);
         std::mem::swap(&mut self.app_controls, &mut prepared.app_controls);
         std::mem::swap(&mut self.source_slots, &mut prepared.source_slots);
         std::mem::swap(&mut self.source_mutes, &mut prepared.source_mutes);

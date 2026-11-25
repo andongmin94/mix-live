@@ -15,13 +15,14 @@ use gpui_deck::{
     Button, Root, ScrollArea, SelectItem, SelectState, Slider, SliderEvent, SliderState, SliderThumb, StyledExt as _, Switch,
 };
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
-use mixlive_audio_windows::config::{AppSource, PitchConfig, MAX_APPS};
-use mixlive_audio_windows::devices::AppInfo;
+use mixlive_audio_windows::config::{AppSource, AuxSource, PitchConfig, MAX_APPS};
+use mixlive_audio_windows::devices::{AppInfo, DeviceInfo};
 use mixlive_audio_windows::plugin::{ChainEdit, EffectSpec, LiveParameter};
 use mixlive_audio_windows::windows::{device_catalog, list_apps};
 use mixlive_effects::{VocalParameter, VocalSettings};
 
 use crate::{
+    aux_editor::{AuxEditor, AuxEvent},
     form::{FormEvent, SceneForm, select_control, selected},
     parameter_editor::{ParameterEditor, ParameterEvent},
     pitch_editor::{PitchEditor, PitchEvent},
@@ -118,6 +119,8 @@ enum Operation {
     RefreshApps,
     AddApp(AppSource),
     RemoveApp(usize),
+    AuxDevices,
+    SetAux(Option<AuxSource>),
     Close,
 }
 
@@ -137,6 +140,8 @@ pub struct MixLive {
     pitch_subscription: Option<Subscription>,
     vocal_editor: Option<Entity<VocalEditor>>,
     vocal_subscription: Option<Subscription>,
+    aux_editor: Option<Entity<AuxEditor>>,
+    aux_subscription: Option<Subscription>,
     installed_plugins: Option<InstalledPlugins>,
     available_apps: Option<AvailableApps>,
     scanning_plugins: bool,
@@ -227,6 +232,8 @@ impl MixLive {
             pitch_subscription: None,
             vocal_editor: None,
             vocal_subscription: None,
+            aux_editor: None,
+            aux_subscription: None,
             installed_plugins: None,
             available_apps: None,
             scanning_plugins: false,
@@ -623,6 +630,34 @@ impl MixLive {
         cx.notify();
     }
 
+    fn install_aux_editor(&mut self, devices: Vec<DeviceInfo>, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.session.aux_source();
+        if let Some(editor) = &self.aux_editor {
+            editor.update(cx, |editor, cx| {
+                editor.set_devices(devices, window, cx);
+                editor.set_current(current, cx);
+            });
+            return;
+        }
+        let route = &self.session.scene().expect("running Scene").route;
+        let editor = cx.new(|cx| AuxEditor::new(current, (&route.input, route.input_channel), devices, window, cx));
+        self.aux_subscription = Some(cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
+            match event {
+                AuxEvent::Apply(source) => this.perform(Operation::SetAux(Some(source.clone())), window, cx),
+                AuxEvent::Remove => this.perform(Operation::SetAux(None), window, cx),
+                AuxEvent::Refresh => this.perform(Operation::AuxDevices, window, cx),
+                AuxEvent::Close if this.busy.is_none() => {
+                    this.aux_editor = None;
+                    this.aux_subscription = None;
+                    cx.notify();
+                }
+                AuxEvent::Close => {}
+            }
+        }));
+        self.aux_editor = Some(editor);
+        self.workspace_scroll.set_offset(Default::default());
+    }
+
     fn perform(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
@@ -639,7 +674,7 @@ impl MixLive {
         {
             return;
         }
-        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_) | Operation::SetVocalSettings(_) | Operation::RefreshApps | Operation::AddApp(_) | Operation::RemoveApp(_));
+        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_) | Operation::SetVocalSettings(_) | Operation::RefreshApps | Operation::AddApp(_) | Operation::RemoveApp(_) | Operation::AuxDevices | Operation::SetAux(_));
         if live_operation && (!self.session.running() || self.picking) {
             return;
         }
@@ -657,6 +692,8 @@ impl MixLive {
             Operation::RefreshApps => "앱 목록 조회 중",
             Operation::AddApp(_) => "앱 추가 중",
             Operation::RemoveApp(_) => "앱 삭제 중",
+            Operation::AuxDevices => "AUX 장치 조회 중",
+            Operation::SetAux(_) => "AUX 변경 중",
         });
         if matches!(operation, Operation::EditChain(_)) {
             // Parameter events capture a slot index. A topology change invalidates that selection.
@@ -672,6 +709,8 @@ impl MixLive {
             self.pitch_subscription = None;
             self.vocal_editor = None;
             self.vocal_subscription = None;
+            self.aux_editor = None;
+            self.aux_subscription = None;
             self.available_apps = None;
         } else if let Some(editor) = &self.parameter_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
@@ -682,6 +721,9 @@ impl MixLive {
         if let Some(editor) = &self.vocal_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
+        if let Some(editor) = &self.aux_editor {
+            editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
+        }
         if let Some(available) = &self.available_apps {
             for select in [&available.picker, &available.channels] {
                 select.update(cx, |state, cx| state.set_disabled(true, window, cx));
@@ -689,12 +731,14 @@ impl MixLive {
         }
         let previous_preset = self.session.vocal_settings().map(|settings| settings.preset);
         let previous_apps = self.session.apps().to_vec();
+        let previous_aux = self.session.aux_source();
         let mut session = std::mem::take(&mut self.session);
         cx.notify();
         cx.spawn_in(window, async move |owner, cx| {
             // These synchronous native calls MUST be outside App/entity update.
             let mut parameters = None;
             let mut apps = None;
+            let mut aux_devices = None;
             let catalog = match &operation {
                 Operation::Devices | Operation::EditDevices => {
                     Some(device_catalog().map_err(|error| error.to_string()))
@@ -741,6 +785,14 @@ impl MixLive {
                     let _ = session.remove_app(*index);
                     None
                 }
+                Operation::AuxDevices => {
+                    aux_devices = Some(device_catalog().map(|catalog| catalog.inputs).map_err(|error| error.to_string()));
+                    None
+                }
+                Operation::SetAux(source) => {
+                    let _ = session.set_aux_source(source.clone());
+                    None
+                }
                 Operation::StopAndSave(path) => {
                     let _ = session.stop_and_save(path.clone());
                     None
@@ -785,6 +837,18 @@ impl MixLive {
                     if let Some(apps) = apps {
                         this.install_app_picker(apps, cx);
                     }
+                    if let Some(devices) = aux_devices {
+                        match devices {
+                            Ok(devices) => {
+                                this.session.error = None;
+                                this.install_aux_editor(devices, window, cx);
+                            }
+                            Err(error) => {
+                                this.session.message = "AUX 장치 목록을 읽지 못했습니다. 연결을 확인한 뒤 다시 조회하세요.".into();
+                                this.session.error = Some(error);
+                            }
+                        }
+                    }
                     if let Some(available) = &this.available_apps {
                         for select in [&available.picker, &available.channels] {
                             select.update(cx, |state, cx| state.set_disabled(false, window, cx));
@@ -802,10 +866,17 @@ impl MixLive {
                             editor.set_busy(false, window, cx);
                         });
                     }
+                    if let Some(editor) = &this.aux_editor {
+                        editor.update(cx, |editor, cx| {
+                            editor.set_current(this.session.aux_source(), cx);
+                            editor.set_busy(false, window, cx);
+                        });
+                    }
                     // Rebind compacted app indices and changed preset availability even
                     // if a later error is reported after the worker acknowledged the edit.
                     let current_preset = this.session.vocal_settings().map(|settings| settings.preset);
-                    if !live_operation || current_preset != previous_preset || this.session.apps() != previous_apps {
+                    if !live_operation || current_preset != previous_preset || this.session.apps() != previous_apps
+                        || this.session.aux_source() != previous_aux {
                         this.install_faders(cx);
                     }
                     cx.notify();
@@ -1161,14 +1232,16 @@ impl MixLive {
                     route.input_channel, route.input_gain_db
                 ),
             ));
-        if let Some(aux) = &route.aux_input {
+        if let Some(aux) = self.session.aux_source() {
+            let trim = self.session.controls().map_or(route.aux_gain_db, |controls| {
+                controls.source_trim_db(RouteSource::Aux).expect("configured AUX")
+            });
             sources = sources.child(device(
                 "AUX / MR",
-                aux,
+                &aux.input,
                 format!(
-                    "입력 채널 {} · {:+.1} dB",
-                    channels(&route.aux_channels),
-                    route.aux_gain_db
+                    "입력 채널 {} · {trim:+.1} dB",
+                    channels(&aux.channels),
                 ),
             ));
         } else {
@@ -1178,6 +1251,11 @@ impl MixLive {
                     .text_color(rgb(MUTED))
                     .child("AUX / MR 미선택"),
             );
+        }
+        if self.session.running() {
+            sources = sources.child(button("edit-live-aux", "실행 중 AUX 설정", false)
+                .disabled(self.busy.is_some() || self.picking)
+                .on_click(cx.listener(|this, _, window, cx| this.perform(Operation::AuxDevices, window, cx))));
         }
 
         for (index, app) in self.session.apps().iter().enumerate() {
@@ -1814,6 +1892,11 @@ impl Render for MixLive {
             body = body.child(form.clone());
         } else {
             if self.session.running()
+                && let Some(editor) = &self.aux_editor
+            {
+                body = body.child(editor.clone());
+            }
+            if self.session.running()
                 && let Some(editor) = &self.vocal_editor
             {
                 body = body.child(editor.clone());
@@ -1843,7 +1926,7 @@ impl Render for MixLive {
             .child(self.header(cx))
             .child(body)
             .child(div().flex_shrink_0().px_7().py_3().border_t_1().border_color(rgb(BORDER)).text_xs().text_color(rgb(MUTED))
-                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 앱 소스·믹서·보컬 설정과 VST3 상태를 보존합니다."))
+                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 AUX·앱 소스·믹서·보컬 설정과 VST3 상태를 보존합니다."))
     }
 }
 

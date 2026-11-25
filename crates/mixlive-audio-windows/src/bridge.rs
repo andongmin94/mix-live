@@ -61,6 +61,12 @@ impl Health {
         let _ = self.fault.compare_exchange(0, fault as u8, Ordering::Relaxed, Ordering::Relaxed);
     }
     pub fn failed(&self) -> bool { self.fault.load(Ordering::Relaxed) != 0 }
+    /// Only the currently attached input forwards its first fault to route health.
+    #[cfg(any(windows, test))]
+    pub(crate) fn propagate_to(&self, target: &Health) {
+        let fault = self.fault.load(Ordering::Relaxed);
+        if fault != 0 { let _ = target.fault.compare_exchange(0, fault, Ordering::Relaxed, Ordering::Relaxed); }
+    }
     pub fn error(&self) -> Option<&'static str> {
         match self.fault.load(Ordering::Relaxed) {
             0 => None,
@@ -265,6 +271,24 @@ impl OutputReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attached_input_fault_propagation_preserves_cause_and_first_route_failure() {
+        for fault in [Fault::Device, Fault::Input, Fault::Overflow, Fault::Resampler] {
+            let local = Health::default();
+            let route = Health::default();
+            local.propagate_to(&route);
+            assert!(!route.failed());
+            local.fail(fault);
+            assert!(!route.failed());
+            local.propagate_to(&route);
+            assert_eq!(route.error(), local.error());
+            let other = Health::default();
+            other.fail(Fault::Routing);
+            local.propagate_to(&other);
+            assert_eq!(other.error(), Some("routing failed"));
+        }
+    }
 
     #[test]
     fn rate_conversion_keeps_stereo_and_faults_silence_pending_audio() {

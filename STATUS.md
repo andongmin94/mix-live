@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-26
-단계: **실행 중 앱 소스 추가·삭제 검증 완료 · main 병합**
+단계: **실행 중 물리 AUX 추가·교체·삭제 구현 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -26,6 +26,15 @@
   현재 목록으로 fader·계측·진단과 Scene 저장을 갱신하며, 일반 정지는 저장된 목록으로 돌아간다.
   앱 목록 mutex는 제어/UI에서만 읽는다. 초기 priming 무음과 삭제 소스의 소리 종료는 있으며
   실제 Windows process loopback·장비를 사용한 전환과 청취 품질은 미검증이다.
+- 실행 중 물리 AUX를 exact capture endpoint와 채널로 추가·교체·삭제한다. 별도 장치는
+  독립 clock reader를 기존 worker에 준비하고, 마이크와 같은 장치는 선택 채널·세대로
+  표시한 pair를 기존 입력 큐로 보낸다. 새 선택과 일치하지 않는 대기 AUX 샘플은 무음으로
+  처리하며 mic·앱·보컬·pitch·VST3·출력을 유지한다. 새 독립 캡처는 적용까지 공급을
+  보류하고 오류를 자체 Health에 모아 준비 실패가 현재 경로를 중단하지 않게 한다.
+  적용 후 현재 입력의 오류만 전체 경로로 전달한다. 교체는 AUX mixer/ramp를 유지하고
+  이전 AUX PDC 이력을 버리며, 추가는 −12 dB/unmuted/all sends off로 시작한다.
+  현재 binding·fader·계측·진단과 Scene snapshot을 갱신하며 명시적 저장에만 반영한다.
+  새 bridge priming과 선택 전환의 AUX 무음은 가능하다. 실장비/실행 UI 전환은 미검증이다.
 - 실행 중 mic/AUX/앱별 mute 및 각 목적지로의 send·gain, master/믹스별 감쇠·출력 mute를 조절한다.
   AUX/앱 공통 trim은 기존 Scene 필드에서 시작하고 GUI/CLI에서 실시간 조절한다.
   입력 clock에서 5 ms ramp를 한 번 적용하고 PDC 이후 mute/send gain을 유지한다.
@@ -125,7 +134,11 @@
 
 ## 검증
 
-- [Audio #59](https://github.com/andongmin94/mix-live/actions/runs/45645735079) `359cc26` 전체 성공:
+- 이번 AUX 변경은 로컬 scoped 검사 39개가 통과했다: capture 24, control 13,
+  AUX fault 전달 1, UI 선택 검증 1. 이전 소스의 PDC 폐기, 진행 중 mic pitch/app ramp·PDC
+  보존, AUX 없음/있음에 따른 후속 delay 준비, 현재 mixer snapshot과 fresh add reset을 확인했다.
+  Windows worker/native fixture와 실제 GPUI 파일 흐름은 통합 CI에서 검증할 예정이다.
+- 직전 main의 [Audio #59](https://github.com/andongmin94/mix-live/actions/runs/45645735079) `359cc26` 전체 성공:
   Windows workspace 검사 151개와 실제 native VST3 fixture 검사 13개, 총 **164개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
@@ -162,7 +175,7 @@
 - 실제 MiniFuse/가상 케이블/복수 앱 process loopback/상용 VST3 및 장치+UI 전체 실행은
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
-- 탭 선택·ASIO·실행 중 물리 장치 소스 교체·고급 formant 보존과 음정 보정 품질 수용은
+- 탭 선택·ASIO·실행 중 마이크/출력 장치 교체·고급 formant 보존과 음정 보정 품질 수용은
   미완료다(실험적 자동 보정은 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
   음정 설정/프리셋/리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.

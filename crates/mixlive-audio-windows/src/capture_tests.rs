@@ -675,10 +675,10 @@ fn live_app_removal_preserves_partial_ramps_and_retained_send_histories() {
             }
         }
         if start == 137 {
-            let mut change = PreparedAppChange::new(&controls, &edited.app_controls(),
+            let mut change = PreparedSourceChange::apps(&controls, &edited.app_controls(),
                 vec![retained_identity.clone()], 48000, edited.voice_latency).unwrap();
             assert_eq!(change.compensation(), 512);
-            edited.apply_app_change(&mut change);
+            edited.apply_source_change(&mut change);
             assert!(Arc::ptr_eq(&edited.app_controls[0], &retained_identity));
             // Publication is deliberately delayed through one audio block. The
             // worker must use its own retained identities, not the UI's old order.
@@ -710,13 +710,13 @@ fn live_app_removal_preserves_partial_ramps_and_retained_send_histories() {
     }
     // Delete all apps with audio still pending, then reuse the compact index for
     // a new source. No removed history or requested gain/route may carry over.
-    let mut empty = PreparedAppChange::new(&controls, &edited.app_controls(), vec![], 48000, 512).unwrap();
-    edited.apply_app_change(&mut empty);
+    let mut empty = PreparedSourceChange::apps(&controls, &edited.app_controls(), vec![], 48000, 512).unwrap();
+    edited.apply_source_change(&mut empty);
     controls.publish_apps(vec![]);
     let added = Arc::new(AppControls::new(&AppSource::new("added.exe".into())).unwrap());
-    let mut add = PreparedAppChange::new(&controls, &[], vec![added], 48000, 512).unwrap();
+    let mut add = PreparedSourceChange::apps(&controls, &[], vec![added], 48000, 512).unwrap();
     assert_eq!(add.delay_layout().prepare(512, 48000).unwrap().compensation(), 512);
-    edited.apply_app_change(&mut add);
+    edited.apply_source_change(&mut add);
     controls.publish_apps(edited.app_controls());
     assert_eq!(controls.route_state(RouteSource::App(0), RouteMix::Broadcast).unwrap(), (false, 0.0));
     assert!((controls.source_trim_db(RouteSource::App(0)).unwrap() + 12.0).abs() < 1e-5);
@@ -767,11 +767,11 @@ fn live_app_edits_keep_running_pitch_vocal_state_and_reject_invalid_preparation(
                 2466 => { next.remove(0); }
                 _ => next.push(Arc::new(AppControls::new(&AppSource::new(format!("app-{start}.exe"))).unwrap())),
             }
-            let mut change = PreparedAppChange::new(&controls, &edited.app_controls(), next, 48000, total).unwrap();
+            let mut change = PreparedSourceChange::apps(&controls, &edited.app_controls(), next, 48000, total).unwrap();
             let expected_compensation = if change.app_controls.is_empty() { 0 } else { total };
             assert_eq!(change.compensation(), expected_compensation);
             assert_eq!(change.delay_layout().prepare(total as u64, 48000).unwrap().compensation(), expected_compensation);
-            edited.apply_app_change(&mut change);
+            edited.apply_source_change(&mut change);
             controls.publish_apps(edited.app_controls());
             assert_eq!(edited.compensation, expected_compensation);
         }
@@ -800,12 +800,186 @@ fn live_app_edits_keep_running_pitch_vocal_state_and_reject_invalid_preparation(
         (vec![], 7999, total),
         (vec![], 48000, 96001),
     ] {
-        assert!(PreparedAppChange::new(&controls, &edited.app_controls(), next, rate, latency).is_err());
+        assert!(PreparedSourceChange::apps(&controls, &edited.app_controls(), next, rate, latency).is_err());
     }
     assert!(edited.app_controls.is_empty());
     assert_eq!(edited.voice_latency, total);
     assert_eq!(edited.pitch_config(), pitch);
     assert!(!edited.health.failed() && !reference.health.failed());
+}
+
+#[test]
+fn live_aux_add_remove_keeps_app_ramps_and_in_flight_pitch_and_send_history() {
+    let config = VocalConfig { preset: Preset::Warm, strength: 0.0, ..VocalConfig::default() };
+    let setup = || {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], false, 2, config).unwrap());
+        for command in ["route app1 output on", "route app1 broadcast on", "route app2 output on", "route app2 broadcast on"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        let (writer, reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
+        let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+            vec![(writer, vec![0, 2])], health, controls.clone()).unwrap();
+        capture.prepare_pitch(48000, PitchConfig { strength: 0.7, ..PitchConfig::default() }).unwrap();
+        capture.prepare_voice_delay(71, 48000).unwrap();
+        (capture, controls, reader)
+    };
+    let (mut edited, controls, _edited_reader) = setup();
+    let (mut reference, reference_controls, _reference_reader) = setup();
+    let identities = edited.app_controls();
+    let total = edited.voice_latency;
+    assert_eq!(total, 2048 + 71);
+    let mut mic = vec![0.0; total + 384];
+    let mut first = vec![[0.015625, -0.0078125]; mic.len()];
+    let mut second = vec![[-0.0078125, 0.015625]; mic.len()];
+    mic[17] = 0.03125;
+    first[17] = [0.125, -0.25];
+    second[31] = [-0.0625, 0.125];
+    for start in (0..mic.len()).step_by(137) {
+        if start == 137 {
+            for target in [&controls, &reference_controls] {
+                for command in ["trim app1 -12", "level app2 broadcast -6", "mute app2"] {
+                    target.apply(command.parse().unwrap()).unwrap();
+                }
+            }
+        }
+        if start == 411 {
+            for target in [&controls, &reference_controls] { target.apply("unmute app2".parse().unwrap()).unwrap(); }
+        }
+        if [137, 274, 411, 548].contains(&start) {
+            let next_aux = !edited.aux_enabled;
+            let mut change = PreparedSourceChange::aux(&controls, &edited.app_controls(), next_aux, 48000, total).unwrap();
+            assert_eq!(change.compensation(), total);
+            assert_eq!(change.delay_layout().compensated.len(), (3 + usize::from(next_aux)) * 2);
+            edited.apply_source_change(&mut change);
+            assert_eq!(edited.aux_enabled, next_aux);
+            assert_ne!(controls.has_aux(), next_aux); // worker applied, UI has not published
+            assert_eq!(f32::from_bits(edited.health.aux_peak.load(Ordering::Relaxed)), 0.0);
+            assert!(edited.app_controls.iter().zip(&identities).all(|(current, original)| Arc::ptr_eq(current, original)));
+        }
+        let end = (start + 137).min(mic.len());
+        let aux = vec![[0.25, -0.125]; end - start];
+        edited.push(&mic[start..end], edited.aux_enabled.then_some(aux.as_slice()), &[&first[start..end], &second[start..end]]);
+        reference.push(&mic[start..end], None, &[&first[start..end], &second[start..end]]);
+        for mix in 0..2 {
+            let actual = edited.engine.output(mix).unwrap();
+            let expected = reference.engine.output(mix).unwrap();
+            assert_eq!(actual.left, expected.left, "left at frame {start}, mix {mix}");
+            assert_eq!(actual.right, expected.right, "right at frame {start}, mix {mix}");
+        }
+        assert_eq!(edited.voice_latency, total);
+        assert_eq!(edited.compensation, total);
+        controls.publish_aux(edited.aux_enabled);
+        if [137, 411].contains(&start) {
+            assert!((controls.source_trim_db(RouteSource::Aux).unwrap() + 12.0).abs() < 1e-5);
+            assert!(!controls.is_muted(crate::control::MuteTarget::Aux));
+            for mix in controls.mixes() { assert_eq!(controls.route_state(RouteSource::Aux, mix).unwrap(), (false, 0.0)); }
+            assert_eq!(f32::from_bits(edited.health.aux_peak.load(Ordering::Relaxed)), 0.25);
+            // Preserve nondefault inactive settings on removal, but a fresh add
+            // must reset them at its processing boundary before any audio flows.
+            for command in ["trim aux -3", "level aux broadcast -9", "route aux output on", "mute aux"] {
+                controls.apply(command.parse().unwrap()).unwrap();
+            }
+        }
+    }
+    assert!(!edited.aux_enabled && !controls.has_aux());
+    assert!(!edited.health.failed() && !reference.health.failed());
+}
+
+#[test]
+fn live_aux_replacement_discards_old_audio_but_keeps_controls_ramps_and_other_sources() {
+    let setup = || {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, VocalConfig::default()).unwrap());
+        for command in ["route aux output on", "route aux broadcast on", "route app1 output on", "route app1 broadcast on"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        let (writer, reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
+        let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+            vec![(writer, vec![0, 2])], health, controls.clone()).unwrap();
+        capture.prepare_voice_delay(512, 48000).unwrap();
+        (capture, controls, reader)
+    };
+    let (mut edited, controls, _edited_reader) = setup();
+    let (mut reference, reference_controls, _reference_reader) = setup();
+    let mut old_aux = vec![[0.0; 2]; 1000];
+    old_aux[17] = [1.0, -1.0];
+    let mut fresh_aux = vec![[0.125, -0.0625]; 1000];
+    fresh_aux[..137].fill([0.0; 2]);
+    let app = vec![[0.03125, -0.015625]; 1000];
+    let mic = vec![0.0078125; 1000];
+    for bounds in [0, 64, 137, 200, 256, 512, 768, 1000].windows(2) {
+        let (start, end) = (bounds[0], bounds[1]);
+        if start == 64 {
+            for target in [&controls, &reference_controls] {
+                for command in ["trim aux -6", "level aux output -6", "level aux broadcast -9", "mute aux"] {
+                    target.apply(command.parse().unwrap()).unwrap();
+                }
+            }
+        }
+        if start == 137 {
+            assert_eq!(f32::from_bits(edited.health.aux_peak.load(Ordering::Relaxed)), 1.0);
+            let mut change = PreparedSourceChange::aux(&controls, &edited.app_controls(), true, 48000, 512).unwrap();
+            edited.apply_source_change(&mut change);
+            assert_eq!(f32::from_bits(edited.health.aux_peak.load(Ordering::Relaxed)), 0.0);
+            assert!((controls.source_trim_db(RouteSource::Aux).unwrap() + 6.0).abs() < 1e-5);
+            assert!(controls.is_muted(crate::control::MuteTarget::Aux));
+            assert!(controls.route_state(RouteSource::Aux, RouteMix::Output).unwrap().0);
+            assert!((controls.route_state(RouteSource::Aux, RouteMix::Broadcast).unwrap().1 + 9.0).abs() < 1e-5);
+            assert!(edited.aux_enabled && controls.has_aux());
+        }
+        if start == 200 {
+            for target in [&controls, &reference_controls] { target.apply("unmute aux".parse().unwrap()).unwrap(); }
+        }
+        let input = if start < 137 { &old_aux } else { &fresh_aux };
+        edited.push(&mic[start..end], Some(&input[start..end]), &[&app[start..end]]);
+        reference.push(&mic[start..end], Some(&fresh_aux[start..end]), &[&app[start..end]]);
+        if start >= 137 {
+            for mix in 0..2 {
+                let actual = edited.engine.output(mix).unwrap();
+                let expected = reference.engine.output(mix).unwrap();
+                assert_eq!(actual.left, expected.left, "left at frame {start}, mix {mix}");
+                assert_eq!(actual.right, expected.right, "right at frame {start}, mix {mix}");
+            }
+        }
+        if start == 512 {
+            let broadcast = edited.engine.output(1).unwrap();
+            let retained = mic[0] + app[0][0];
+            assert_eq!(broadcast.left[17], retained); // old AUX impulse would have arrived here
+            assert!(broadcast.left[137] > retained); // first new AUX sample has its own full delay
+        }
+    }
+    assert_eq!(edited.voice_latency, 512);
+    assert_eq!(edited.compensation, 512);
+    assert!(!edited.health.failed() && !reference.health.failed());
+}
+
+#[test]
+fn aux_only_source_changes_update_compensation_without_resetting_pitch_latency() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], false, 0, VocalConfig::default()).unwrap());
+    let (writer, _reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        vec![(writer, vec![0, 1])], health, controls.clone()).unwrap();
+    capture.prepare_pitch(48000, PitchConfig { strength: 0.7, ..PitchConfig::default() }).unwrap();
+    assert_eq!(capture.prepare_voice_delay(71, 48000).unwrap(), 0);
+    let total = capture.voice_latency;
+    for enabled in [true, false] {
+        let mut change = PreparedSourceChange::aux(&controls, &[], enabled, 48000, total).unwrap();
+        let expected = if enabled { total } else { 0 };
+        assert_eq!(change.compensation(), expected);
+        assert_eq!(change.delay_layout().prepare(total as u64, 48000).unwrap().compensation(), expected);
+        capture.apply_source_change(&mut change);
+        controls.publish_aux(enabled);
+        assert_eq!(capture.compensation, expected);
+        assert_eq!(capture.voice_latency, total);
+        assert_eq!(capture.pitch_latency(), 2048);
+        // Subsequent latency preparation must address the new source count.
+        let mut delays = capture.delay_layout().prepare((total + 1) as u64, 48000).unwrap();
+        capture.swap_voice_delay(&mut delays);
+        capture.swap_voice_delay(&mut delays);
+        assert_eq!(capture.voice_latency, total);
+    }
 }
 
 #[test]
