@@ -366,3 +366,12 @@ Windows CI의 기존 native fixture 검사도 따른다. 화면 검사는 UIAuto
 [DESIGN.md](DESIGN.md) · [STATUS.md](STATUS.md) · [AGENTS.md](AGENTS.md) · [NOTICE.md](NOTICE.md)
 
 공개 저장소이며 제품 라이선스는 미정이다. 자동 녹음·클라우드 전송·드라이버 설치·공식 릴리스는 없다.
+
+## 자체 가상 오디오 드라이버 개발
+
+[drivers/virtual-audio](drivers/virtual-audio/README.md)에 Call/Broadcast용 독립 PortCls/WaveRT
+재생·캡처 쌍의 C++ 개발 소스와 INF를 추가했다. 각 쌍은 48 kHz stereo PCM32, 96-frame
+FIFO로 연결하며 기존 Rust/GPUI 앱의 WASAPI 장치 경계를 그대로 사용한다.
+이 FIFO의 2 ms는 실제 왕복 지연이 아니다. 현재 미서명 소스·빌드 단계이며 장치 설치,
+Windows에서의 실제 endpoint 노출 및 Discord/OBS 수신은 확인되지 않았다.
+WDK와 INF 검사는 드라이버 변경에 한해 별도 경로 필터 CI에서 실행하며 Rust 앱 CI는 변경하지 않는다.

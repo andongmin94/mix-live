@@ -1,0 +1,62 @@
+name: Virtual Audio
+on:
+  push:
+    branches: [main]
+    paths: ['drivers/virtual-audio/**', '.github/workflows/virtual-audio.yml']
+  pull_request:
+    paths: ['drivers/virtual-audio/**', '.github/workflows/virtual-audio.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: virtual-audio-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    # The WDK/SDK 26100 build uses the VS 2022 image, not a floating VS major.
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Test the actual driver transport without loading a kernel driver
+        shell: pwsh
+        run: |
+          cmake -S drivers/virtual-audio -B "$env:RUNNER_TEMP/mixlive-transport" -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build "$env:RUNNER_TEMP/mixlive-transport" --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir "$env:RUNNER_TEMP/mixlive-transport" -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Acquire the pinned Microsoft WDK build files (no driver installation)
+        shell: pwsh
+        run: |
+          $kits = Join-Path $env:RUNNER_TEMP 'mixlive-wdk'
+          nuget install Microsoft.Windows.WDK.x64 -Version 10.0.26100.6584 -ExcludeVersion -DependencyVersion Ignore -NonInteractive -OutputDirectory $kits -Source https://api.nuget.org/v3/index.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $headers = @(Get-ChildItem -LiteralPath $kits -Recurse -File -Filter portcls.h | Where-Object FullName -like '*\Include\10.0.26100.0\km\portcls.h')
+          if ($headers.Count -ne 1) { throw 'Expected one WDK 26100 PortCls header' }
+          $root = $headers[0].Directory.Parent.Parent.Parent.FullName
+          "MIXLIVE_WDK_ROOT=$root" >> $env:GITHUB_ENV
+          $infverif = @(Get-ChildItem -LiteralPath $kits -Recurse -File -Filter infverif.exe | Where-Object { $_.Directory.Name -eq 'x64' })
+          if ($infverif.Count -ne 1) { throw 'Expected one x64 WDK InfVerif executable' }
+          "MIXLIVE_INFVERIF=$($infverif[0].FullName)" >> $env:GITHUB_ENV
+      - name: Compile and link the unsigned x64 driver
+        shell: pwsh
+        run: |
+          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10'
+          ./drivers/virtual-audio/build-driver.ps1 -WdkRoot $env:MIXLIVE_WDK_ROOT -WdkVersion '10.0.26100.0' -SdkRoot $sdk -SdkVersion '10.0.26100.0' -Output "$env:RUNNER_TEMP/mixlive-driver"
+      - name: Validate the INF (no signing or installation)
+        shell: pwsh
+        run: |
+          $inf = Join-Path $env:RUNNER_TEMP 'mixlive-driver\mixlive-virtual-audio.inf'
+          & $env:MIXLIVE_INFVERIF /w $inf
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:MIXLIVE_INFVERIF /h $inf
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Keep unsigned build for driver development only
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: virtual-audio-unsigned-${{ github.sha }}
+          path: ${{ runner.temp }}/mixlive-driver/
+          retention-days: 7
+          if-no-files-found: error

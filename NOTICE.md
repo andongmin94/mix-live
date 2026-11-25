@@ -6,7 +6,7 @@ VST3 API는 아래 Rust 호스팅 라이브러리와 그 의존성을 통해 사
 
 제품 전체 라이선스는 미정이다. 임의로 MIT/Apache 라이선스를 부여하지 않았으며
 Cargo 패키지는 `publish = false`다. 외부 의존성의 라이선스는 별도로 유지한다.
-사용자 음성, 유료 플러그인 바이너리·프리셋, SDK·드라이버는 포함하지 않는다.
+사용자 음성, 유료 플러그인 바이너리·프리셋, SDK 및 외부 드라이버 바이너리는 포함하지 않는다.
 ASIO feature는 꺼져 있다. 공식 설치 파일·드라이버 릴리스는 하지 않는다.
 
 ## 직접 의존성
@@ -137,3 +137,20 @@ DEALINGS IN THE SOFTWARE.
 플러그인은 in-process이며, 메인 스레드의 로딩/상태/종료와 별도 처리 스레드의 processing을
 분리한다. 장치 callback 바깥에서도 호스트의 내부 mutex와 plugin 자체 동작의 제약은 남는다.
 이 변경은 상용 플러그인 라이선스·인증을 제공하거나 바이너리를 재배포하지 않는다.
+
+## 가상 오디오 드라이버 (개발 소스)
+
+- Cableloom (MIT), Copyright (c) 2026 Cableloom contributors:
+  https://github.com/n3dypop/cableloom/tree/130f811310082fd6966b17e76f0ac212e129dbf9
+  `drivers/virtual-audio/`의 PortCls/WaveRT adapter·miniport·stream·WDK build 코드는
+  해당 revision에서 필요한 부분만 도입하고 고정 PCM32 포맷, MixLive의 두 PnP 장치,
+  독립 전송/클럭, RUN 경계의 이력 초기화에 맞게 수정했다. 별도 관리자, VST worker,
+  제어 IOCTL, 동적 cable 번호·delay 기능은 가져오지 않았다. 원본 MIT 전문은
+  `drivers/virtual-audio/LICENSE`에 보존하며 unsigned 개발 artifact에도 포함한다.
+  원본의 실제 driver load와 Windows 장치 연결은 미검증으로 명시되어 있다.
+  이 도입은 MixLive 전체에 MIT 라이선스를 부여하거나 Windows 인증을 주장하지 않는다.
+- Microsoft WDK: `Microsoft.Windows.WDK.x64` 10.0.26100.6584, SDK build 26100,
+  Microsoft Visual C++ 2022 toolset을 빌드 시 사용한다. WDK 자체 파일을 저장소나
+  배포물에 포함하지 않는다.
+  https://www.nuget.org/packages/Microsoft.Windows.WDK.x64/10.0.26100.6584
+  드라이버 서명/인증은 별도 요구사항이며 Microsoft 서명·인증서 구매·설치는 수행하지 않는다.

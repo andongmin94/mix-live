@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실시간 보컬 파라미터 제어 구현 · Windows 통합 검증 대기**
+단계: **Call/Broadcast 가상 오디오 드라이버 개발 소스 구현 · WDK 검증 대기**
 
 ## 현재 구현
 
@@ -41,6 +41,12 @@
   schema 1~7, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
   `appN` 제어 명령을 사용한다.
 
+- `drivers/virtual-audio/`에 고정 Call/Broadcast PnP 하드웨어 ID와 독립 render/capture
+  WaveRT miniport를 추가했다. Cableloom의 MIT 고지를 보존한 C++ WDK 경계이며 별도 관리자·IOCTL은 없다.
+  48 kHz stereo PCM32, 96-frame 고정 FIFO, QPC 기반 clock, RUN 경계 초기화와 부재 시 무음/폐기를
+  제공한다. Rust 오디오/DSP/VST3/Scene schema 8은 변경하지 않았다. 설치된 render ID만 기존 WASAPI에서
+  선택할 수 있으며 실제 endpoint 노출은 아직 미검증이다.
+
 ## 검증
 
 [Audio #32](https://github.com/andongmin94/mix-live/actions/runs/45555026229) 전체 성공:
@@ -59,18 +65,21 @@ PDC 및 stereo 송출 지연·mute 검사를 포함한 Windows 검사 103개, na
 빌드, CLI와 실제 GPUI Scene 생성·편집·저장 검사를 모두 통과했다.
 [Audio #36](https://github.com/andongmin94/mix-live/actions/runs/45566374446)의
 리버브 포함 workspace와 native VST3 fixture 검사는 성공했다. Clippy도 통과했다.  나머지 Windows 통합 검사는 새 변경 반영 직전 미완료였다.
-이번 변경은 기존 제어 경계·GPUI Deck 슬라이더를 재사용해 6개 보컬 파라미터를 실제 처리 상태에
-연결한다. 10 ms ramp/블록 독립성·off→on room/strength·threshold·소스 격리·Scene snapshot 및
-기존 native gain fixture의 실시간 trim 검사를 추가했다. schema 8과 의존성은 그대로다.
-새 코드의 Windows 통합 검증은 대기 중이며 실장비 라이브 조작과 청취는 미검증이다.
+[Audio #37](https://github.com/andongmin94/mix-live/actions/runs/45567131587)의 실시간 보컬 조절 변경은 workspace 검사, native fixture, Clippy를 통과했다. 나머지 통합 검사는 진행 중이다.
+가상 장치 개발은 staged Git blob과 SHA가 동일한 실제 core.hpp/tests.cpp를 로컬 g++ C++17
+-Wall -Wextra -Werror로 컴파일·실행했다. PCM32 stereo 데이터, 두 케이블 격리, 링 wrap,
+RUN reset, 양쪽 부재 처리, 큰 clock gap과 QPC fractional carry/24시간 누적 계산 검사 성공.
+WDK 26100 기반 unsigned 커널 빌드 및 InfVerif /w, /h는 새 Virtual Audio CI에서 검증 대기.
+기존 Audio CI와 별도 변경 범위이며 설치·서명·카탈로그 생성은 하지 않는다.
 
 ## 남은 작업과 제한
 
 - 실제 MiniFuse/가상 케이블/복수 앱 process loopback/상용 VST3 및 장치+UI 전체 실행은
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
-- 탭 선택·자체 가상 장치·ASIO·실행 중
+- 탭 선택·자체 Return 장치·ASIO·실행 중
   소스/체인 삽입/삭제·내장 음정 보정·CLI 전체 Scene snapshot 출력은 미구현이다.
+  Call/Broadcast driver의 WDK 빌드·실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 수신은 미검증이다.
   실행 중 프리셋/pre-delay 변경은 미구현이다. 리버브/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.

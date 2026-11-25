@@ -1,0 +1,116 @@
+; Derived from Cableloom (MIT); see LICENSE.
+[Version]
+Signature="$WINDOWS NT$"
+Class=MEDIA
+ClassGuid={4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider=%Provider%
+DriverVer=11/25/2026,0.1.0.0
+CatalogFile=mixlive-virtual-audio.cat
+PnpLockdown=1
+
+[Manufacturer]
+%Provider%=Models,NTamd64.10.0...22000
+[Models.NTamd64.10.0...22000]
+%CallDevice%=Call,Root\MixLive_Call
+%BroadcastDevice%=Broadcast,Root\MixLive_Broadcast
+[DestinationDirs]
+DriverCopy=13
+[SourceDisksNames]
+1=%Disk%
+[SourceDisksFiles]
+mixlive-virtual-audio.sys=1
+[DriverCopy]
+mixlive-virtual-audio.sys
+[Service]
+DisplayName=%DriverName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%13%\mixlive-virtual-audio.sys
+
+[Call.NT]
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration,WDMAUDIO.Registration
+CopyFiles=DriverCopy
+[Call.NT.Services]
+AddService=MixLiveVirtualAudio,0x2,Service
+[Call.NT.Interfaces]
+AddInterface=%Audio%,RenderWave,CallRenderWave
+AddInterface=%Render%,RenderWave,CallRenderWave
+AddInterface=%Realtime%,RenderWave,CallRenderWave
+AddInterface=%Audio%,CaptureWave,CallCaptureWave
+AddInterface=%Capture%,CaptureWave,CallCaptureWave
+AddInterface=%Realtime%,CaptureWave,CallCaptureWave
+AddInterface=%Audio%,RenderTopology,CallRenderTopology
+AddInterface=%Topology%,RenderTopology,CallRenderTopology
+AddInterface=%Audio%,CaptureTopology,CallCaptureTopology
+AddInterface=%Topology%,CaptureTopology,CallCaptureTopology
+[CallRenderWave]
+AddReg=CallRenderReg
+[CallCaptureWave]
+AddReg=CallCaptureReg
+[CallRenderTopology]
+AddReg=CallRenderReg,DefaultFormat
+[CallCaptureTopology]
+AddReg=CallCaptureReg,DefaultFormat
+[CallRenderReg]
+HKR,,CLSID,,%Proxy%
+HKR,,FriendlyName,,%CallSend%
+[CallCaptureReg]
+HKR,,CLSID,,%Proxy%
+HKR,,FriendlyName,,%CallReceive%
+
+[Broadcast.NT]
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration,WDMAUDIO.Registration
+CopyFiles=DriverCopy
+[Broadcast.NT.Services]
+AddService=MixLiveVirtualAudio,0x2,Service
+[Broadcast.NT.Interfaces]
+AddInterface=%Audio%,RenderWave,BroadcastRenderWave
+AddInterface=%Render%,RenderWave,BroadcastRenderWave
+AddInterface=%Realtime%,RenderWave,BroadcastRenderWave
+AddInterface=%Audio%,CaptureWave,BroadcastCaptureWave
+AddInterface=%Capture%,CaptureWave,BroadcastCaptureWave
+AddInterface=%Realtime%,CaptureWave,BroadcastCaptureWave
+AddInterface=%Audio%,RenderTopology,BroadcastRenderTopology
+AddInterface=%Topology%,RenderTopology,BroadcastRenderTopology
+AddInterface=%Audio%,CaptureTopology,BroadcastCaptureTopology
+AddInterface=%Topology%,CaptureTopology,BroadcastCaptureTopology
+[BroadcastRenderWave]
+AddReg=BroadcastRenderReg
+[BroadcastCaptureWave]
+AddReg=BroadcastCaptureReg
+[BroadcastRenderTopology]
+AddReg=BroadcastRenderReg,DefaultFormat
+[BroadcastCaptureTopology]
+AddReg=BroadcastCaptureReg,DefaultFormat
+[BroadcastRenderReg]
+HKR,,CLSID,,%Proxy%
+HKR,,FriendlyName,,%BroadcastSend%
+[BroadcastCaptureReg]
+HKR,,CLSID,,%Proxy%
+HKR,,FriendlyName,,%BroadcastReceive%
+
+[DefaultFormat]
+; 48 kHz stereo PCM32, valid bits 32, FL|FR.
+HKR,"EP\0","{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2",,%AnyNode%
+HKR,"EP\0","{E4870E26-3CC5-4CD2-BA46-CA0A9A70ED04},3",1,41,00,00,00,28,00,00,00,fe,ff,02,00,80,bb,00,00,00,dc,05,00,08,00,20,00,16,00,20,00,03,00,00,00,01,00,00,00,00,00,10,00,80,00,00,aa,00,38,9b,71
+
+[Strings]
+Provider="MixLive"
+DriverName="MixLive Virtual Audio"
+Disk="MixLive Virtual Audio Driver"
+CallDevice="MixLive Call Cable"
+BroadcastDevice="MixLive Broadcast Cable"
+CallSend="MixLive Call Send"
+CallReceive="MixLive Call"
+BroadcastSend="MixLive Broadcast Send"
+BroadcastReceive="MixLive Broadcast"
+Audio="{6994ad04-93ef-11d0-a3cc-00a0c9223196}"
+Render="{65e8773e-8f56-11d0-a3b9-00a0c9223196}"
+Capture="{65e8773d-8f56-11d0-a3b9-00a0c9223196}"
+Realtime="{eb115ffc-10c8-4964-831d-6dcb02e6f23f}"
+Topology="{dda54a40-1e4c-11d1-a050-405705c10000}"
+Proxy="{17cca71b-ecd7-11d0-b908-00a0c9223196}"
+AnyNode="{00000000-0000-0000-0000-000000000000}"
