@@ -8,22 +8,36 @@ The Rust app retains all mixing, DSP, VST3 processing, and device selection.
 |---|---|---|
 | Root\MixLive_Call | MixLive Call Send | MixLive Call |
 | Root\MixLive_Broadcast | MixLive Broadcast Send | MixLive Broadcast |
+| Root\MixLive_Return | MixLive Return | MixLive Return Capture |
 
-The INF declares two fixed hardware IDs. The development provisioning script can
+The INF declares three fixed hardware IDs. The development provisioning script can
 create one root-enumerated device for each ID only after a signed-package preflight
 and explicit administrator confirmation.
 Actual Windows endpoint names and enumeration still need confirmation on a test
 machine. The existing WASAPI device catalog selects the installed render ID; it
 does not synthesize IDs or select devices by their friendly names. Use the
 corresponding capture endpoint in the receiving application. No default device
-is changed. The Return cable is outside this slice.
+is changed.
+
+For external audio/DAW return, select the installed **MixLive Return** render
+endpoint in the producing application, and its **MixLive Return Capture**
+endpoint as the AUX input in MixLive (channels 1,2). Select physical headphones
+for monitor, Call Send for the call mix, and Broadcast Send for the broadcast mix.
+The Return cable itself does not play on physical headphones. Do not capture the
+same producing application by process loopback as well: that would duplicate the
+signal. Do not route MixLive's own output to Return or select a cable's capture
+as its own source/output loop. Return is a separate audio route, not an
+access-controlled private device; other authorized Windows audio clients may open it.
+These are intended interface labels; actual endpoint labels and IDs are resolved
+from Windows only after installation. The current Scene supports one physical
+or virtual AUX endpoint in addition to process-captured apps.
 
 ## Transfer contract
 
 - 48 kHz stereo interleaved integer PCM32 only; one WaveRT stream in each direction.
   Shared-mode conversion/mixing belongs to Windows, not to this kernel driver.
 - An adapter owns one nonpaged ring-delay state, one QPC-derived frame clock and
-  one high-resolution timer. Call and Broadcast do not share audio.
+  one high-resolution timer. Call, Broadcast and Return do not share audio.
 - A 96-frame (2 ms) FIFO while both streams run; this is not end-to-end latency.
   No receiver: discard render data. No producer: produce zero capture frames.
   A RUN boundary flushes the FIFO. A missed full DMA wrap or interval over 480
@@ -39,7 +53,7 @@ The path-scoped **Virtual Audio** CI uses the Windows Server 2022 runner's insta
 VS 2022 and WDK/SDK build 26100 (the windows-2025 label now selects VS 2026).
 It tests the transport, links the driver, runs InfVerif and generates an unsigned
 catalog with Inf2Cat. It also checks that the unsigned package is rejected and that
-both cable IDs are absent. It never creates, loads or removes a device. Local build:
+all three cable IDs are absent. It never creates, loads or removes a device. Local build:
 
 ```powershell
 cmake -S drivers/virtual-audio -B drivers/virtual-audio/build/transport
@@ -65,10 +79,10 @@ Once an approved Microsoft-signed package is available, use
 test machine. SignTool checks the kernel policy and INF/SYS membership in the
 catalog. A successful check is not proof that Windows will load the driver.
 
-The default `-Action Status` is read-only. It checks only the two fixed hardware
+The default `-Action Status` is read-only. It checks only the three fixed hardware
 IDs and reports absent, duplicate, started (matching service, present and no
 PnP problem), or not ready. It does not assert that audio endpoints are present.
-The `Register` action requires `-Cable Call` or `-Cable Broadcast`,
+The `Register` action requires `-Cable Call`, `-Cable Broadcast` or `-Cable Return`,
 `-PackageDirectory <signed-directory>`, and `-DevGen <installed-WDK-devgen.exe>`.
 Use `-WhatIf` before an explicit confirmed action on an elevated Windows 11 x64
 test machine. DevGen is a Microsoft development-only tool, cannot be redistributed,
@@ -84,7 +98,7 @@ store; package removal/upgrade and a production installer are not implemented.
 
 Build-only CI cannot prove PortCls enumeration, shared-mode format negotiation,
 kernel lifetime/IRQL correctness, power transitions, driver removal, HVCI or
-Discord/OBS reception. Validate these on an isolated Windows 11 test target
+Discord/OBS reception or DAW/Return capture. Validate these on an isolated Windows 11 test target
 with an approved Microsoft-signed package and Driver Verifier/HLK as appropriate.
 A successful transport test does not certify the kernel driver.
 

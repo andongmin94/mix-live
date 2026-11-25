@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **가상 드라이버 패키지·개발 장치 등록 경계 구현 · WDK 재검증 대기**
+단계: **Call/Broadcast/Return 가상 장치 개발 패키지 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -41,53 +41,43 @@
   schema 1~7, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
   `appN` 제어 명령을 사용한다.
 
-- `drivers/virtual-audio/`에 고정 Call/Broadcast PnP 하드웨어 ID와 독립 render/capture
+- `drivers/virtual-audio/`에 고정 Call/Broadcast/Return PnP 하드웨어 ID와 독립 render/capture
   WaveRT miniport를 추가했다. Cableloom의 MIT 고지를 보존한 C++ WDK 경계이며 별도 관리자·IOCTL은 없다.
   48 kHz stereo PCM32, 96-frame 고정 FIFO, QPC 기반 clock, RUN 경계 초기화와 부재 시 무음/폐기를
   제공한다. Rust 오디오/DSP/VST3/Scene schema 8은 변경하지 않았다. 설치된 render ID만 기존 WASAPI에서
   선택할 수 있으며 실제 endpoint 노출은 아직 미검증이다.
+  Return은 외부 앱/DAW의 render→capture→기존 AUX를 위한 별도 장치이며 실제 앱에서 선택·수신한 결과는 미검증이다.
+  Return과 같은 앱의 process loopback 중복 캡처, Return으로의 자기 송출은 사용하지 않는다.
   개발용 manage-devices.ps1은 SignTool kernel-policy 및 catalog의 INF/SYS 검증 후에만
   명시적 관리자 승인으로 WDK DevGen/PnPUtil 등록을 수행한다. 고정 ID만 조회·제거하고
   중복 장치·자동 재시작·보안 우회를 허용하지 않는다. 제품 설치기는 별도 미구현이다.
 
 ## 검증
 
-[Audio #32](https://github.com/andongmin94/mix-live/actions/runs/45555026229) 전체 성공:
-이전 단일 앱 캡처 코드 `0eca6085218ac40e9adbaaf2332409faedc9da61`의
-Windows 테스트 94개(원본 VST3 창 재열기 fixture 포함), Clippy, locked release 빌드,
-앱 목록 CLI와 실제 GPUI Scene 생성·편집·저장 검사를 통과했다.
-이전 #30 컴파일 오류 및 #31 Clippy 모듈 배치 오류도 해당 실행에서 해결됐다.
-
-[Audio #33](https://github.com/andongmin94/mix-live/actions/runs/45559585204)은 합성 mono
-장치의 stereo 테스트 입력 오류로 중단됐고, `a90fae8`에서 mono 채널 1로 수정했다.
-[Audio #34](https://github.com/andongmin94/mix-live/actions/runs/45561046164)는
-세 믹스 변경의 Windows 검사 100개, native VST3 fixture, Clippy, locked release 빌드,
-CLI 및 실제 GPUI Scene 생성·편집·저장 검사를 모두 통과했다.
-[Audio #35](https://github.com/andongmin94/mix-live/actions/runs/45562830490)는
-PDC 및 stereo 송출 지연·mute 검사를 포함한 Windows 검사 103개, native fixture, Clippy, locked release
-빌드, CLI와 실제 GPUI Scene 생성·편집·저장 검사를 모두 통과했다.
-[Audio #36](https://github.com/andongmin94/mix-live/actions/runs/45566374446)의
-리버브 포함 workspace와 native VST3 fixture 검사는 성공했다. Clippy도 통과했다.  나머지 Windows 통합 검사는 새 변경 반영 직전 미완료였다.
-[Audio #37](https://github.com/andongmin94/mix-live/actions/runs/45567131587)의 실시간 보컬 조절 변경은 workspace 검사, native fixture, Clippy를 통과했다. 나머지 통합 검사는 진행 중이다.
-가상 장치 개발은 staged Git blob과 SHA가 동일한 실제 core.hpp/tests.cpp를 로컬 g++ C++17
--Wall -Wextra -Werror로 컴파일·실행했다. PCM32 stereo 데이터, 두 케이블 격리, 링 wrap,
-RUN reset, 양쪽 부재 처리, 큰 clock gap과 QPC fractional carry/24시간 누적 계산 검사 성공.
-[Virtual Audio #1](https://github.com/andongmin94/mix-live/actions/runs/45568185125)은
-windows-2025가 VS 2026 이미지를 제공하여 VS 2022 CMake generator 구성 단계에서 실패했다.
-드라이버 컴파일 전 실패이므로 기존 transport C++ 자체의 실패로 판단하지 않는다.
-windows-2022의 설치된 VS 2022 + WDK/SDK 26100으로 수정했다. 기존 Audio CI는 변경하지 않는다.
-이번 변경은 InfVerif 및 Inf2Cat의 unsigned catalog 생성, 서명·catalog membership 검사,
-두 고정 ID의 read-only 상태 조회와 명시적 개발용 등록/제거 명령을 추가했다.
-새 Windows 검사는 대기 중이다. 실제 장치 등록·제거·서명은 실행하지 않았다.
+- [Audio #37](https://github.com/andongmin94/mix-live/actions/runs/45567131587) 전체 성공:
+  `beea453`의 Windows 검사 113개(리버브·실시간 보컬 파라미터·native VST3 포함),
+  Clippy, locked release 빌드, CLI 및 실제 GPUI Scene 생성/편집/저장 검사 통과.
+  이번 드라이버 변경은 Rust 코드를 수정하지 않으므로 Audio CI를 반복하지 않는다.
+- [Virtual Audio #2](https://github.com/andongmin94/mix-live/actions/runs/45568859781):
+  기존 두 케이블의 MSVC transport 검사, WDK 26100 x64 컴파일·링크,
+  InfVerif /w·/h, Inf2Cat unsigned catalog 생성 성공. 미서명 catalog 거절 및
+  두 PnP ID의 부재 확인까지 성공했지만, 예상된 SignTool 실패의 native 종료 코드가
+  PowerShell CI wrapper에 전달되어 job 실패 및 artifact 미게시로 기록됐다.
+  모든 assertion 통과 시에만 명시적으로 0을 반환하도록 수정했다.
+- 이번 Return 추가는 같은 driver service/miniport와 독립 adapter state를 재사용한다.
+  세 고정 INF/PnP ID·서명 대상 일치·부재 검사 및 세 케이블의 실제 transport 격리 검사를
+  확장했다. 새 Virtual Audio CI 검증은 대기 중이다.
+  드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는
+  검증하지 않았다.
 
 ## 남은 작업과 제한
 
 - 실제 MiniFuse/가상 케이블/복수 앱 process loopback/상용 VST3 및 장치+UI 전체 실행은
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
-- 탭 선택·자체 Return 장치·ASIO·실행 중
+- 탭 선택·ASIO·실행 중
   소스/체인 삽입/삭제·내장 음정 보정·CLI 전체 Scene snapshot 출력은 미구현이다.
-  Call/Broadcast driver의 WDK 빌드·카탈로그 생성·실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 수신은 미검증이다.
+  세 가상 장치의 새 INF/패키지는 CI 대기 중이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
   실행 중 프리셋/pre-delay 변경은 미구현이다. 리버브/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.

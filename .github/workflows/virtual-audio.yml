@@ -50,10 +50,15 @@ jobs:
           Write-Output 'Unsigned package cannot pass the signed-package preflight.'
           # PnP discovery is read-only. Print only the result count, not runner hardware IDs.
           $rows = @(./drivers/virtual-audio/manage-devices.ps1 -Action Status)
-          if ($rows.Count -ne 2 -or @($rows | Where-Object { $_.State -ne 'Absent' }).Count -ne 0) {
-            throw 'The clean runner should contain neither MixLive cable'
+          $expected = @('Root\MixLive_Call', 'Root\MixLive_Broadcast', 'Root\MixLive_Return')
+          if (($rows.HardwareId -join ';') -cne ($expected -join ';') -or
+              @($rows | Where-Object { $_.State -ne 'Absent' }).Count -ne 0) {
+            throw 'The clean runner should report exactly the three absent MixLive cable IDs'
           }
-          Write-Output 'Both MixLive device IDs are absent; no device state was modified.'
+          Write-Output 'All three MixLive device IDs are absent; no device state was modified.'
+          # SignTool deliberately failed above. All assertions succeeded, so do not
+          # propagate that expected native exit code through Actions' pwsh wrapper.
+          exit 0
       - name: Keep unsigned package for driver development only
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:

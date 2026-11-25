@@ -143,7 +143,7 @@ DEALINGS IN THE SOFTWARE.
 - Cableloom (MIT), Copyright (c) 2026 Cableloom contributors:
   https://github.com/n3dypop/cableloom/tree/130f811310082fd6966b17e76f0ac212e129dbf9
   `drivers/virtual-audio/`의 PortCls/WaveRT adapter·miniport·stream·WDK build 코드는
-  해당 revision에서 필요한 부분만 도입하고 고정 PCM32 포맷, MixLive의 두 PnP 장치,
+  해당 revision에서 필요한 부분만 도입하고 고정 PCM32 포맷, MixLive의 세 PnP 장치,
   독립 전송/클럭, RUN 경계의 이력 초기화에 맞게 수정했다. 별도 관리자, VST worker,
   제어 IOCTL, 동적 cable 번호·delay 기능은 가져오지 않았다. 원본 MIT 전문은
   `drivers/virtual-audio/LICENSE`에 보존하며 unsigned 개발 artifact에도 포함한다.

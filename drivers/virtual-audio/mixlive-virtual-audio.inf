@@ -13,6 +13,7 @@ PnpLockdown=1
 [Models.NTamd64.10.0...22000]
 %CallDevice%=Call,Root\MixLive_Call
 %BroadcastDevice%=Broadcast,Root\MixLive_Broadcast
+%ReturnDevice%=Return,Root\MixLive_Return
 [DestinationDirs]
 DriverCopy=13
 [SourceDisksNames]
@@ -92,6 +93,38 @@ HKR,,FriendlyName,,%BroadcastSend%
 HKR,,CLSID,,%Proxy%
 HKR,,FriendlyName,,%BroadcastReceive%
 
+[Return.NT]
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration,WDMAUDIO.Registration
+CopyFiles=DriverCopy
+[Return.NT.Services]
+AddService=MixLiveVirtualAudio,0x2,Service
+[Return.NT.Interfaces]
+AddInterface=%Audio%,RenderWave,ReturnRenderWave
+AddInterface=%Render%,RenderWave,ReturnRenderWave
+AddInterface=%Realtime%,RenderWave,ReturnRenderWave
+AddInterface=%Audio%,CaptureWave,ReturnCaptureWave
+AddInterface=%Capture%,CaptureWave,ReturnCaptureWave
+AddInterface=%Realtime%,CaptureWave,ReturnCaptureWave
+AddInterface=%Audio%,RenderTopology,ReturnRenderTopology
+AddInterface=%Topology%,RenderTopology,ReturnRenderTopology
+AddInterface=%Audio%,CaptureTopology,ReturnCaptureTopology
+AddInterface=%Topology%,CaptureTopology,ReturnCaptureTopology
+[ReturnRenderWave]
+AddReg=ReturnRenderReg
+[ReturnCaptureWave]
+AddReg=ReturnCaptureReg
+[ReturnRenderTopology]
+AddReg=ReturnRenderReg,DefaultFormat
+[ReturnCaptureTopology]
+AddReg=ReturnCaptureReg,DefaultFormat
+[ReturnRenderReg]
+HKR,,CLSID,,%Proxy%
+HKR,,FriendlyName,,%ReturnSend%
+[ReturnCaptureReg]
+HKR,,CLSID,,%Proxy%
+HKR,,FriendlyName,,%ReturnReceive%
+
 [DefaultFormat]
 ; 48 kHz stereo PCM32, valid bits 32, FL|FR.
 HKR,"EP\0","{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2",,%AnyNode%
@@ -103,10 +136,13 @@ DriverName="MixLive Virtual Audio"
 Disk="MixLive Virtual Audio Driver"
 CallDevice="MixLive Call Cable"
 BroadcastDevice="MixLive Broadcast Cable"
+ReturnDevice="MixLive Return Cable"
 CallSend="MixLive Call Send"
 CallReceive="MixLive Call"
 BroadcastSend="MixLive Broadcast Send"
 BroadcastReceive="MixLive Broadcast"
+ReturnSend="MixLive Return"
+ReturnReceive="MixLive Return Capture"
 Audio="{6994ad04-93ef-11d0-a3cc-00a0c9223196}"
 Render="{65e8773e-8f56-11d0-a3b9-00a0c9223196}"
 Capture="{65e8773d-8f56-11d0-a3b9-00a0c9223196}"

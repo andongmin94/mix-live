@@ -52,11 +52,12 @@ struct TestCable {
 };
 
 int main() {
-    TestCable call, broadcast;
+    TestCable call, broadcast, returned;
     for (uint32_t i = 0; i < 4000; ++i) {
         // Different source sequences and buffer positions must never bleed into each other.
         call.check(1 + i % 113, 0x13579bdfu);
         broadcast.check(1 + (i * 3) % 211, 0x2468ace0u);
+        returned.check(1 + (i * 7) % 233, 0xabcdef01u);
     }
 
     // Capture alone is silence; render alone is discarded. A RUN boundary resets history.
@@ -86,8 +87,26 @@ int main() {
         call.total = 0;
         call.check(127, 0xfedcba98u);
     }
-    // Reset/gap handling of Call must not disturb the Broadcast instance.
+    // Reset/gap handling of Call must not disturb Broadcast or Return.
     broadcast.check(193, 0x2468ace0u);
+    returned.check(229, 0xabcdef01u);
+
+    // DAW/Return keeps receiving while an unrelated output is stopped, then its
+    // own receiver disconnects. No pre-disconnect Return samples may be retained.
+    returned.cable.reset();
+    returned.output.fill(0xff);
+    cp = returned.capture.position;
+    REQUIRE(returned.cable.advance(137, absent, returned.capture));
+    for (uint32_t i = 0; i < 137; ++i)
+        REQUIRE(equal(returned.output.data() + ((cp + i) % returned.size) * frame_bytes, Frame{}));
+    rp = returned.render.position;
+    REQUIRE(returned.cable.advance(59, returned.render, absent));
+    REQUIRE(returned.render.position == rp + 59);
+    returned.cable.reset();
+    returned.total = 0;
+    returned.check(127, 0x13572468u);
+    call.check(127, 0xfedcba98u);
+    broadcast.check(127, 0x2468ace0u);
 
     FrameClock clock;
     constexpr uint64_t frequency = 10000019;
@@ -104,5 +123,5 @@ int main() {
     REQUIRE(clock.advance(99) == 0);
     clock.reset(0, 0);
     REQUIRE(clock.advance(123456) == 0);
-    std::puts("PASS: exact PCM32 stereo transfer, ring wrap, independent Call/Broadcast, RUN reset, absent producer/consumer, discontinuity and QPC frame accounting.");
+    std::puts("PASS: exact PCM32 stereo transfer, ring wrap, independent Call/Broadcast/Return, RUN reset, absent producer/consumer, discontinuity and QPC frame accounting.");
 }
