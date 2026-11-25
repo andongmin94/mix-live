@@ -34,6 +34,14 @@ pub struct SoundEditor {
     strength: Entity<InputState>,
     compressor: Entity<InputState>,
     deesser: Entity<InputState>,
+    eq_hpf_hz: Entity<InputState>,
+    eq_body_db: Entity<InputState>,
+    eq_presence_db: Entity<InputState>,
+    eq_air_db: Entity<InputState>,
+    compressor_ratio: Entity<InputState>,
+    compressor_attack_ms: Entity<InputState>,
+    compressor_release_ms: Entity<InputState>,
+    deess_max_db: Entity<InputState>,
     reverb_mix: Entity<InputState>,
     reverb_decay: Entity<InputState>,
     reverb_predelay: Entity<InputState>,
@@ -71,6 +79,14 @@ impl SoundEditor {
             cx,
         );
         let deesser = text_input("디에서 threshold", &draft.deess_threshold_db, window, cx);
+        let eq_hpf_hz = text_input("하이패스 주파수", &draft.eq_hpf_hz, window, cx);
+        let eq_body_db = text_input("저역 EQ 보정", &draft.eq_body_db, window, cx);
+        let eq_presence_db = text_input("존재감 EQ 보정", &draft.eq_presence_db, window, cx);
+        let eq_air_db = text_input("고역 EQ 보정", &draft.eq_air_db, window, cx);
+        let compressor_ratio = text_input("컴프레서 ratio", &draft.compressor_ratio, window, cx);
+        let compressor_attack_ms = text_input("컴프레서 attack", &draft.compressor_attack_ms, window, cx);
+        let compressor_release_ms = text_input("컴프레서 release", &draft.compressor_release_ms, window, cx);
+        let deess_max_db = text_input("디에서 최대 감쇠", &draft.deess_max_db, window, cx);
         let reverb_mix = text_input("리버브 비율", &draft.reverb_mix, window, cx);
         let reverb_decay = text_input("잔향 시간", &draft.reverb_decay_secs, window, cx);
         let reverb_predelay = text_input("리버브 pre-delay", &draft.reverb_predelay_ms, window, cx);
@@ -78,7 +94,7 @@ impl SoundEditor {
         let echo_time = text_input("에코 시간", &draft.echo_time_ms, window, cx);
         let echo_feedback = text_input("에코 피드백", &draft.echo_feedback, window, cx);
         let mut subscriptions = vec![cx.observe(&preset, |_, _, cx| cx.notify())];
-        for input in [&input_gain, &strength, &compressor, &deesser, &reverb_mix, &reverb_decay, &reverb_predelay, &echo_mix, &echo_time, &echo_feedback] {
+        for input in [&input_gain, &strength, &compressor, &deesser, &eq_hpf_hz, &eq_body_db, &eq_presence_db, &eq_air_db, &compressor_ratio, &compressor_attack_ms, &compressor_release_ms, &deess_max_db, &reverb_mix, &reverb_decay, &reverb_predelay, &echo_mix, &echo_time, &echo_feedback] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
         }
         Self {
@@ -88,6 +104,14 @@ impl SoundEditor {
             strength,
             compressor,
             deesser,
+            eq_hpf_hz,
+            eq_body_db,
+            eq_presence_db,
+            eq_air_db,
+            compressor_ratio,
+            compressor_attack_ms,
+            compressor_release_ms,
+            deess_max_db,
             reverb_mix,
             reverb_decay,
             reverb_predelay,
@@ -110,6 +134,14 @@ impl SoundEditor {
             strength: self.strength.read(cx).value().to_string(),
             compressor_threshold_db: self.compressor.read(cx).value().to_string(),
             deess_threshold_db: self.deesser.read(cx).value().to_string(),
+            eq_hpf_hz: self.eq_hpf_hz.read(cx).value().to_string(),
+            eq_body_db: self.eq_body_db.read(cx).value().to_string(),
+            eq_presence_db: self.eq_presence_db.read(cx).value().to_string(),
+            eq_air_db: self.eq_air_db.read(cx).value().to_string(),
+            compressor_ratio: self.compressor_ratio.read(cx).value().to_string(),
+            compressor_attack_ms: self.compressor_attack_ms.read(cx).value().to_string(),
+            compressor_release_ms: self.compressor_release_ms.read(cx).value().to_string(),
+            deess_max_db: self.deess_max_db.read(cx).value().to_string(),
             reverb_mix: self.reverb_mix.read(cx).value().to_string(),
             reverb_decay_secs: self.reverb_decay.read(cx).value().to_string(),
             reverb_predelay_ms: self.reverb_predelay.read(cx).value().to_string(),
@@ -141,6 +173,14 @@ impl SoundEditor {
             &self.strength,
             &self.compressor,
             &self.deesser,
+            &self.eq_hpf_hz,
+            &self.eq_body_db,
+            &self.eq_presence_db,
+            &self.eq_air_db,
+            &self.compressor_ratio,
+            &self.compressor_attack_ms,
+            &self.compressor_release_ms,
+            &self.deess_max_db,
             &self.reverb_mix,
             &self.reverb_decay,
             &self.reverb_predelay,
@@ -259,13 +299,14 @@ impl SoundEditor {
 
     fn chain(&self, window: &Window, cx: &Context<Self>) -> Div {
         let disabled = self.is_busy();
+        let scan_label = if self.installed.is_some() { "설치된 VST3 다시 검색" } else { "설치된 VST3 검색" };
         let mut chain = panel().gap_4()
             .child(div().flex().items_center().justify_between().gap_3()
                 .child(section_title("VST3", "보컬 플러그인 순서"))
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child(format!("{}개", self.draft.effects.len()))))
             .child(div().flex().flex_wrap().gap_2()
-                .child(button("scan-vst3", "설치된 VST3 검색", false).disabled(disabled)
+                .child(button("scan-vst3", scan_label, false).disabled(disabled)
                     .on_click(cx.listener(|this, _, window, cx| this.scan_installed(window, cx))))
                 .child(button("add-vst3-files", "VST3 파일 추가", false).disabled(disabled)
                     .on_click(cx.listener(|this, _, window, cx| this.pick(Pick::Plugins, window, cx))))
@@ -419,11 +460,30 @@ impl Render for SoundEditor {
                     "sound-preset", "내장 보컬 보정", &self.preset, None, window, cx)))
                 .child(div().flex().flex_wrap().gap_5()
                     .child(field("sound-trim", "입력 trim", "−36~18 dB", &self.input_gain, window, cx))
-                    .child(field("sound-strength", "보정 비율", "0~1 · EQ/다이내믹스 blend", &self.strength, window, cx))
-                    .child(field("sound-compressor", "컴프레서 threshold", "−60~0 dBFS", &self.compressor, window, cx))
-                    .child(field("sound-deesser", "디에서 threshold", "−60~0 dBFS", &self.deesser, window, cx)))
+                    .child(field("sound-strength", "보정 비율", "0~1 · EQ/다이내믹스 blend", &self.strength, window, cx)))
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child("저장한 값은 다음 오디오 시작부터 적용됩니다. 보정 비율은 음량 일치 기능이 아니며, 자동 makeup gain은 없습니다.")))
+            .child(panel().gap_4()
+                .child(section_title("EQ", "보컬 EQ 세부 설정"))
+                .child(div().flex().flex_wrap().gap_5()
+                    .child(field("eq-hpf-hz", "하이패스 주파수", "40~200 Hz · 정지 상태", &self.eq_hpf_hz, window, cx))
+                    .child(field("eq-body-db", "저역 EQ 보정", "180 Hz shelf · −6~6 dB", &self.eq_body_db, window, cx))
+                    .child(field("eq-presence-db", "존재감 EQ 보정", "2.8 kHz peak · −6~6 dB", &self.eq_presence_db, window, cx))
+                    .child(field("eq-air-db", "고역 EQ 보정", "7.5 kHz shelf · −6~6 dB", &self.eq_air_db, window, cx)))
+                .child(div().text_xs().text_color(rgb(MUTED))
+                    .child("선택한 프리셋의 EQ에 저역·존재감·고역 gain을 더합니다. 하이패스는 절대 주파수이며 EQ 계수는 정지 상태에서 변경합니다. Off 프리셋에서는 적용하지 않습니다.")))
+            .child(panel().gap_4()
+                .child(section_title("DYN", "컴프레서 · 디에서"))
+                .child(div().flex().flex_wrap().gap_5()
+                    .child(field("sound-compressor", "컴프레서 threshold", "−60~0 dBFS", &self.compressor, window, cx))
+                    .child(field("compressor-ratio", "컴프레서 ratio", "1~8 : 1", &self.compressor_ratio, window, cx))
+                    .child(field("compressor-attack-ms", "컴프레서 attack", "1~50 ms", &self.compressor_attack_ms, window, cx))
+                    .child(field("compressor-release-ms", "컴프레서 release", "20~500 ms", &self.compressor_release_ms, window, cx)))
+                .child(div().flex().flex_wrap().gap_5()
+                    .child(field("sound-deesser", "디에서 threshold", "−60~0 dBFS", &self.deesser, window, cx))
+                    .child(field("deess-max-db", "디에서 최대 감쇠", "0~12 dB · 0은 감쇠 없음", &self.deess_max_db, window, cx)))
+                .child(div().text_xs().text_color(rgb(MUTED))
+                    .child("모든 다이내믹스 값은 재생 중에도 조절할 수 있습니다. 프리셋과 독립적인 명시적 값이며 자동 makeup gain은 없습니다.")))
             .child(panel().gap_4()
                 .child(section_title("ROOM", "스테레오 리버브"))
                 .child(div().flex().flex_wrap().gap_5()

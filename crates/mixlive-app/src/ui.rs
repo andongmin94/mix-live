@@ -68,6 +68,8 @@ impl FaderTarget {
         match self {
             Self::Vocal(VocalParameter::Strength | VocalParameter::ReverbMix | VocalParameter::EchoMix | VocalParameter::EchoFeedback) => format!("{:.1}%", value * 100.0),
             Self::Vocal(VocalParameter::ReverbDecay) => format!("{value:.2} s"),
+            Self::Vocal(VocalParameter::CompressorRatio) => format!("{value:.1}:1"),
+            Self::Vocal(VocalParameter::CompressorAttack | VocalParameter::CompressorRelease) => format!("{value:.1} ms"),
             Self::Vocal(VocalParameter::Compressor | VocalParameter::Deesser) => format!("{value:.1} dBFS"),
             _ => format!("{value:.1} dB"),
         }
@@ -792,6 +794,8 @@ impl MixLive {
                         vocal.strength * 100.0,
                         scene.effects.len()
                     )))
+                    .children((vocal.preset != mixlive_effects::Preset::Off).then(|| div().text_xs().text_color(rgb(MUTED)).child(format!(
+                        "HPF {:.0} Hz · EQ {:+.1}/{:+.1}/{:+.1} dB", vocal.eq.hpf_hz, vocal.eq.body_db, vocal.eq.presence_db, vocal.eq.air_db))))
                     .child(div().text_xs().text_color(rgb(MUTED)).child(if vocal.reverb.mix == 0.0 {
                         "스테레오 리버브 · 꺼짐".to_owned()
                     } else {
@@ -1005,6 +1009,10 @@ impl MixLive {
                 VocalParameter::ReverbDecay => "잔향 시간",
                 VocalParameter::EchoMix => "에코 비율",
                 VocalParameter::EchoFeedback => "에코 피드백",
+                VocalParameter::CompressorRatio => "컴프레서 ratio",
+                VocalParameter::CompressorAttack => "컴프레서 attack",
+                VocalParameter::CompressorRelease => "컴프레서 release",
+                VocalParameter::DeesserMaximum => "디에서 최대 감쇠",
             };
             fields = fields.child(div().min_w(px(250.)).flex_1().flex().flex_col().gap_1()
                 .child(div().text_sm().font_semibold().child(label))
@@ -1012,7 +1020,7 @@ impl MixLive {
                     FaderTarget::Vocal(parameter), controls.vocal_value(parameter), cx)));
         }
         let hint = if config.preset == mixlive_effects::Preset::Off {
-            "EQ/다이내믹스 프리셋이 꺼져 있습니다. 정지 후 프리셋을 선택하면 보정 비율과 threshold를 조절할 수 있습니다."
+            "EQ/다이내믹스 프리셋이 꺼져 있습니다. 정지 후 프리셋을 선택하면 EQ/다이내믹스를 조절할 수 있습니다."
         } else {
             "보정 비율을 0으로 내리면 EQ/다이내믹스를 우회합니다. 리버브와 에코는 별도로 조절합니다."
         };
@@ -1024,7 +1032,7 @@ impl MixLive {
             .child(fields)
             .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
             .child(div().text_xs().text_color(rgb(MUTED))
-                .child("프리셋과 pre-delay, 에코 시간은 정지 상태에서 변경합니다. 조절값은 약 10 ms 전환 후 반영되며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
+                .child("프리셋과 EQ, pre-delay, 에코 시간은 정지 상태에서 변경합니다. 조절값은 약 10 ms 전환 후 반영되며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
     }
 
     fn mixer(&self, cx: &Context<Self>) -> gpui::AnyElement {

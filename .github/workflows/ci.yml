@@ -110,7 +110,11 @@ jobs:
           MIXLIVE_UI_BLEND: '보컬 보정 비율'
           MIXLIVE_UI_MOVE_SECOND: 'VST3 2 위로'
           MIXLIVE_UI_SCAN_VST3: '설치된 VST3 검색'
-          MIXLIVE_UI_SCAN_RESULT: 'VST3 검색 결과'
+          MIXLIVE_UI_SCAN_COMPLETE: '설치된 VST3 다시 검색'
+          MIXLIVE_UI_EQ_HPF: '하이패스 주파수'
+          MIXLIVE_UI_EQ_BODY: '저역 EQ 보정'
+          MIXLIVE_UI_RATIO: '컴프레서 ratio'
+          MIXLIVE_UI_DEESS_MAX: '디에서 최대 감쇠'
           MIXLIVE_UI_THIRD_SLOT: 'VST3 3 위로'
           MIXLIVE_UI_BYPASS_SECOND_ON: 'VST3 2 우회 켜기'
           MIXLIVE_UI_BYPASS_SECOND_OFF: 'VST3 2 우회 끄기'
@@ -243,7 +247,7 @@ jobs:
           $savedPath = Join-Path $sceneDirectory 'Edited scene.mixlive-scene.json'
           $pluginPath = Join-Path $sceneDirectory 'not-installed.vst3'
           $scene = [ordered]@{
-            schema = 10
+            schema = 11
             route = [ordered]@{
               input = 'ci-absent-mic'; input_channel = 2
               aux_input = 'ci-absent-aux'; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
@@ -256,6 +260,8 @@ jobs:
               broadcast = 'ci-absent-broadcast'; broadcast_channels = @(2, 1)
               input_gain_db = 1.25; output_gain_db = -23; monitor_gain_db = -4; send_gain_db = -6; broadcast_gain_db = -11
               vocal = 'warm'; vocal_strength = 0.75; vocal_threshold_db = -20; deess_threshold_db = -28
+              eq_hpf_hz = 75; eq_body_db = 0; eq_presence_db = 0; eq_air_db = 0
+              compressor_ratio = 2.5; compressor_attack_ms = 8; compressor_release_ms = 140; deess_max_db = 4
               reverb_mix = 0.125; reverb_decay_secs = 1.75; reverb_predelay_ms = 12.5
               echo_mix = 0.125; echo_time_ms = 300; echo_feedback = 0.25
               queue_ms = 20
@@ -354,7 +360,7 @@ jobs:
             if ((Wait-UiName $env:MIXLIVE_UI_START).Current.IsEnabled) { throw 'Audio start must be disabled while editing' }
             if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '1.25') { throw 'Saved mic trim was not loaded into the editor' }
             Invoke-UiName $env:MIXLIVE_UI_SCAN_VST3
-            $null = Wait-UiName $env:MIXLIVE_UI_SCAN_RESULT
+            $null = Wait-UiName $env:MIXLIVE_UI_SCAN_COMPLETE -Enabled
             $null = Wait-UiName $env:MIXLIVE_UI_SAVE -Enabled
             if (Find-UiName $env:MIXLIVE_UI_THIRD_SLOT) { throw 'Scanning unexpectedly appended a plugin slot' }
             Set-UiValue $env:MIXLIVE_UI_TRIM '3.5'
@@ -362,6 +368,9 @@ jobs:
             Set-UiValue $env:MIXLIVE_UI_REVERB '0.25'
             if ((Read-UiValue $env:MIXLIVE_UI_ECHO) -cne '0.125') { throw 'Saved echo was not loaded' }
             Set-UiValue $env:MIXLIVE_UI_ECHO '0.5'
+            if ((Read-UiValue $env:MIXLIVE_UI_EQ_HPF) -cne '75') { throw 'Saved HPF was not loaded' }
+            Set-UiValue $env:MIXLIVE_UI_EQ_HPF '110'
+            Set-UiValue $env:MIXLIVE_UI_RATIO '6'
             Invoke-UiName $env:MIXLIVE_UI_BYPASS_SECOND_ON
             $null = Wait-UiName $env:MIXLIVE_UI_BYPASS_SECOND_OFF -Enabled
             Invoke-UiName $env:MIXLIVE_UI_MOVE_SECOND
@@ -376,6 +385,11 @@ jobs:
             if ((Read-UiValue $env:MIXLIVE_UI_TRIM) -cne '1.25') { throw 'Cancelled edits changed the selected Scene' }
             Set-UiValue $env:MIXLIVE_UI_TRIM '3.5'
             Set-UiValue $env:MIXLIVE_UI_BLEND '0.5'
+            if ((Read-UiValue $env:MIXLIVE_UI_EQ_HPF) -cne '75' -or (Read-UiValue $env:MIXLIVE_UI_RATIO) -cne '2.5') { throw 'Cancelled EQ/dynamics edit changed the selected Scene' }
+            Set-UiValue $env:MIXLIVE_UI_EQ_HPF '95'
+            Set-UiValue $env:MIXLIVE_UI_EQ_BODY '1.5'
+            Set-UiValue $env:MIXLIVE_UI_RATIO '3.5'
+            Set-UiValue $env:MIXLIVE_UI_DEESS_MAX '7'
             if ((Read-UiValue $env:MIXLIVE_UI_REVERB) -cne '0.125') { throw 'Cancelled reverb edit changed the selected Scene' }
             Set-UiValue $env:MIXLIVE_UI_REVERB '0.375'
             Set-UiValue $env:MIXLIVE_UI_REVERB_DECAY '2.5'
@@ -438,13 +452,15 @@ jobs:
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
             if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
             $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json
-            if ($saved.schema -ne 10 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5 -or
+            if ($saved.schema -ne 11 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5 -or
                 $saved.route.reverb_mix -ne 0.375 -or $saved.route.reverb_decay_secs -ne 2.5 -or $saved.route.reverb_predelay_ms -ne 25 -or
-                $saved.route.echo_mix -ne 0.375 -or $saved.route.echo_time_ms -ne 420 -or $saved.route.echo_feedback -ne 0.625) {
+                $saved.route.echo_mix -ne 0.375 -or $saved.route.echo_time_ms -ne 420 -or $saved.route.echo_feedback -ne 0.625 -or
+                $saved.route.eq_hpf_hz -ne 95 -or $saved.route.eq_body_db -ne 1.5 -or
+                $saved.route.compressor_ratio -ne 3.5 -or $saved.route.deess_max_db -ne 7) {
               throw 'The saved Scene did not contain the edited vocal values'
             }
             foreach ($field in $scene.route.Keys) {
-              if ($field -in @('input_gain_db', 'vocal_strength', 'reverb_mix', 'reverb_decay_secs', 'reverb_predelay_ms', 'echo_mix', 'echo_time_ms', 'echo_feedback')) { continue }
+              if ($field -in @('input_gain_db', 'vocal_strength', 'reverb_mix', 'reverb_decay_secs', 'reverb_predelay_ms', 'echo_mix', 'echo_time_ms', 'echo_feedback', 'eq_hpf_hz', 'eq_body_db', 'compressor_ratio', 'deess_max_db')) { continue }
               $expected = $scene.route[$field]
               $actual = $saved.route.$field
               if ($field -eq 'apps') {
@@ -486,7 +502,9 @@ jobs:
                 (Read-UiValue $env:MIXLIVE_UI_REVERB) -cne '0.375' -or (Read-UiValue $env:MIXLIVE_UI_REVERB_DECAY) -cne '2.5' -or
                 (Read-UiValue $env:MIXLIVE_UI_REVERB_PREDELAY) -cne '25' -or
                 (Read-UiValue $env:MIXLIVE_UI_ECHO) -cne '0.375' -or (Read-UiValue $env:MIXLIVE_UI_ECHO_TIME) -cne '420' -or
-                (Read-UiValue $env:MIXLIVE_UI_ECHO_FEEDBACK) -cne '0.625') {
+                (Read-UiValue $env:MIXLIVE_UI_ECHO_FEEDBACK) -cne '0.625' -or
+                (Read-UiValue $env:MIXLIVE_UI_EQ_HPF) -cne '95' -or (Read-UiValue $env:MIXLIVE_UI_EQ_BODY) -cne '1.5' -or
+                (Read-UiValue $env:MIXLIVE_UI_RATIO) -cne '3.5' -or (Read-UiValue $env:MIXLIVE_UI_DEESS_MAX) -cne '7') {
               throw 'Saving did not select the newly saved Scene'
             }
             Invoke-UiName $env:MIXLIVE_UI_CANCEL

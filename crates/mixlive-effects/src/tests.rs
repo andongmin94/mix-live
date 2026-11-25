@@ -63,7 +63,7 @@ fn compressor_has_a_continuous_knee_correct_ratio_and_release() {
     for edge in [-27.0, -21.0] {
         assert!((reduction(edge - 1e-7, -24.0, 3.0, 6.0) - reduction(edge + 1e-7, -24.0, 3.0, 6.0)).abs() < 1e-6);
     }
-    let mut compressor = Compressor::new(48000.0, -24.0, 3.0);
+    let mut compressor = Compressor::new(48000.0, -24.0, DynamicsConfig { ratio: 3.0, ..DynamicsConfig::default() });
     let x = gain(-12.0);
     let mut y = x;
     for _ in 0..48000 { y = compressor.run(x); }
@@ -375,4 +375,83 @@ fn stereo_echo_keeps_channels_separate_and_live_ramps_keep_history_current() {
     assert!(chain.process(&[f32::NAN], &mut [0.0], &mut [0.0]).is_err());
     chain.process(&[0.0; 80], &mut left, &mut right).unwrap();
     assert_eq!(left, [0.0; 80]);
+}
+
+#[test]
+fn explicit_eq_changes_the_expected_bands_and_validates_while_off() {
+    let base = VocalConfig { preset: Preset::Natural,
+        dynamics: DynamicsConfig { ratio: 1.0, deess_max_db: 0.0, ..DynamicsConfig::default() },
+        ..VocalConfig::default() };
+    let level = |eq: EqConfig, hz: f64| {
+        let config = VocalConfig { eq, ..base };
+        let input = tone(hz, 0.02, 48000, 24000);
+        let mut left = vec![0.0; input.len()];
+        let mut right = left.clone();
+        VocalChain::new(48000, config).unwrap().process(&input, &mut left, &mut right).unwrap();
+        assert_eq!(left, right);
+        rms(&left[12000..])
+    };
+    let eq = EqConfig::default();
+    assert!(level(EqConfig { hpf_hz: 160.0, ..eq }, 60.0) < 0.25 * level(EqConfig { hpf_hz: 40.0, ..eq }, 60.0));
+    for (hz, changed) in [(100.0, EqConfig { body_db: 6.0, ..eq }),
+        (2800.0, EqConfig { presence_db: 6.0, ..eq }),
+        (12000.0, EqConfig { air_db: 6.0, ..eq })] {
+        assert!(level(changed, hz) > 1.5 * level(eq, hz), "{hz} Hz");
+    }
+    for eq in [EqConfig { hpf_hz: 39.0, ..eq }, EqConfig { body_db: f32::NAN, ..eq },
+        EqConfig { presence_db: -6.1, ..eq }, EqConfig { air_db: 6.1, ..eq }] {
+        assert!(VocalConfig { eq, ..VocalConfig::default() }.validate().is_err());
+    }
+}
+
+#[test]
+fn compressor_timing_and_deesser_limit_respond_to_explicit_settings() {
+    let settings = DynamicsConfig { ratio: 4.0, attack_ms: 1.0, release_ms: 20.0, deess_max_db: 0.0 };
+    let mut fast = Compressor::new(48000.0, -36.0, settings);
+    let mut slow = Compressor::new(48000.0, -36.0, DynamicsConfig { attack_ms: 50.0, release_ms: 500.0, ..settings });
+    let mut unity = Compressor::new(48000.0, -36.0, DynamicsConfig { ratio: 1.0, ..settings });
+    for _ in 0..960 { fast.run(0.5); slow.run(0.5); assert_eq!(unity.run(0.5), 0.5); }
+    assert!(fast.reduction > slow.reduction + 5.0);
+    for _ in 0..48000 { fast.run(0.5); slow.run(0.5); }
+    assert!((fast.reduction - slow.reduction).abs() < 0.01);
+    for _ in 0..4800 { fast.run(0.0); slow.run(0.0); }
+    assert!(slow.reduction > fast.reduction + 5.0);
+    let mut deesser = DeEsser::new(48000.0, -45.0, 12.0).unwrap();
+    for sample in tone(10000.0, 0.5, 48000, 24000) { deesser.run(f64::from(sample)); }
+    assert!(deesser.reduction > 4.0);
+    deesser.maximum = 0.0;
+    assert_eq!(deesser.run(0.25), 0.25);
+    assert_eq!(deesser.reduction, 0.0);
+}
+
+#[test]
+fn live_dynamics_ramps_are_block_invariant_and_finish_on_requested_values() {
+    let config = VocalConfig { preset: Preset::Warm, ..VocalConfig::default() };
+    let edits = [(VocalParameter::CompressorRatio, 5.0), (VocalParameter::CompressorAttack, 2.0),
+        (VocalParameter::CompressorRelease, 250.0), (VocalParameter::DeesserMaximum, 8.0)];
+    let input = tone(10000.0, 0.4, 48000, 2400);
+    let render = |block: usize| {
+        let mut chain = VocalChain::new(48000, config).unwrap();
+        for (parameter, value) in edits { chain.set_parameter(parameter, value).unwrap(); }
+        let mut left = vec![0.0; input.len()];
+        let mut right = left.clone();
+        for ((part, l), r) in input.chunks(block).zip(left.chunks_mut(block)).zip(right.chunks_mut(block)) {
+            chain.process(part, l, r).unwrap();
+        }
+        assert_eq!(left, right);
+        let p = chain.processing.as_ref().unwrap();
+        assert_eq!(p.compressor.ratio, 5.0);
+        assert_eq!(p.compressor.attack, coefficient(2.0, 48000.0));
+        assert_eq!(p.compressor.release, coefficient(250.0, 48000.0));
+        assert_eq!(p.deesser.maximum, 8.0);
+        assert!(p.deesser.reduction <= 8.0);
+        left
+    };
+    assert_eq!(render(2400), render(137));
+    for (parameter, invalid) in [(VocalParameter::CompressorRatio, 0.9), (VocalParameter::CompressorAttack, 0.0),
+        (VocalParameter::CompressorRelease, 501.0), (VocalParameter::DeesserMaximum, 12.1)] {
+        let mut config = config;
+        assert!(config.set_parameter(parameter, invalid).is_err());
+        assert!(config.set_parameter(parameter, f32::NAN).is_err());
+    }
 }

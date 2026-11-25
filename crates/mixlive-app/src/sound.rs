@@ -7,7 +7,7 @@ use mixlive_audio_windows::{
     plugin::{EffectSpec, PluginArgs},
     scene::AudioScene,
 };
-use mixlive_effects::{EchoConfig, Preset, ReverbConfig, VocalConfig};
+use mixlive_effects::{DynamicsConfig, EchoConfig, EqConfig, Preset, ReverbConfig, VocalConfig};
 
 #[derive(Clone, Debug)]
 pub struct SoundDraft {
@@ -16,6 +16,14 @@ pub struct SoundDraft {
     pub strength: String,
     pub compressor_threshold_db: String,
     pub deess_threshold_db: String,
+    pub eq_hpf_hz: String,
+    pub eq_body_db: String,
+    pub eq_presence_db: String,
+    pub eq_air_db: String,
+    pub compressor_ratio: String,
+    pub compressor_attack_ms: String,
+    pub compressor_release_ms: String,
+    pub deess_max_db: String,
     pub reverb_mix: String,
     pub reverb_decay_secs: String,
     pub reverb_predelay_ms: String,
@@ -43,6 +51,14 @@ impl SoundDraft {
             strength: config.strength.to_string(),
             compressor_threshold_db: config.compressor_threshold_db.to_string(),
             deess_threshold_db: config.deess_threshold_db.to_string(),
+            eq_hpf_hz: config.eq.hpf_hz.to_string(),
+            eq_body_db: config.eq.body_db.to_string(),
+            eq_presence_db: config.eq.presence_db.to_string(),
+            eq_air_db: config.eq.air_db.to_string(),
+            compressor_ratio: config.dynamics.ratio.to_string(),
+            compressor_attack_ms: config.dynamics.attack_ms.to_string(),
+            compressor_release_ms: config.dynamics.release_ms.to_string(),
+            deess_max_db: config.dynamics.deess_max_db.to_string(),
             reverb_mix: config.reverb.mix.to_string(),
             reverb_decay_secs: config.reverb.decay_secs.to_string(),
             reverb_predelay_ms: config.reverb.predelay_ms.to_string(),
@@ -64,6 +80,18 @@ impl SoundDraft {
             strength: number(&self.strength, "보정 비율")?,
             compressor_threshold_db: number(&self.compressor_threshold_db, "컴프레서 threshold")?,
             deess_threshold_db: number(&self.deess_threshold_db, "디에서 threshold")?,
+            eq: EqConfig {
+                hpf_hz: number(&self.eq_hpf_hz, "하이패스 주파수")?,
+                body_db: number(&self.eq_body_db, "저역 EQ 보정")?,
+                presence_db: number(&self.eq_presence_db, "존재감 EQ 보정")?,
+                air_db: number(&self.eq_air_db, "고역 EQ 보정")?,
+            },
+            dynamics: DynamicsConfig {
+                ratio: number(&self.compressor_ratio, "컴프레서 ratio")?,
+                attack_ms: number(&self.compressor_attack_ms, "컴프레서 attack")?,
+                release_ms: number(&self.compressor_release_ms, "컴프레서 release")?,
+                deess_max_db: number(&self.deess_max_db, "디에서 최대 감쇠")?,
+            },
             reverb: ReverbConfig {
                 mix: number(&self.reverb_mix, "리버브 비율")?,
                 decay_secs: number(&self.reverb_decay_secs, "잔향 시간")?,
@@ -224,6 +252,14 @@ mod tests {
         draft.strength = "0.375".into();
         draft.compressor_threshold_db = "-18.5".into();
         draft.deess_threshold_db = "-32.5".into();
+        draft.eq_hpf_hz = "95".into();
+        draft.eq_body_db = "1.5".into();
+        draft.eq_presence_db = "-2".into();
+        draft.eq_air_db = "2.5".into();
+        draft.compressor_ratio = "3.5".into();
+        draft.compressor_attack_ms = "5".into();
+        draft.compressor_release_ms = "220".into();
+        draft.deess_max_db = "7".into();
         draft.reverb_mix = "0.375".into();
         draft.reverb_decay_secs = "2.5".into();
         draft.reverb_predelay_ms = "7.5".into();
@@ -237,6 +273,14 @@ mod tests {
         expected.vocal_strength = 0.375;
         expected.vocal_threshold_db = -18.5;
         expected.deess_threshold_db = -32.5;
+        expected.eq_hpf_hz = 95.0;
+        expected.eq_body_db = 1.5;
+        expected.eq_presence_db = -2.0;
+        expected.eq_air_db = 2.5;
+        expected.compressor_ratio = 3.5;
+        expected.compressor_attack_ms = 5.0;
+        expected.compressor_release_ms = 220.0;
+        expected.deess_max_db = 7.0;
         expected.reverb_mix = 0.375;
         expected.reverb_decay_secs = 2.5;
         expected.reverb_predelay_ms = 7.5;
@@ -347,6 +391,30 @@ mod tests {
         draft.deess_threshold_db = "1".into();
         assert!(draft.vocal_config().is_err());
         draft.deess_threshold_db = "-30".into();
+        draft.eq_hpf_hz = "201".into();
+        assert!(draft.vocal_config().is_err());
+        draft.eq_hpf_hz = "75".into();
+        draft.eq_body_db = "6.1".into();
+        assert!(draft.vocal_config().is_err());
+        draft.eq_body_db = "0".into();
+        draft.eq_presence_db = "-6.1".into();
+        assert!(draft.vocal_config().is_err());
+        draft.eq_presence_db = "0".into();
+        draft.eq_air_db = "6.1".into();
+        assert!(draft.vocal_config().is_err());
+        draft.eq_air_db = "0".into();
+        draft.compressor_ratio = "0.9".into();
+        assert!(draft.vocal_config().is_err());
+        draft.compressor_ratio = "2.5".into();
+        draft.compressor_attack_ms = "0".into();
+        assert!(draft.vocal_config().is_err());
+        draft.compressor_attack_ms = "8".into();
+        draft.compressor_release_ms = "501".into();
+        assert!(draft.vocal_config().is_err());
+        draft.compressor_release_ms = "140".into();
+        draft.deess_max_db = "12.1".into();
+        assert!(draft.vocal_config().is_err());
+        draft.deess_max_db = "4".into();
         draft.reverb_mix = "1.01".into();
         assert!(draft.vocal_config().is_err());
         draft.reverb_mix = "0.25".into();

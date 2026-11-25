@@ -1,6 +1,6 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::control::MixSettings;
-use mixlive_effects::{EchoConfig, Preset, ReverbConfig, VocalConfig};
+use mixlive_effects::{DynamicsConfig, EchoConfig, EqConfig, Preset, ReverbConfig, VocalConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -220,6 +220,30 @@ pub struct RouteOptions {
     /// High-band de-esser threshold (-60..0 dBFS).
     #[arg(long, default_value = "-30", allow_hyphen_values = true)]
     pub deess_threshold_db: f32,
+    /// High-pass cutoff (40..200 Hz), fixed during playback.
+    #[arg(long, default_value = "75")]
+    pub eq_hpf_hz: f32,
+    /// Additional low-shelf gain at 180 Hz (-6..6 dB).
+    #[arg(long, default_value = "0", allow_hyphen_values = true)]
+    pub eq_body_db: f32,
+    /// Additional presence gain at 2800 Hz (-6..6 dB).
+    #[arg(long, default_value = "0", allow_hyphen_values = true)]
+    pub eq_presence_db: f32,
+    /// Additional high-shelf gain at 7500 Hz (-6..6 dB).
+    #[arg(long, default_value = "0", allow_hyphen_values = true)]
+    pub eq_air_db: f32,
+    /// Compressor ratio (1..8); unity ratio gives no new gain reduction.
+    #[arg(long, default_value = "2.5")]
+    pub compressor_ratio: f32,
+    /// Compressor attack time (1..50 ms).
+    #[arg(long, default_value = "8")]
+    pub compressor_attack_ms: f32,
+    /// Compressor release time (20..500 ms).
+    #[arg(long, default_value = "140")]
+    pub compressor_release_ms: f32,
+    /// Maximum de-esser attenuation (0..12 dB).
+    #[arg(long, default_value = "4")]
+    pub deess_max_db: f32,
     /// Independent stereo room blend (0..1); zero bypasses the room entirely.
     #[arg(long, default_value = "0")]
     pub reverb_mix: f32,
@@ -260,6 +284,8 @@ impl RouteOptions {
     pub fn vocal_config(&self) -> VocalConfig {
         VocalConfig { preset: self.vocal, input_gain_db: self.input_gain_db, strength: self.vocal_strength,
             compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db,
+            eq: EqConfig { hpf_hz: self.eq_hpf_hz, body_db: self.eq_body_db, presence_db: self.eq_presence_db, air_db: self.eq_air_db },
+            dynamics: DynamicsConfig { ratio: self.compressor_ratio, attack_ms: self.compressor_attack_ms, release_ms: self.compressor_release_ms, deess_max_db: self.deess_max_db },
             reverb: ReverbConfig { mix: self.reverb_mix, decay_secs: self.reverb_decay_secs, predelay_ms: self.reverb_predelay_ms },
             echo: EchoConfig { mix: self.echo_mix, time_ms: self.echo_time_ms, feedback: self.echo_feedback } }
     }
@@ -270,6 +296,14 @@ impl RouteOptions {
         self.vocal_strength = config.strength;
         self.vocal_threshold_db = config.compressor_threshold_db;
         self.deess_threshold_db = config.deess_threshold_db;
+        self.eq_hpf_hz = config.eq.hpf_hz;
+        self.eq_body_db = config.eq.body_db;
+        self.eq_presence_db = config.eq.presence_db;
+        self.eq_air_db = config.eq.air_db;
+        self.compressor_ratio = config.dynamics.ratio;
+        self.compressor_attack_ms = config.dynamics.attack_ms;
+        self.compressor_release_ms = config.dynamics.release_ms;
+        self.deess_max_db = config.dynamics.deess_max_db;
         self.reverb_mix = config.reverb.mix;
         self.reverb_decay_secs = config.reverb.decay_secs;
         self.reverb_predelay_ms = config.reverb.predelay_ms;

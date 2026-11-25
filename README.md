@@ -50,8 +50,8 @@ AUX를 통화 또는 방송으로 보내려면 해당 출력 장치도 선택해
 
 내장 보정 `off/natural/warm/bright`를 고를 수 있으며, 새 Scene의 초기값은 출력 −18 dB,
 AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. 전체/모니터/통화/방송/AUX 시작 음량과
-queue 목표, 입력 trim, 보정 비율, 컴프레서/디에서 threshold, 리버브 비율/잔향/pre-delay, 에코 비율/시간/피드백과 VST3 순서를 저장 전에 바꿀 수 있다.
-저장은 기존 schema 10의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
+queue 목표, 입력 trim, 보정 비율, EQ 및 컴프레서/디에서 세부값, 리버브 비율/잔향/pre-delay, 에코 비율/시간/피드백과 VST3 순서를 저장 전에 바꿀 수 있다.
+저장은 기존 schema 11의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
 이전 Scene 선택을 유지한다. 장치와 현재 설정은 실제 시작 때 다시 검사한다.
 
 기존 체인은 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작**으로 실행한다.
@@ -96,7 +96,7 @@ VST3는 **설치된 VST3 검색**에서 표준 설치 경로의 후보를 골라
 - 각 소스를 어느 출력에 보낼지 선택하는 스위치와 경로별 음량.
 - AUX/MR·앱별 공통 입력 trim(-96..0 dB). 입력 peak는 trim 전이며, 소스 trim은
   약 5 ms sample ramp로 적용하고 모든 연결된 목적지에 동일하게 반영한다. 장치·VST3는 다시 열지 않는다.
-- 라이브 보컬 trim·보정 비율·컴프레서/디에서 threshold·리버브 비율·잔향 시간·에코 비율·피드백 슬라이더.
+- 라이브 보컬 trim·보정 비율·컴프레서/디에서 threshold·ratio·attack/release·최대 감쇠·리버브 비율·잔향 시간·에코 비율·피드백 슬라이더.
   EQ/다이내믹스 프리셋이 off이면 trim과 리버브·에코만 표시한다.
 - 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 모니터/통화/방송 sample peak.
   약 100ms 간격의 최대값을 dBFS로 표시한다. 소스 peak는 mute 전, AUX와 앱은 입력 trim 전이며
@@ -113,7 +113,7 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 저장된 전체/믹스별 음량, AUX/앱 입력 trim, 소스·출력·전체 mute, 모든 경로의 연결·gain, 라이브 보컬 파라미터와 VST3 우회·상태는 다음 명시적 시작부터
 적용된다. 초기 mute는 스트림 시작 전에 복원한다. 오류·상태 수집 실패·기존 파일 충돌 시 이전 Scene 선택을
 유지하고 새 파일을 게시하지 않는다. 일반 정지/창 닫기는 저장하지 않는다.
-장치·출력, EQ/다이내믹스 프리셋, 리버브 pre-delay, 에코 시간 및 VST3 체인 순서 편집은 정지 상태에서만 제공한다.
+장치·출력, EQ 계수와 프리셋, 리버브 pre-delay, 에코 시간 및 VST3 체인 순서 편집은 정지 상태에서만 제공한다.
 실행 중 보컬 체인의 각 VST3 슬롯에서 **우회 켜기/끄기** 및 **원본 창 열기/닫기**를 선택할 수 있다.
 우회는 해당 슬롯의 신고 지연만큼 정렬한 dry 신호로 약 5 ms 교차 전환한다. 다른 슬롯과 PDC는
 유지하며 모든 native 효과는 계속 처리한다(CPU 절감이나 음량 일치 A/B가 아니다).
@@ -154,6 +154,11 @@ sample clipping guard는 전문 리미터·true-peak·음향 피드백 방지·�
 | `--vocal-strength 1` | 원음/보정 blend 0..1. 음량 일치 기능 아님 |
 | `--vocal-threshold-db -24` | 컴프레서 threshold -60..0 dBFS |
 | `--deess-threshold-db -30` | 디에서 고역 threshold -60..0 dBFS |
+| `--eq-hpf-hz 75` | 하이패스 40..200 Hz |
+| `--eq-body-db 0`, `--eq-presence-db 0`, `--eq-air-db 0` | 180 Hz shelf / 2.8 kHz peak / 7.5 kHz shelf의 프리셋 대비 ±6 dB |
+| `--compressor-ratio 2.5` | 컴프레서 ratio 1..8 |
+| `--compressor-attack-ms 8`, `--compressor-release-ms 140` | attack 1..50 ms / release 20..500 ms |
+| `--deess-max-db 4` | 디에서 최대 감쇠 0..12 dB |
 | `--reverb-mix 0` | stereo 리버브 wet 비율 0..1 (0은 끄기) |
 | `--reverb-decay-secs 1.2` | 저역 기준 명목 잔향 시간 0.2..5초 |
 | `--reverb-predelay-ms 15` | wet 신호에만 추가 pre-delay 0..80 ms |
@@ -166,13 +171,20 @@ sample clipping guard는 전문 리미터·true-peak·음향 피드백 방지·�
 | `--broadcast-gain-db 0` | 방송 초기 추가 감쇠 -96..0 dB |
 
 자동 makeup gain은 없다. A/B 청취의 원본/보정 음량은 따로 맞춘다. 프리셋은 32..192 kHz,
-off는 8..192 kHz를 받는다. 프리셋과 리버브 pre-delay, 에코 시간은 실행 중 고정이며, 나머지 여덟 보컬
+off는 8..192 kHz를 받는다. 프리셋, EQ 계수와 리버브 pre-delay, 에코 시간은 실행 중 고정이며, 나머지 열두 보컬
 파라미터는 실행 중에도 조절할 수 있다. 각 대상값은 블록 경계에서 읽고 처리 clock의 약 10 ms
 sample ramp를 적용한다. trim은 선형 gain, 보정/리버브 비율은 blend, threshold는 dB,
+ratio와 디에서 최대 감쇠는 요청값, attack/release는 envelope coefficient를 전환한다.
 decay는 각 FDN feedback gain을 전환하며, 에코의 blend와 feedback도 독립적으로 전환한다. 콜백 안에서 버퍼를 만들거나 VST3를 다시 로드하지 않는다.
 보정 비율 0에서도 선택한 EQ/다이내믹스 상태를 유지하며, 리버브 0에서도 room 이력을 갱신한다.
 따라서 처음 꺼 둔 리버브를 실행 중 켤 수 있고 다시 켤 때 정지된 과거 이력을 재생하지 않는다.
 이 구조는 off 상태에서도 내부 DSP 비용이 들며, 실제 장비 CPU/청취 지연은 미측정이다.
+
+프리셋은 저역·존재감·고역 EQ의 시작 형태를 선택한다. 하이패스는 명시적 절대 주파수이고
+나머지 EQ gain은 프리셋에 더하는 오프셋이다. 다이내믹스 시작값은 모든 프리셋에서
+2.5:1, 8/140 ms, 최대 디에서 4 dB로 통일하며 사용자가 직접 변경한다. Ratio 1은 새 압축을
+발생시키지 않고 기존 envelope는 release로 복귀한다. 디에서 최대값은 현재 ramp 값을 넘지 않는다.
+Off 프리셋에서는 EQ/다이내믹스가 적용되지 않는다. 새 설정값의 음질은 청취 검증이 필요하다.
 
 스테레오 리버브는 **보컬 설정**의 별도 ROOM 카드에서 조절한다. 기본값은 꺼짐이며,
 예를 들어 `--reverb-mix 0.15 --reverb-decay-secs 1.2 --reverb-predelay-ms 15`로
@@ -248,7 +260,7 @@ off여도 리버브 비율이 0보다 크면 리버브가 동작한다. 보정 �
 
 ## 장치·보컬·VST3를 Scene 하나로 재실행
 
-**Scene schema 10**는 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state·bypassed를
+**Scene schema 11**은 mic/AUX/앱 소스별/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state·bypassed를
 한 파일에 담는다. 기존 체인을 넣으면 상태 바이트를 복사하므로 원래 체인 JSON은 재실행에
 필요하지 않다. 플러그인 DLL과 외부 샘플/라이선스 등은 여전히 설치되어 있어야 한다.
 
@@ -269,7 +281,7 @@ off여도 리버브 비율이 0보다 크면 리버브가 동작한다. 보정 �
 슬롯별 `--vst3-editor`와 정상 종료의 `--vst3-chain-out <새 파일>`은 실행 시 지정할 수 있다.
 Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또는 `scene run`에서
 `--scene-out <새 파일>`을 지정하면 정상 정지(시간 제한, stop, EOF) 후 GUI와 같은
-전체 Scene snapshot을 저장한다. 믹서·라이브 보컬 설정·모든 VST3 상태를 schema 10에 담으며,
+전체 Scene snapshot을 저장한다. 믹서·라이브 보컬 설정·모든 VST3 상태를 schema 11에 담으며,
 장치나 플러그인이 오류로 중단되면 파일을 게시하지 않는다. 기존 파일 또는 존재하지 않는
 상위 폴더는 시작 전에 거절하고, 종료 시점의 파일 충돌도 덮어쓰지 않는다.
 전체 Scene과 체인만 내보내기를 동시에 요청할 수 없다. 옵션이 없으면 실행 중 변경을 저장하지 않는다.
@@ -279,7 +291,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또�
 ```
 
 상대 경로는 들어 있던 chain/scene 파일 기준으로 해석한다. CLI에서 지정한 경로는 현재 작업
-폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~9는 읽지 않으며 현재 옵션으로
+폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~10은 읽지 않으며 현재 옵션으로
 다시 저장한다. 마이그레이션/누락값 복구는 없다. Scene에는 개인 장치 ID와 플러그인 상태가
 포함되므로 공개하지 않는다. `*.mixlive-scene.json`은 Git에서 제외한다.
 
@@ -298,13 +310,14 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또�
 | `bypass 1 on`, `bypass 1 off` | 1번 VST3 슬롯의 지연 정렬 우회/효과 적용 |
 | `vocal trim -3`, `vocal strength 0.75` | 입력 trim(dB) / EQ·다이내믹스 blend(0..1) |
 | `vocal compressor -28`, `vocal deesser -35` | threshold(-60..0 dBFS) |
+| `vocal ratio 3.5`, `vocal attack 5`, `vocal release 220`, `vocal deess-max 7` | ratio / attack·release(ms) / 디에서 최대 감쇠(dB) |
 | `vocal reverb 0.15`, `vocal decay 1.5` | room blend(0..1) / 명목 잔향 시간(0.2..5초) |
 | `vocal echo 0.2`, `vocal echo-feedback 0.35` | 에코 blend(0..1) / feedback(0..0.85) |
 | `status`, `stop` | 요청된 제어 상태 / 장치 해제 후 종료 |
 
 일반형은 `route mic|aux|appN output|send|broadcast on|off`, `level mic|aux|appN output|send|broadcast <dB>`다. `appN`은 1부터 시작하는 현재 앱 슬롯이다.
-`vocal` 명령의 값 범위는 시작 옵션과 같다. off 프리셋의 strength/compressor/deesser 제어는 거절하며,
-pre-delay, 에코 시간 및 프리셋 전환은 실행 중 지원하지 않는다.
+`vocal` 명령의 값 범위는 시작 옵션과 같다. off 프리셋의 EQ/다이내믹스 관련 라이브 제어는 거절하며,
+EQ 계수, pre-delay, 에코 시간 및 프리셋 전환은 실행 중 지원하지 않는다.
 꺼둔 경로의 level 변경은 켜짐이 아니고 전체 unmute도 개별 mute를 풀지 않는다.
 AUX/앱 trim은 입력 timeline에서 PDC 전에 적용되며, mute/경로별 gain은 PDC 뒤에서 적용된다.
 마이크는 `vocal trim`으로 조절한다. Scene 저장은 목표 trim을 기존 필드에 보존한다.
