@@ -455,3 +455,97 @@ fn live_dynamics_ramps_are_block_invariant_and_finish_on_requested_values() {
         assert!(config.set_parameter(parameter, f32::NAN).is_err());
     }
 }
+
+#[test]
+fn live_eq_reaches_the_requested_frequency_response() {
+    let config = VocalConfig { preset: Preset::Natural,
+        eq: EqConfig { hpf_hz: 40.0, ..EqConfig::default() },
+        dynamics: DynamicsConfig { ratio: 1.0, deess_max_db: 0.0, ..DynamicsConfig::default() },
+        ..VocalConfig::default() };
+    for (parameter, value, hz, minimum, maximum) in [
+        (VocalParameter::EqHpf, 200.0, 60.0, 0.05, 0.15),
+        (VocalParameter::EqBody, 6.0, 100.0, 1.5, 2.1),
+        (VocalParameter::EqPresence, 6.0, 2800.0, 1.9, 2.1),
+        (VocalParameter::EqAir, 6.0, 12000.0, 1.5, 2.1),
+    ] {
+        let input = tone(hz, 0.02, 48000, 48000);
+        let mut unchanged = vec![0.0; input.len()];
+        let mut right = unchanged.clone();
+        VocalChain::new(48000, config).unwrap().process(&input, &mut unchanged, &mut right).unwrap();
+        let mut chain = VocalChain::new(48000, config).unwrap();
+        let mut changed = vec![0.0; input.len()];
+        let at = 12037;
+        chain.process(&input[..at], &mut changed[..at], &mut right[..at]).unwrap();
+        chain.set_parameter(parameter, value).unwrap();
+        chain.process(&input[at..], &mut changed[at..], &mut right[at..]).unwrap();
+        assert_eq!(changed, right);
+        assert!((changed[at] - unchanged[at]).abs() < 0.0001, "abrupt {:?} edit", parameter);
+        let ratio = rms(&changed[36000..]) / rms(&unchanged[36000..]);
+        assert!((minimum..maximum).contains(&ratio), "{parameter:?}: {ratio}");
+        let mut reference = vec![0.0; input.len()];
+        VocalChain::new(48000, chain.config()).unwrap().process(&input, &mut reference, &mut right).unwrap();
+        for (actual, expected) in changed[36000..].iter().zip(&reference[36000..]) {
+            assert!((actual - expected).abs() < 1e-7, "{parameter:?} did not settle");
+        }
+    }
+}
+
+#[test]
+fn live_eq_preserves_history_and_retargets_independently_of_block_size() {
+    let edits = [
+        [(VocalParameter::EqHpf, 200.0), (VocalParameter::EqBody, 6.0),
+            (VocalParameter::EqPresence, -6.0), (VocalParameter::EqAir, 6.0)],
+        [(VocalParameter::EqHpf, 40.0), (VocalParameter::EqBody, -6.0),
+            (VocalParameter::EqPresence, 6.0), (VocalParameter::EqAir, -6.0)],
+        [(VocalParameter::EqHpf, 110.0), (VocalParameter::EqBody, 3.0),
+            (VocalParameter::EqPresence, 1.5), (VocalParameter::EqAir, -2.0)],
+    ];
+    for rate in [32000, 48000, 192000] {
+        let config = VocalConfig { preset: Preset::Warm,
+            dynamics: DynamicsConfig { ratio: 1.0, deess_max_db: 0.0, ..DynamicsConfig::default() },
+            ..VocalConfig::default() };
+        // Editing a settled high-pass on DC must not recreate a startup transient.
+        let mut equalizer = Equalizer::new(rate, config).unwrap();
+        for _ in 0..rate / 2 { equalizer.run(0.25); }
+        for targets in edits {
+            for (parameter, value) in targets { equalizer.set_parameter(parameter, value).unwrap(); }
+            for _ in 0..rate / 40 { assert!(equalizer.run(0.25).abs() < 1e-8); }
+        }
+        let counts = [rate as usize / 400, rate as usize / 200, rate as usize / 20];
+        let frames = counts.iter().sum();
+        let mut input = tone(90.0, 0.15, rate, frames);
+        for (i, value) in input.iter_mut().enumerate() {
+            *value += (0.1 * (TAU * 2800.0 * i as f64 / f64::from(rate)).sin()
+                + 0.05 * (TAU * 11000.0 * i as f64 / f64::from(rate)).sin()) as f32;
+        }
+        let render = |block: usize| {
+            let mut chain = VocalChain::new(rate, config).unwrap();
+            let mut left = vec![0.0; frames];
+            let mut right = left.clone();
+            let mut start = 0;
+            for (targets, count) in edits.into_iter().zip(counts) {
+                let end = start + count;
+                for ((part, l), r) in input[start..end].chunks(block)
+                    .zip(left[start..end].chunks_mut(block)).zip(right[start..end].chunks_mut(block)) {
+                    for (parameter, value) in targets { chain.set_parameter(parameter, value).unwrap(); }
+                    chain.process(part, l, r).unwrap();
+                }
+                start = end;
+            }
+            assert_eq!(left, right);
+            assert!(left.iter().all(|sample| sample.is_finite() && sample.abs() < 1.0));
+            left
+        };
+        let whole = render(frames);
+        for block in [1, 17, 256] { assert_eq!(whole, render(block), "rate {rate}, block {block}"); }
+    }
+    for parameter in [VocalParameter::EqHpf, VocalParameter::EqBody, VocalParameter::EqPresence, VocalParameter::EqAir] {
+        assert!(!parameter.available_for(Preset::Off));
+        let mut chain = VocalChain::new(48000, VocalConfig { preset: Preset::Natural, ..VocalConfig::default() }).unwrap();
+        let before = chain.config();
+        for value in [f32::NAN, f32::INFINITY, *parameter.range().start() - 0.1, *parameter.range().end() + 0.1] {
+            assert!(chain.set_parameter(parameter, value).is_err());
+            assert_eq!(chain.config(), before);
+        }
+    }
+}

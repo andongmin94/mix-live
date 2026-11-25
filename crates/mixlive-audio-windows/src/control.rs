@@ -14,7 +14,7 @@ const BROADCAST: u32 = 1 << (5 + MAX_APPS);
 pub(crate) const MAX_SOURCES: usize = MAX_APPS + 2;
 pub(crate) const MAX_ROUTES: usize = MAX_MIXES * MAX_SOURCES;
 
-pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; trim aux|appN <dB -96..0>; bypass <VST3 slot> on|off; vocal trim|strength|compressor|deesser|ratio|attack|release|deess-max|reverb|decay|echo|echo-feedback <value>; status; stop. Changes last for this run unless saved with --scene-out.";
+pub const HELP: &str = "Live commands: mute/unmute mic|aux|app1..app8|output|send|broadcast|all; gain master|monitor|send|broadcast <dB -96..0>; route mic|aux|appN output|send|broadcast on|off; level mic|aux|appN output|send|broadcast <dB -96..0>; trim aux|appN <dB -96..0>; bypass <VST3 slot> on|off; vocal trim|strength|eq-hpf|eq-body|eq-presence|eq-air|compressor|deesser|ratio|attack|release|deess-max|reverb|decay|echo|echo-feedback <value>; status; stop. Changes last for this run unless saved with --scene-out.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuteTarget { Mic, Aux, App(usize), Output, Send, Broadcast, All }
@@ -286,7 +286,7 @@ impl LiveControls {
             return Err("live controls do not match the Scene topology".into());
         }
         if route.vocal != self.vocal_start.preset || route.reverb_predelay_ms != self.vocal_start.reverb.predelay_ms
-            || route.echo_time_ms != self.vocal_start.echo.time_ms || route.vocal_config().eq != self.vocal_start.eq {
+            || route.echo_time_ms != self.vocal_start.echo.time_ms {
             return Err("live vocal processing does not match the Scene topology".into());
         }
         let mut saved = route.clone();
@@ -763,13 +763,15 @@ mod tests {
             "--vocal", "warm", "--vocal-strength", "0", "--reverb-predelay-ms", "25"]).command else { panic!("expected check") };
         let controls = LiveControls::from_route(&route).unwrap();
         for command in ["vocal trim -3", "vocal strength 0.75", "vocal compressor -35",
-            "vocal deesser -40", "vocal reverb 0.25", "vocal decay 2.5", "vocal echo 0.375", "vocal echo-feedback 0.5", "vocal ratio 5", "vocal attack 2", "vocal release 250", "vocal deess-max 8"] {
+            "vocal deesser -40", "vocal reverb 0.25", "vocal decay 2.5", "vocal echo 0.375", "vocal echo-feedback 0.5", "vocal ratio 5", "vocal attack 2", "vocal release 250", "vocal deess-max 8",
+            "vocal eq-hpf 120", "vocal eq-body -3", "vocal eq-presence 2.5", "vocal eq-air 4"] {
             controls.apply(command.parse().unwrap()).unwrap();
         }
         let before = controls.vocal_config();
         for command in ["vocal reverb NaN", "vocal decay 5.1", "vocal trim -37",
             "vocal compressor 1", "vocal strength 1.01", "vocal predelay 10", "vocal preset warm",
-            "vocal echo NaN", "vocal echo-feedback 0.86", "vocal echo-time 100", "vocal ratio 9", "vocal attack 0", "vocal release 501", "vocal deess-max NaN", "vocal eq-hpf 95"] {
+            "vocal echo NaN", "vocal echo-feedback 0.86", "vocal echo-time 100", "vocal ratio 9", "vocal attack 0", "vocal release 501", "vocal deess-max NaN",
+            "vocal eq-hpf 39", "vocal eq-hpf 201", "vocal eq-body -6.1", "vocal eq-presence 6.1", "vocal eq-air NaN"] {
             assert!(command.parse::<LiveCommand>().is_err(), "{command}");
         }
         assert!(controls.apply(LiveCommand::Vocal { parameter: VocalParameter::Trim, value: f32::NAN }).is_err());
@@ -778,11 +780,23 @@ mod tests {
         assert_eq!(route.vocal_config(), before);
         assert_eq!(route.vocal, Preset::Warm);
         assert_eq!(route.reverb_predelay_ms, 25.0);
+        assert_eq!(route.vocal_config().eq, mixlive_effects::EqConfig {
+            hpf_hz: 120.0, body_db: -3.0, presence_db: 2.5, air_db: 4.0,
+        });
+        // A later snapshot can update EQ again; it no longer changes the topology.
+        controls.apply("vocal eq-hpf 80".parse().unwrap()).unwrap();
+        controls.snapshot_into(&mut route).unwrap();
+        let scene = crate::scene::AudioScene::new(route.clone(), Vec::new()).unwrap();
+        let json = serde_json::to_string(&scene).unwrap();
+        let saved: crate::scene::AudioScene = serde_json::from_str(&json).unwrap();
+        assert_eq!(saved.route.vocal_config(), controls.vocal_config());
         let restored = LiveControls::from_route(&route).unwrap();
         assert_eq!(restored.describe(), controls.describe());
         let off = LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
         assert!(off.apply("vocal strength 1".parse().unwrap()).is_err());
         assert!(off.apply("vocal ratio 4".parse().unwrap()).is_err());
+        assert!(off.apply("vocal eq-hpf 95".parse().unwrap()).is_err());
+        assert!(off.apply("vocal eq-body 3".parse().unwrap()).is_err());
         assert!(off.apply("vocal reverb 0.5".parse().unwrap()).is_ok());
         assert!(off.apply("vocal echo 0.5".parse().unwrap()).is_ok());
         assert_eq!(off.vocal_parameters().count(), 5);

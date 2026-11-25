@@ -11,6 +11,8 @@ use reverb::Reverb;
 mod echo;
 pub use echo::EchoConfig;
 use echo::Echo;
+mod eq;
+use eq::Equalizer;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Preset {
@@ -39,11 +41,12 @@ impl FromStr for Preset {
 /// Parameters that can change without changing processing topology or a delay length.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
-pub enum VocalParameter { Trim, Strength, Compressor, Deesser, ReverbMix, ReverbDecay, EchoMix, EchoFeedback, CompressorRatio, CompressorAttack, CompressorRelease, DeesserMaximum }
+pub enum VocalParameter { Trim, Strength, Compressor, Deesser, ReverbMix, ReverbDecay, EchoMix, EchoFeedback, CompressorRatio, CompressorAttack, CompressorRelease, DeesserMaximum, EqHpf, EqBody, EqPresence, EqAir }
 
 impl VocalParameter {
-    pub const ALL: [Self; 12] = [Self::Trim, Self::Strength, Self::Compressor, Self::Deesser, Self::ReverbMix, Self::ReverbDecay, Self::EchoMix, Self::EchoFeedback,
-        Self::CompressorRatio, Self::CompressorAttack, Self::CompressorRelease, Self::DeesserMaximum];
+    pub const ALL: [Self; 16] = [Self::Trim, Self::Strength, Self::Compressor, Self::Deesser, Self::ReverbMix, Self::ReverbDecay, Self::EchoMix, Self::EchoFeedback,
+        Self::CompressorRatio, Self::CompressorAttack, Self::CompressorRelease, Self::DeesserMaximum,
+        Self::EqHpf, Self::EqBody, Self::EqPresence, Self::EqAir];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -51,6 +54,7 @@ impl VocalParameter {
             Self::Deesser => "deesser", Self::ReverbMix => "reverb", Self::ReverbDecay => "decay",
             Self::EchoMix => "echo", Self::EchoFeedback => "echo-feedback",
             Self::CompressorRatio => "ratio", Self::CompressorAttack => "attack", Self::CompressorRelease => "release", Self::DeesserMaximum => "deess-max",
+            Self::EqHpf => "eq-hpf", Self::EqBody => "eq-body", Self::EqPresence => "eq-presence", Self::EqAir => "eq-air",
         }
     }
 
@@ -65,6 +69,8 @@ impl VocalParameter {
             Self::CompressorAttack => 1.0..=50.0,
             Self::CompressorRelease => 20.0..=500.0,
             Self::DeesserMaximum => 0.0..=12.0,
+            Self::EqHpf => 40.0..=200.0,
+            Self::EqBody | Self::EqPresence | Self::EqAir => -6.0..=6.0,
         }
     }
 
@@ -86,11 +92,13 @@ impl VocalParameter {
             Self::CompressorAttack => DspError::CompressorAttack,
             Self::CompressorRelease => DspError::CompressorRelease,
             Self::DeesserMaximum => DspError::DeesserMaximum,
+            Self::EqHpf => DspError::EqCutoff,
+            Self::EqBody | Self::EqPresence | Self::EqAir => DspError::EqGain,
         })
     }
 }
 
-/// Fixed-coefficient EQ settings. The three gain controls are offsets to the selected preset.
+/// EQ targets. The three gain controls are offsets to the selected preset.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EqConfig {
     pub hpf_hz: f32,
@@ -100,15 +108,6 @@ pub struct EqConfig {
 }
 impl Default for EqConfig {
     fn default() -> Self { Self { hpf_hz: 75.0, body_db: 0.0, presence_db: 0.0, air_db: 0.0 } }
-}
-impl EqConfig {
-    pub fn validate(self) -> Result<(), DspError> {
-        if !(40.0..=200.0).contains(&self.hpf_hz) { return Err(DspError::EqCutoff); }
-        if [self.body_db, self.presence_db, self.air_db].into_iter().any(|db| !(-6.0..=6.0).contains(&db)) {
-            return Err(DspError::EqGain);
-        }
-        Ok(())
-    }
 }
 
 /// Explicit dynamics values, independent of the chosen EQ preset.
@@ -157,6 +156,10 @@ impl VocalConfig {
             VocalParameter::CompressorAttack => self.dynamics.attack_ms,
             VocalParameter::CompressorRelease => self.dynamics.release_ms,
             VocalParameter::DeesserMaximum => self.dynamics.deess_max_db,
+            VocalParameter::EqHpf => self.eq.hpf_hz,
+            VocalParameter::EqBody => self.eq.body_db,
+            VocalParameter::EqPresence => self.eq.presence_db,
+            VocalParameter::EqAir => self.eq.air_db,
         }
     }
 
@@ -175,13 +178,16 @@ impl VocalConfig {
             VocalParameter::CompressorAttack => self.dynamics.attack_ms = value,
             VocalParameter::CompressorRelease => self.dynamics.release_ms = value,
             VocalParameter::DeesserMaximum => self.dynamics.deess_max_db = value,
+            VocalParameter::EqHpf => self.eq.hpf_hz = value,
+            VocalParameter::EqBody => self.eq.body_db = value,
+            VocalParameter::EqPresence => self.eq.presence_db = value,
+            VocalParameter::EqAir => self.eq.air_db = value,
         }
         Ok(())
     }
 
     pub fn validate(self) -> Result<(), DspError> {
         for parameter in VocalParameter::ALL { parameter.validate(self.parameter(parameter))?; }
-        self.eq.validate()?;
         self.reverb.validate()?;
         self.echo.validate()
     }
@@ -345,32 +351,22 @@ impl DeEsser {
 }
 
 struct Processing {
-    filters: [Filter; 4],
+    eq: Equalizer,
     compressor: Compressor,
     deesser: DeEsser,
 }
 impl Processing {
-    fn new(rate: f64, config: VocalConfig) -> Result<Self, DspError> {
-        let (body, presence, air) = match config.preset {
-            Preset::Warm => (1.5, 0.0, -1.0),
-            Preset::Bright => (-1.5, 2.0, 1.5),
-            Preset::Natural | Preset::Off => (0.0, 1.0, 0.0),
-        };
-        let eq = config.eq;
+    fn new(sample_rate: u32, config: VocalConfig) -> Result<Self, DspError> {
+        let rate = f64::from(sample_rate);
         let dynamics = config.dynamics;
         Ok(Self {
-            filters: [
-                Filter::new(Type::HighPass, f64::from(eq.hpf_hz), Q_BUTTERWORTH_F64, rate)?,
-                Filter::new(Type::LowShelf(body + f64::from(eq.body_db)), 180.0, Q_BUTTERWORTH_F64, rate)?,
-                Filter::new(Type::PeakingEQ(presence + f64::from(eq.presence_db)), 2800.0, 0.8, rate)?,
-                Filter::new(Type::HighShelf(air + f64::from(eq.air_db)), 7500.0, Q_BUTTERWORTH_F64, rate)?,
-            ],
+            eq: Equalizer::new(sample_rate, config)?,
             compressor: Compressor::new(rate, f64::from(config.compressor_threshold_db), dynamics),
             deesser: DeEsser::new(rate, f64::from(config.deess_threshold_db), f64::from(dynamics.deess_max_db))?,
         })
     }
     fn reset(&mut self) {
-        for filter in &mut self.filters { filter.reset(); }
+        self.eq.reset();
         self.compressor.reset(); self.deesser.reset();
     }
 }
@@ -399,7 +395,7 @@ impl VocalChain {
         // Prepare the selected EQ/dynamics even at zero strength, and prepare
         // the fixed room network even at zero mix. Live edits never allocate.
         let processing = if config.preset == Preset::Off { None }
-            else { Some(Processing::new(f64::from(sample_rate), config)?) };
+            else { Some(Processing::new(sample_rate, config)?) };
         let reverb = Reverb::new(sample_rate, config.reverb)?;
         let echo = Echo::new(sample_rate, config.echo);
         let rate = f64::from(sample_rate);
@@ -418,7 +414,7 @@ impl VocalChain {
     pub fn config(&self) -> VocalConfig { self.config }
 
     /// Apply a validated target on the audio-processing thread, at a block boundary.
-    /// Preset, EQ coefficients, sample rate, pre-delay and echo time remain fixed. Only changed targets do work.
+    /// Preset, sample rate, pre-delay and echo time remain fixed. Only changed targets do work.
     pub fn set_parameter(&mut self, parameter: VocalParameter, value: f32) -> Result<(), DspError> {
         if self.config.parameter(parameter) == value { return Ok(()); }
         self.config.set_parameter(parameter, value)?;
@@ -435,6 +431,9 @@ impl VocalChain {
             VocalParameter::CompressorAttack => self.compressor_attack.set(coefficient(f64::from(value), self.rate)),
             VocalParameter::CompressorRelease => self.compressor_release.set(coefficient(f64::from(value), self.rate)),
             VocalParameter::DeesserMaximum => self.deess_maximum.set(f64::from(value)),
+            VocalParameter::EqHpf | VocalParameter::EqBody | VocalParameter::EqPresence | VocalParameter::EqAir => {
+                if let Some(processing) = &mut self.processing { processing.eq.set_parameter(parameter, value)?; }
+            }
         }
         Ok(())
     }
@@ -475,8 +474,7 @@ impl VocalChain {
                 processing.compressor.attack = attack;
                 processing.compressor.release = release;
                 processing.deesser.maximum = maximum;
-                let mut wet = dry;
-                for filter in &mut processing.filters { wet = filter.run(wet); }
+                let mut wet = processing.eq.run(dry);
                 wet = processing.compressor.run(wet);
                 wet = processing.deesser.run(wet);
                 if strength == 0.0 {

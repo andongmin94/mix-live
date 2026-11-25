@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **가상 장치 개발 패키지 빌드 완료 · 실험적 자동 음정 보정 경로 추가**
+단계: **실험적 음정 보정 병합 · 라이브 EQ와 VST3 파라미터 편집 통합 검증**
 
 ## 현재 구현
 
@@ -46,10 +46,12 @@
   GPUI/CLI에서 설정하고 저장한다. dry는 추가 지연하지 않으며 stereo VST3 입력을 유지한다.
   실행 중 trim·strength·compressor/deesser threshold·reverb mix/decay를 독립 atomic 목표값과
   10 ms sample ramp로 조절한다. zero strength/mix에서도 준비된 DSP 상태를 갱신한다.
-  하이패스(40..200 Hz)와 180/2800/7500 Hz EQ gain 오프셋(±6 dB)을 정지 중 편집한다.
+  하이패스(40..200 Hz)와 180/2800/7500 Hz EQ gain 오프셋(±6 dB)을 GUI/CLI에서 실시간 편집한다.
+  biquad Direct Form I의 이력을 유지하며 변경한 밴드의 정규화 계수를 10 ms 동안 전환한다.
+  추가 delay buffer 없이 같은 마이크 처리 결과를 모든 연결된 믹스에 보낸다.
   compressor ratio(1..8), attack(1..50 ms), release(20..500 ms), deesser 최대 감쇠(0..12 dB)를
   기존 atomic target과 10 ms ramp로 실시간 변경한다. 새 기본값은 명시적 2.5:1, 8/140 ms, 최대 4 dB다.
-  EQ·pre-delay와 프리셋은 정지 상태에서만 변경한다. off 프리셋의 EQ/다이내믹스 파라미터는 비활성이다.
+  pre-delay와 프리셋은 정지 상태에서만 변경한다. off 프리셋의 EQ/다이내믹스 파라미터는 비활성이다.
   리버브 뒤에 독립 stereo feedback echo를 추가했다. 최대 1초 delay buffer를 시작 전에 만들고
   mix(0..1), feedback(0..0.85)을 10 ms ramp로 실시간 조절한다. 시간(10..1000 ms)은 정지 중 변경한다.
   AUX/앱은 영향을 받지 않는다. 보컬은 한 번만 처리하고 mute는 리버브와 반복음을 포함해 적용한다.
@@ -59,6 +61,10 @@
   음량 일치·CPU 절감·오류 시 dry fallback은 아니다.
 - 실행 중 VST3 원본 창은 슬롯별 열기/닫기/재열기. 같은 실제 인스턴스를 유지하며, GPUI가
   메시지 루프를 소유한다. 창 조작과 native poll은 GPUI 변경 참조 밖에서 수행한다.
+  실행 슬롯의 공통 파라미터 패널도 같은 인스턴스를 사용한다. native 표시 문자열/단계 수를 읽고
+  선택한 값 하나를 명시적 적용으로 전달한다. 숨김은 제외하고 읽기 전용은 조작하지 않는다.
+  조회한 값은 새로고침으로 갱신하며, native editor/processor 피드백을 DSP에 재전송하지 않는다.
+  조회·포맷·변경은 foreground에서 수행하고 기존 최종 state flush/Scene 저장을 재사용한다.
 - 정지 후 새 Scene 저장은 장치 중지 → 앱 capture thread join → VST3 worker join → 모든
   상태 수집 → 새 파일 게시를 사용한다. 실행 중 모든 소스/출력 mute·route·gain, 보컬 파라미터와 VST3 상태를
   다음 시작 전에 복원한다. 일반 정지/닫기/오류는 저장하지 않으며 파일 덮어쓰기 없음.
@@ -82,41 +88,23 @@
 
 ## 검증
 
-- [Audio #37](https://github.com/andongmin94/mix-live/actions/runs/45567131587) 전체 성공:
-  `beea453`의 Windows 검사 113개(리버브·실시간 보컬 파라미터·native VST3 포함),
-  Clippy, locked release 빌드, CLI 및 실제 GPUI Scene 생성/편집/저장 검사 통과.
-  이번 드라이버 변경은 Rust 코드를 수정하지 않으므로 Audio CI를 반복하지 않는다.
-- [Virtual Audio #2](https://github.com/andongmin94/mix-live/actions/runs/45568859781):
-  기존 두 케이블의 MSVC transport 검사, WDK 26100 x64 컴파일·링크,
-  InfVerif /w·/h, Inf2Cat unsigned catalog 생성 성공. 미서명 catalog 거절 및
-  두 PnP ID의 부재 확인까지 성공했지만, 예상된 SignTool 실패의 native 종료 코드가
-  PowerShell CI wrapper에 전달되어 job 실패 및 artifact 미게시로 기록됐다.
-  모든 assertion 통과 시에만 명시적으로 0을 반환하도록 수정했다.
-- [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) 성공:
-  `08d0007`의 세 고정 INF/PnP ID, transport 격리, WDK/INF/unsigned catalog 및
-  미서명 거절·부재 검사 workflow 완료.
-  드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는
-  검증하지 않았다.
-- [Audio #38](https://github.com/andongmin94/mix-live/actions/runs/45571558178) 성공:
-  `9817ec6`의 CLI 전체 Scene snapshot/종료 입력 차단을 포함한 Windows 통합 검사 통과.
-- [Audio #40](https://github.com/andongmin94/mix-live/actions/runs/45574156346): `10961f2`의
-  라이브 AUX/앱 trim 및 VST3 슬롯 우회 관련 workspace 테스트, native fixture, Clippy 성공.
-  최신 변경으로 대체되어 릴리스 빌드/GPUI 검사 완료 전에 취소됐다.
-- [Audio #42](https://github.com/andongmin94/mix-live/actions/runs/45576006084) `9035d2f`:
-  에코/VST3 검색 관련 테스트, native fixture, Clippy, Windows release 빌드 및 CLI 검사 통과.
-  GUI 자동화에서 `VST3 검색 결과` 접근성 이름 조회가 실패했다. 검색 완료 후 다시 검색 버튼이
-  표시되는 계약으로 수정했다.
-- [Audio #43](https://github.com/andongmin94/mix-live/actions/runs/45581536089) `561caff`:
-  EQ/다이내믹스 workspace·native·Clippy·release·CLI·GPUI 검사 전체 성공.
-- [Audio #44](https://github.com/andongmin94/mix-live/actions/runs/45582621843) `dedd686`:
-  limiter의 stereo 비율/회복/믹스 격리/계측 테스트 성공. 기존 pitch-detection 정규화로 인해
-  낮은 합성음 검출 테스트가 실패했다. 기존 FFT dependency를 직접 사용하고 lag별 양쪽 중첩 에너지를
-  계산하도록 교체했다. 75..1190 Hz 순음, 대역 밖 거절, 배음 포함, 기준 스케일·Scene/UI 검사를 추가했다.
-- [Audio #45](https://github.com/andongmin94/mix-live/actions/runs/45585569425) `60184e1`:
-  수정된 detector/limiter/Scene workspace·native VST3·Clippy 통과, 확인 시점 Windows release/GUI 미완료.
-- 실험적 pitch correction: 44.1/48/96 kHz 합성 주파수 이동·강도·스케일·처리 길이·무성음 지연·
-  블록 경계·통화/방송 PDC 및 저장 UI 회귀 검사를 추가했다. 같은 수식의 NumPy 검산에서
-  예제 순음이 목표에 0.2 cent 이내였으나 Rust CI 및 실제 노래 청취는 아직 미완료다.
+- [Audio #46](https://github.com/andongmin94/mix-live/actions/runs/45587784385) `d3bc037` 전체 성공:
+  음정 보정의 합성 주파수 이동·강도·스케일·처리 길이·무성음 지연·블록 경계·송출 PDC,
+  workspace/실제 native VST3 fixture, Clippy, locked Windows release 빌드, CLI 및 실제 GPUI
+  Scene 편집·취소·저장·재열기 검사 통과. PR #2를 `main`에 병합했다.
+  실제 노래 청취·포먼트·장치 지연/CPU 검증은 아니다.
+- [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) `08d0007` 성공:
+  세 고정 INF/PnP ID, transport 격리, WDK/INF/unsigned catalog 및 미서명 거절·부재 검사 완료.
+  드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는 미검증이다.
+- 이번 라이브 EQ 변경: 로컬 `cargo test -p mixlive-effects --locked` 20개 성공.
+  실제 주파수 응답 변화, 전환 연속성, 목표 재변경, 처리 블록 독립성, 32/48/192 kHz의 유한 출력 검증.
+  `live_eq` capture 검사와 보컬 파라미터 검증/Scene snapshot·JSON roundtrip 검사도 각각 성공했다.
+- 공통 VST3 편집에는 실제 gain fixture의 출력 변화/슬롯 독립성, state fixture의 이산값·읽기 전용
+  거절 및 마지막 편집 후 state 저장/복원, native 창의 controller-only 값 새로고침과 processor 피드백
+  보존 검사를 추가했다. portable 파라미터 검증 검사 1개는 로컬에서 성공했다.
+  Linux library Clippy는 Windows 호출부가 제외된 기존 항목의 dead_code 경고로 종료됐다.
+  이 변경 묶음의 지원 플랫폼 Windows CI는 아직 실행 전이다.
+  실장비를 여는 라이브 패널 조작과 상용 VST3 호환성은 검증하지 않았다.
 
 ## 남은 작업과 제한
 
@@ -126,7 +114,7 @@
 - 탭 선택·ASIO·실행 중
   소스/체인 삽입/삭제·고급 formant 보존과 음정 보정 품질 수용은 미완료다(실험적 자동 보정은 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
-  실행 중 음정 설정/EQ 계수/프리셋/pre-delay/에코 시간 변경은 미구현이다. 리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
+  실행 중 음정 설정/프리셋/pre-delay/에코 시간 변경은 미구현이다. 리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.
 - 원래 앱 재생 경로·장치 기본값은 변경하지 않는다. 자동 mix-minus 추정/외부 피드백 검출/

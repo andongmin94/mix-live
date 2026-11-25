@@ -1,10 +1,10 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
-use super::{ChainFile, EffectSpec, ResolvedPlugins};
+use super::{ChainFile, EffectSpec, LiveParameter, ResolvedPlugins};
 use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}, config::MAX_APPS, control::{GainRamp, LiveControls}};
 use mixlive_vst3::editor::flush_editor_changes;
 use rtrb::{Producer, RingBuffer};
 use std::{path::Path, sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
-use vst3_host::{Plugin, PluginWindow, Vst3Host, audio::BusAudioBuffers, plugin::ProcessMode};
+use vst3_host::{Parameter, Plugin, PluginWindow, Vst3Host, audio::BusAudioBuffers, plugin::ProcessMode};
 
 // All clock-converted source samples travel together; only the mic enters VST3.
 // Fixed-capacity frames are copied by value. No callback allocation or extra processing worker.
@@ -53,6 +53,70 @@ struct Slot {
     plugin: Arc<Mutex<Plugin>>,
     editor: Option<PluginWindow>,
     bypassed: Arc<AtomicBool>,
+    // Initialized only on explicit panel access. Feedback replaces values, never records history.
+    parameters: Option<Vec<CachedParameter>>,
+}
+
+struct CachedParameter {
+    info: Parameter,
+    // Feedback may come from the processor and need not be mirrored to its controller.
+    feedback: bool,
+}
+
+// VST3 ParameterInfo::ParameterFlags::kIsHidden (pinned vst3 0.3.0).
+const PARAMETER_HIDDEN: u32 = 1 << 4;
+
+fn update_parameter_feedback(parameters: &mut Option<Vec<CachedParameter>>, changes: Vec<(u32, f64)>) {
+    if let Some(parameters) = parameters {
+        for (id, value) in changes {
+            if let Some(parameter) = parameters.iter_mut().find(|parameter| parameter.info.id == id) {
+                parameter.info.value = value;
+                parameter.feedback = true;
+            }
+        }
+    }
+}
+
+fn parameter_snapshot(plugin: &Plugin, parameter: &Parameter) -> Result<LiveParameter, String> {
+    if !(0.0..=1.0).contains(&parameter.value) {
+        return Err(format!("VST3 parameter {} reported an invalid normalized value", parameter.id));
+    }
+    Ok(LiveParameter { id: parameter.id, name: parameter.name.clone(), unit: parameter.unit.clone(),
+        normalized: parameter.value, display: plugin.format_parameter(parameter.id, parameter.value).map_err(|e| e.to_string())?,
+        step_count: parameter.step_count.max(0) as u32, read_only: parameter.is_read_only })
+}
+
+impl Slot {
+    // Loading/control thread only, outside GPUI borrows. Native calls still share the
+    // existing worker mutex; this is not a lock-free or hard-real-time host interface.
+    fn parameter_snapshot(&mut self, edit: Option<(u32, f64)>) -> Result<Vec<LiveParameter>, String> {
+        let mut plugin = self.plugin.lock().map_err(|_| "VST3 processing state was poisoned")?;
+        if self.parameters.is_none() {
+            self.parameters = Some(plugin.get_parameters().map_err(|e| e.to_string())?.into_iter()
+                .map(|info| CachedParameter { info, feedback: false }).collect());
+        }
+        // Processor/editor feedback was already consumed by DSP. Never replay it as an edit.
+        update_parameter_feedback(&mut self.parameters, plugin.get_parameter_changes());
+        let parameters = self.parameters.as_mut().expect("parameter metadata initialized above");
+        // Explicit Refresh also reads controller-only values (e.g. editor instrumentation).
+        // Once a parameter has feedback, its latest reported value wins over a potentially
+        // stale controller getter. No continuous meter sampling or event history is inferred.
+        for parameter in parameters.iter_mut().filter(|parameter| !parameter.feedback) {
+            parameter.info.value = plugin.get_parameter(parameter.info.id).map_err(|e| e.to_string())?;
+        }
+        if let Some((id, value)) = edit {
+            let parameter = parameters.iter_mut().find(|parameter| parameter.info.id == id && parameter.info.flags & PARAMETER_HIDDEN == 0)
+                .ok_or("VST3 parameter ID is not in the visible parameter list")?;
+            let value = parameter_snapshot(&plugin, &parameter.info)?.validate_edit(value)?;
+            // One explicit UI apply, not a parameter batch. The upstream pending queue is
+            // bounded at 4096 and can silently drop on overflow; no delivery guarantee is added.
+            plugin.set_parameter(id, value).map_err(|e| e.to_string())?;
+            parameter.info.value = plugin.get_parameter(id).map_err(|e| e.to_string())?;
+            parameter.feedback = false;
+        }
+        parameters.iter().filter(|parameter| parameter.info.flags & PARAMETER_HIDDEN == 0)
+            .map(|parameter| parameter_snapshot(&plugin, &parameter.info)).collect()
+    }
 }
 
 // Always advance the aligned dry history, even when listening to the wet path.
@@ -221,7 +285,7 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
             index + 1, plugin.info().name, plugin.info().uid, latency));
         let plugin = Arc::new(Mutex::new(plugin));
         processors.push(Processor::new(plugin.clone(), buffers, bypassed.clone(), rate, latency));
-        owner.slots.push(Slot { plugin, editor: None, bypassed });
+        owner.slots.push(Slot { plugin, editor: None, bypassed, parameters: None });
     }
     let pitch_latency = capture.pitch_latency();
     let compensation = capture.prepare_voice_delay(total_latency, rate)?;
@@ -264,6 +328,16 @@ fn stop_and_snapshot(plugin: &mut Plugin, save: bool, bypassed: bool) -> Result<
 }
 
 impl PluginWorker {
+    pub fn effect_parameters(&mut self, index: usize) -> Result<Vec<LiveParameter>, String> {
+        if self.health.failed() { return Err("audio path has failed; stop before editing parameters".into()); }
+        self.slots.get_mut(index).ok_or("VST3 slot is outside the active chain")?.parameter_snapshot(None)
+    }
+
+    pub fn set_effect_parameter(&mut self, index: usize, id: u32, normalized: f64) -> Result<Vec<LiveParameter>, String> {
+        if self.health.failed() { return Err("audio path has failed; stop before editing parameters".into()); }
+        self.slots.get_mut(index).ok_or("VST3 slot is outside the active chain")?.parameter_snapshot(Some((id, normalized)))
+    }
+
     pub fn editor_is_open(&self, index: usize) -> bool {
         self.slots.get(index).and_then(|slot| slot.editor.as_ref()).is_some_and(PluginWindow::is_open)
     }
@@ -303,7 +377,7 @@ impl PluginWorker {
             self.health.fail(Fault::Routing);
             return Err("VST3 processing thread stopped unexpectedly".into());
         }
-        for (index, slot) in self.slots.iter().enumerate() {
+        for (index, slot) in self.slots.iter_mut().enumerate() {
             let mut plugin = match slot.plugin.try_lock() {
                 Ok(plugin) => plugin,
                 Err(TryLockError::WouldBlock) => continue,
@@ -316,7 +390,7 @@ impl PluginWorker {
                 return Err(format!("VST3 slot {} requested a restart; configure and start the route again", index + 1));
             }
             // Edits already reach process_bus_audio. Drain UI feedback, do not replay it.
-            let _ = plugin.get_parameter_changes();
+            update_parameter_feedback(&mut slot.parameters, plugin.get_parameter_changes());
             let _ = plugin.take_host_notifications();
             let _ = plugin.take_parameter_edits();
         }

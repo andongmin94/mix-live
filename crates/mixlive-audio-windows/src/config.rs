@@ -258,7 +258,7 @@ pub struct RouteOptions {
     /// Additional attenuation on the broadcast mix.
     #[arg(long, default_value = "0", allow_hyphen_values = true)]
     pub broadcast_gain_db: f32,
-    /// Vocal starting point: off, natural, warm or bright. Reverb is configured separately; no pitch correction yet.
+    /// Vocal EQ/dynamics starting point: off, natural, warm or bright. Pitch and spatial effects are configured separately.
     #[arg(long, default_value_t = Preset::Off)]
     #[serde(with = "preset_serde")]
     pub vocal: Preset,
