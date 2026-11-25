@@ -3,6 +3,32 @@ use clap::Args;
 use serde::{Deserialize, Serialize};
 use std::{fs::File, io::{BufReader, Write}, path::{Path, PathBuf}};
 
+/// Control-thread snapshot of one visible parameter on the actual running VST3 instance.
+/// `normalized` is always 0..=1; `display` comes from the plugin, not an inferred Hz/dB mapping.
+#[derive(Clone, Debug)]
+pub struct LiveParameter {
+    pub id: u32,
+    pub name: String,
+    pub unit: String,
+    pub normalized: f64,
+    pub display: String,
+    /// Number of gaps: zero is continuous, one is a two-state parameter.
+    pub step_count: u32,
+    pub read_only: bool,
+}
+
+impl LiveParameter {
+    /// Validate a manual edit and select the nearest canonical discrete value.
+    pub fn validate_edit(&self, normalized: f64) -> Result<f64, String> {
+        if self.read_only { return Err("VST3 parameter is read-only".into()); }
+        if !(0.0..=1.0).contains(&normalized) {
+            return Err("VST3 parameter value must be finite and in 0..=1".into());
+        }
+        Ok(if self.step_count == 0 { normalized }
+            else { (normalized * f64::from(self.step_count)).round() / f64::from(self.step_count) })
+    }
+}
+
 #[derive(Args, Clone, Debug, Default)]
 pub struct PluginArgs {
     /// Append a trusted stereo VST3 in processing order. For run or scene save, not scene run.
@@ -175,6 +201,24 @@ pub(crate) mod native;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn live_parameter_edits_are_normalized_and_respect_discrete_and_read_only_values() {
+        let parameter = LiveParameter { id: 3, name: "Mode".into(), unit: String::new(), normalized: 0.0,
+            display: "First".into(), step_count: 2, read_only: false };
+        for (requested, accepted) in [(0.0, 0.0), (0.24, 0.0), (0.26, 0.5), (0.74, 0.5), (0.76, 1.0), (1.0, 1.0)] {
+            assert_eq!(parameter.validate_edit(requested).unwrap(), accepted);
+        }
+        for value in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
+            assert!(parameter.validate_edit(value).is_err());
+        }
+        let continuous = LiveParameter { step_count: 0, ..parameter.clone() };
+        assert_eq!(continuous.validate_edit(0.371).unwrap(), 0.371);
+        let toggle = LiveParameter { step_count: 1, ..parameter.clone() };
+        assert_eq!(toggle.validate_edit(0.49).unwrap(), 0.0);
+        assert_eq!(toggle.validate_edit(0.51).unwrap(), 1.0);
+        assert!(LiveParameter { read_only: true, ..parameter }.validate_edit(0.0).unwrap_err().contains("read-only"));
+    }
 
     #[test]
     fn chain_selection_is_ordered_and_editor_indices_are_explicit() {

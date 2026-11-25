@@ -309,7 +309,7 @@ float headroom은 보존한다. limiter/출력 보호가 없는 현재 예제를
 - MiniFuse 모델/물리 채널과 Windows ASIO 구성은 실장비 연결 때 확인한다.
 - ASIO 배포 조건, virtual driver 서명·인증서, 상용 드라이버 재배포 계약은 별도 승인 대상.
 - SoundCraft/다른 코드 재사용은 license·고정 revision·테스트 범위를 실제 확인한 것만 반영한다.
-- DAW plugin, CLAP/AU, macOS/Linux, 탭 캡처, 자체 pitch correction, 장치 전체 자동 복구는
+- DAW plugin, CLAP/AU, macOS/Linux, 탭 캡처, 장치 전체 자동 복구는
   첫 요구를 완성한 뒤의 항목이다. 지금 추상화나 placeholder 구현으로 넣지 않는다.
 
 ## 12. 참고자료 — 2026-11-10 확인

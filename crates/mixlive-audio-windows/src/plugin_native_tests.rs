@@ -58,6 +58,24 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
     assert!(!worker.editor_is_open(0));
     assert!(worker.set_editor_open(2, true).is_err());
     assert!(!health.failed());
+    let parameters = worker.effect_parameters(1).unwrap();
+    let gain = parameters.iter().find(|parameter| parameter.id == 0).unwrap();
+    assert_eq!(gain.normalized, 0.25);
+    assert!(!gain.read_only);
+    assert!(!gain.display.is_empty());
+    assert!(worker.effect_parameters(2).is_err());
+    assert!(worker.set_effect_parameter(1, u32::MAX, 0.75).is_err());
+    for value in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
+        assert!(worker.set_effect_parameter(1, 0, value).is_err());
+    }
+    assert_eq!(worker.effect_parameters(1).unwrap().iter().find(|parameter| parameter.id == 0).unwrap().normalized, 0.25);
+    // A plugin's hidden flag excludes a parameter from both display and public edits.
+    worker.slots[1].parameters.as_mut().unwrap()[0].info.flags |= PARAMETER_HIDDEN;
+    assert!(worker.effect_parameters(1).unwrap().is_empty());
+    assert!(worker.set_effect_parameter(1, 0, 0.75).is_err());
+    worker.slots[1].parameters.as_mut().unwrap()[0].info.flags &= !PARAMETER_HIDDEN;
+    // Manual editing is allowed even if the plugin does not permit recorded automation.
+    worker.slots[1].parameters.as_mut().unwrap()[0].info.can_automate = false;
     for count in [1, 137, 256, 219, 923] {
         input.push(&vec![0.4; count], Some(&vec![[0.1, -0.2]; count]),
             &[&vec![[0.1, -0.05]; count], &vec![[0.04, 0.02]; count]]);
@@ -71,7 +89,8 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
     // Live trim reaches the same running worker. Editing the SECOND plugin
     // instance cannot alter the first or create another copy per output.
     controls.apply("vocal trim -6".parse().unwrap()).unwrap();
-    worker.slots[1].plugin.lock().unwrap().set_parameter(0, 0.75).unwrap();
+    let changed = worker.set_effect_parameter(1, 0, 0.75).unwrap();
+    assert_eq!(changed.iter().find(|parameter| parameter.id == 0).unwrap().normalized, 0.75);
     assert!((worker.slots[0].plugin.lock().unwrap().get_parameter(0).unwrap() - 0.5).abs() < 1e-6);
     input.push(&[0.4; 1536], Some(&[[0.1, -0.2]; 1536]),
         &[&[[0.1, -0.05]; 1536], &[[0.04, 0.02]; 1536]]);
@@ -181,7 +200,7 @@ fn native_editors_reopen_on_the_same_slots_and_detach_independently() {
         let _ = plugin.take_restart_flags();
         plugin.start_processing().unwrap();
         plugin.set_parameter(0, gain).unwrap();
-        Slot { plugin: Arc::new(Mutex::new(plugin)), editor: None, bypassed: Arc::new(AtomicBool::new(gain > 0.5)) }
+        Slot { plugin: Arc::new(Mutex::new(plugin)), editor: None, bypassed: Arc::new(AtomicBool::new(gain > 0.5)), parameters: None }
     }).collect();
     let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
         stopped: false, health: health.clone(), description: String::new() };
@@ -189,7 +208,16 @@ fn native_editors_reopen_on_the_same_slots_and_detach_independently() {
     let attached = |worker: &PluginWorker, index: usize| {
         worker.slots[index].plugin.lock().unwrap().get_parameter(1000).unwrap()
     };
+    let displayed = |worker: &mut PluginWorker, id| {
+        worker.effect_parameters(0).unwrap().iter().find(|parameter| parameter.id == id).unwrap().normalized
+    };
     assert_eq!(attached(&worker, 0), 0.0);
+    assert_eq!(displayed(&mut worker, 1000), 0.0);
+    // A processor-only report can differ from the controller. Refresh must preserve it,
+    // without replaying it into the actual plugin or losing controller-only probe updates.
+    update_parameter_feedback(&mut worker.slots[0].parameters, vec![(0, 0.42)]);
+    assert_eq!(displayed(&mut worker, 0), 0.42);
+    assert!((worker.slots[0].plugin.lock().unwrap().get_parameter(0).unwrap() - 0.23).abs() < 1e-6);
     worker.set_editor_open(0, true).unwrap();
     worker.set_editor_open(0, true).unwrap(); // idempotent; no replacement view
     worker.set_editor_open(1, true).unwrap();
@@ -200,10 +228,13 @@ fn native_editors_reopen_on_the_same_slots_and_detach_independently() {
     }
     assert_eq!(attached(&worker, 0), 1.0);
     assert_eq!(attached(&worker, 1), 1.0);
+    assert_eq!(displayed(&mut worker, 1000), 1.0);
+    assert_eq!(displayed(&mut worker, 0), 0.42);
     worker.set_editor_open(0, false).unwrap();
     assert!(!worker.editor_is_open(0) && worker.editor_is_open(1));
     assert_eq!(attached(&worker, 0), 0.0);
     assert_eq!(attached(&worker, 1), 1.0);
+    assert_eq!(displayed(&mut worker, 1000), 0.0);
     worker.set_editor_open(0, true).unwrap();
     assert!(mixlive_vst3::editor::pump_editor_messages());
     worker.poll().unwrap();
@@ -235,13 +266,26 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
             let mut plugin = load_effect(&spec, 48000).unwrap();
             let _ = plugin.take_restart_flags();
             plugin.start_processing().unwrap();
-            // A last edit with no subsequent audio block must survive in its own snapshot.
-            plugin.set_parameter(0, gain).unwrap();
-            slots.push(Slot { plugin: Arc::new(Mutex::new(plugin)), editor: None, bypassed: Arc::new(AtomicBool::new(gain > 0.5)) });
+            slots.push(Slot { plugin: Arc::new(Mutex::new(plugin)), editor: None, bypassed: Arc::new(AtomicBool::new(gain > 0.5)), parameters: None });
         }
-        if matches!(case, "partial-failure" | "snapshot-partial") { slots[1].plugin.lock().unwrap().stop_processing().unwrap(); }
-        let worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
+        let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
             stopped: false, health: health.clone(), description: String::new() };
+        // A last generic-panel edit with no subsequent audio block must survive its snapshot.
+        for (index, gain) in [0.23, 0.61].into_iter().enumerate() {
+            let parameters = worker.set_effect_parameter(index, 0, gain).unwrap();
+            assert!((parameters.iter().find(|parameter| parameter.id == 0).unwrap().normalized - gain).abs() < 1e-6);
+            if case == "save" {
+                assert!(parameters.iter().find(|parameter| parameter.id == 1000).unwrap().read_only);
+                assert!(worker.set_effect_parameter(index, 1000, 1.0).unwrap_err().contains("read-only"));
+                // The pinned fixture's three-way waveform uses native labels, not guessed units.
+                let changed = worker.set_effect_parameter(index, 1, 0.74).unwrap();
+                let waveform = changed.iter().find(|parameter| parameter.id == 1).unwrap();
+                assert_eq!(waveform.step_count, 2);
+                assert_eq!(waveform.normalized, 0.5);
+                assert_eq!(waveform.display, "Saw");
+            }
+        }
+        if matches!(case, "partial-failure" | "snapshot-partial") { worker.slots[1].plugin.lock().unwrap().stop_processing().unwrap(); }
         let path = directory.path().join(format!("{case}.json"));
         if case == "exists" { std::fs::write(&path, b"keep").unwrap(); }
         if matches!(case, "fault" | "snapshot-fault") { health.fail(Fault::Device); }
@@ -272,6 +316,7 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
                     assert!(spec.plugin.is_absolute());
                     let plugin = load_effect(spec, 48000).unwrap();
                     assert!((plugin.get_parameter(0).unwrap() - expected).abs() < 1e-6);
+                    if case == "save" { assert_eq!(plugin.get_parameter(1).unwrap(), 0.5); }
                 }
                 let wrong_class = EffectSpec { plugin: fixture("MIXLIVE_GAIN_VST3").plugin, ..setup.effects[0].clone() };
                 assert!(load_effect(&wrong_class, 48000).is_err());

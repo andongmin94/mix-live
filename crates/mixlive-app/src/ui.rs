@@ -15,11 +15,13 @@ use gpui_deck::{
     Button, Root, ScrollArea, Slider, SliderEvent, SliderState, SliderThumb, StyledExt as _, Switch,
 };
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
+use mixlive_audio_windows::plugin::LiveParameter;
 use mixlive_audio_windows::windows::device_catalog;
 use mixlive_effects::VocalParameter;
 
 use crate::{
     form::{FormEvent, SceneForm},
+    parameter_editor::{ParameterEditor, ParameterEvent},
     session::Session,
 };
 
@@ -60,6 +62,7 @@ impl FaderTarget {
     fn step(self) -> f32 {
         match self {
             Self::Vocal(VocalParameter::Strength | VocalParameter::ReverbMix | VocalParameter::EchoMix | VocalParameter::EchoFeedback) => 0.01,
+            Self::Vocal(VocalParameter::EqHpf) => 1.0,
             _ => 0.1,
         }
     }
@@ -71,6 +74,8 @@ impl FaderTarget {
             Self::Vocal(VocalParameter::CompressorRatio) => format!("{value:.1}:1"),
             Self::Vocal(VocalParameter::CompressorAttack | VocalParameter::CompressorRelease) => format!("{value:.1} ms"),
             Self::Vocal(VocalParameter::Compressor | VocalParameter::Deesser) => format!("{value:.1} dBFS"),
+            Self::Vocal(VocalParameter::EqHpf) => format!("{value:.0} Hz"),
+            Self::Vocal(VocalParameter::EqBody | VocalParameter::EqPresence | VocalParameter::EqAir) => format!("{value:+.1} dB"),
             _ => format!("{value:.1} dB"),
         }
     }
@@ -88,6 +93,8 @@ enum Operation {
     Stop,
     StopAndSave(PathBuf),
     Editor { index: usize, open: bool },
+    Parameters { index: usize },
+    SetParameter { index: usize, id: u32, normalized: f64 },
     Close,
 }
 
@@ -101,6 +108,8 @@ pub struct MixLive {
     subscriptions: Vec<Subscription>,
     form: Option<Entity<SceneForm>>,
     form_subscription: Option<Subscription>,
+    parameter_editor: Option<Entity<ParameterEditor>>,
+    parameter_subscription: Option<Subscription>,
     workspace_scroll: ScrollHandle,
 }
 
@@ -182,6 +191,8 @@ impl MixLive {
             subscriptions: Vec::new(),
             form: None,
             form_subscription: None,
+            parameter_editor: None,
+            parameter_subscription: None,
             workspace_scroll: ScrollHandle::new(),
         }
     }
@@ -206,6 +217,8 @@ impl MixLive {
                     match result {
                         Ok(Ok(Some(paths))) => {
                             if let Some(path) = paths.into_iter().next() {
+                                this.parameter_editor = None;
+                                this.parameter_subscription = None;
                                 let _ = this.session.open(path);
                                 this.selected_name = scene_name(&this.session);
                                 this.workspace_scroll.set_offset(Default::default());
@@ -223,6 +236,8 @@ impl MixLive {
     }
 
     fn install_form(&mut self, form: Entity<SceneForm>, window: &Window, cx: &mut Context<Self>) {
+        self.parameter_editor = None;
+        self.parameter_subscription = None;
         self.form_subscription =
             Some(
                 cx.subscribe_in(&form, window, |this, form, event, window, cx| match event {
@@ -361,6 +376,27 @@ impl MixLive {
         .detach();
     }
 
+    fn install_parameters(&mut self, index: usize, parameters: Vec<LiveParameter>, window: &mut Window, cx: &mut Context<Self>) {
+        let already_open = self.parameter_editor.as_ref().is_some_and(|editor| editor.read(cx).index == index);
+        let selected = self.parameter_editor.as_ref().filter(|editor| editor.read(cx).index == index)
+            .and_then(|editor| editor.read(cx).selected_id(cx));
+        let editor = cx.new(|cx| ParameterEditor::new(index, parameters, selected, window, cx));
+        self.parameter_subscription = Some(cx.subscribe_in(&editor, window, move |this, _, event, window, cx| {
+            match event {
+                ParameterEvent::Refresh => this.perform(Operation::Parameters { index }, window, cx),
+                ParameterEvent::Apply { id, normalized } => this.perform(Operation::SetParameter { index, id: *id, normalized: *normalized }, window, cx),
+                ParameterEvent::Close if this.busy.is_none() => {
+                    this.parameter_editor = None;
+                    this.parameter_subscription = None;
+                    cx.notify();
+                }
+                ParameterEvent::Close => {}
+            }
+        }));
+        self.parameter_editor = Some(editor);
+        if !already_open { self.workspace_scroll.set_offset(Default::default()); }
+    }
+
     fn perform(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
@@ -377,8 +413,8 @@ impl MixLive {
         {
             return;
         }
-        let editor_only = matches!(operation, Operation::Editor { .. });
-        if editor_only && (!self.session.running() || self.picking) {
+        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. });
+        if live_operation && (!self.session.running() || self.picking) {
             return;
         }
         self.busy = Some(match &operation {
@@ -387,15 +423,22 @@ impl MixLive {
             Operation::Stop | Operation::Close => "정지 중",
             Operation::StopAndSave(_) => "정지 및 저장 중",
             Operation::Editor { .. } => "VST3 원본 창 변경 중",
+            Operation::Parameters { .. } => "VST3 파라미터 조회 중",
+            Operation::SetParameter { .. } => "VST3 파라미터 적용 중",
         });
-        if !editor_only {
+        if !live_operation {
             self.faders.clear();
             self.subscriptions.clear();
+            self.parameter_editor = None;
+            self.parameter_subscription = None;
+        } else if let Some(editor) = &self.parameter_editor {
+            editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
         let mut session = std::mem::take(&mut self.session);
         cx.notify();
         cx.spawn_in(window, async move |owner, cx| {
             // These synchronous native calls MUST be outside App/entity update.
+            let mut parameters = None;
             let catalog = match &operation {
                 Operation::Devices | Operation::EditDevices => {
                     Some(device_catalog().map_err(|error| error.to_string()))
@@ -406,6 +449,14 @@ impl MixLive {
                 }
                 Operation::Editor { index, open } => {
                     let _ = session.set_editor_open(*index, *open);
+                    None
+                }
+                Operation::Parameters { index } => {
+                    parameters = Some((*index, session.effect_parameters(*index)));
+                    None
+                }
+                Operation::SetParameter { index, id, normalized } => {
+                    parameters = Some((*index, session.set_effect_parameter(*index, *id, *normalized)));
                     None
                 }
                 Operation::StopAndSave(path) => {
@@ -444,7 +495,12 @@ impl MixLive {
                             }
                         }
                     }
-                    if !editor_only {
+                    if let Some((index, Ok(parameters))) = parameters {
+                        this.install_parameters(index, parameters, window, cx);
+                    } else if let Some(editor) = &this.parameter_editor {
+                        editor.update(cx, |editor, cx| editor.set_busy(false, window, cx));
+                    }
+                    if !live_operation {
                         this.install_faders(cx);
                     }
                     cx.notify();
@@ -875,6 +931,14 @@ impl MixLive {
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.perform(Operation::Editor { index, open }, window, cx);
                                     }))
+                            }))
+                            .children(self.session.running().then(|| {
+                                button(("vst3-parameters", index), "파라미터 편집", false)
+                                    .accessibility_label(format!("VST3 {} 파라미터 편집", index + 1))
+                                    .disabled(self.busy.is_some() || self.picking)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.perform(Operation::Parameters { index }, window, cx);
+                                    }))
                             })),
                     ),
             );
@@ -999,6 +1063,7 @@ impl MixLive {
         let controls = self.session.controls().expect("running session");
         let config = controls.vocal_config();
         let mut fields = div().flex().flex_wrap().gap_4();
+        let mut eq_fields = div().flex().flex_wrap().gap_4();
         for parameter in controls.vocal_parameters() {
             let label = match parameter {
                 VocalParameter::Trim => "입력 trim",
@@ -1013,11 +1078,18 @@ impl MixLive {
                 VocalParameter::CompressorAttack => "컴프레서 attack",
                 VocalParameter::CompressorRelease => "컴프레서 release",
                 VocalParameter::DeesserMaximum => "디에서 최대 감쇠",
+                VocalParameter::EqHpf => "하이패스 주파수",
+                VocalParameter::EqBody => "저역 · 180 Hz",
+                VocalParameter::EqPresence => "존재감 · 2.8 kHz",
+                VocalParameter::EqAir => "고역 · 7.5 kHz",
             };
-            fields = fields.child(div().min_w(px(250.)).flex_1().flex().flex_col().gap_1()
+            let is_eq = matches!(parameter, VocalParameter::EqHpf | VocalParameter::EqBody | VocalParameter::EqPresence | VocalParameter::EqAir);
+            let field = div().min_w(px(if is_eq { 180. } else { 250. })).flex_1().flex().flex_col().gap_1()
                 .child(div().text_sm().font_semibold().child(label))
                 .child(self.fader(("vocal-param", parameter as usize), &format!("실시간 {label}"),
-                    FaderTarget::Vocal(parameter), controls.vocal_value(parameter), cx)));
+                    FaderTarget::Vocal(parameter), controls.vocal_value(parameter), cx));
+            if is_eq { eq_fields = eq_fields.child(field); }
+            else { fields = fields.child(field); }
         }
         let hint = if config.preset == mixlive_effects::Preset::Off {
             "EQ/다이내믹스 프리셋이 꺼져 있습니다. 정지 후 프리셋을 선택하면 EQ/다이내믹스를 조절할 수 있습니다."
@@ -1029,10 +1101,16 @@ impl MixLive {
                 .child(div().font_semibold().child("실시간 보컬 보정"))
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child(format!("{} · pre-delay {:.1} ms · echo {:.1} ms", config.preset, config.reverb.predelay_ms, config.echo.time_ms))))
+            .children((config.preset != mixlive_effects::Preset::Off).then(|| div().flex().flex_col().gap_3()
+                .pb_4().border_b_1().border_color(rgb(BORDER))
+                .child(div().text_sm().font_semibold().child("실시간 EQ"))
+                .child(eq_fields)
+                .child(div().text_xs().text_color(rgb(MUTED))
+                    .child("하이패스는 절대 주파수입니다. 저역·존재감·고역은 선택한 프리셋의 EQ에 더하는 값입니다."))))
             .child(fields)
             .child(div().text_xs().text_color(rgb(MUTED)).child(hint))
             .child(div().text_xs().text_color(rgb(MUTED))
-                .child("프리셋과 EQ, pre-delay, 에코 시간은 정지 상태에서 변경합니다. 조절값은 약 10 ms 전환 후 반영되며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
+                .child("프리셋, pre-delay, 에코 시간은 정지 상태에서 변경합니다. 조절값은 약 10 ms에 걸쳐 반영되며, 정지 후 새 Scene 저장으로 보존할 수 있습니다."))
     }
 
     fn mixer(&self, cx: &Context<Self>) -> gpui::AnyElement {
@@ -1334,6 +1412,11 @@ impl Render for MixLive {
         if let Some(form) = &self.form {
             body = body.child(form.clone());
         } else {
+            if self.session.running()
+                && let Some(editor) = &self.parameter_editor
+            {
+                body = body.child(editor.clone());
+            }
             body = body.child(self.scene_summary(cx));
             if self.session.running() {
                 body = body.child(self.mixer(cx));

@@ -511,6 +511,46 @@ fn live_vocal_controls_reach_the_audio_thread_without_touching_other_sources() {
 }
 
 #[test]
+fn live_eq_reaches_both_voice_sends_and_leaves_aux_and_app_audio_unchanged() {
+    let config = VocalConfig { preset: Preset::Warm, compressor_threshold_db: 0.0,
+        deess_threshold_db: 0.0, ..VocalConfig::default() };
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, config).unwrap());
+    for command in ["route aux broadcast on", "route app1 broadcast on"] {
+        controls.apply(command.parse().unwrap()).unwrap();
+    }
+    let (writer, _reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
+        vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
+    let input: Vec<f32> = (0..8192).map(|i| (std::f32::consts::TAU * 180.0 * i as f32 / 48000.0).sin() * 0.05).collect();
+    let aux = vec![[0.125, -0.25]; input.len()];
+    let app = vec![[-0.0625, 0.125]; input.len()];
+    capture.push(&input[..4096], Some(&aux[..4096]), &[&app[..4096]]);
+    let before = capture.engine.output(0).unwrap().sample_peak();
+    for command in ["vocal eq-hpf 140", "vocal eq-body -6", "vocal eq-presence 3", "vocal eq-air 2"] {
+        controls.apply(command.parse().unwrap()).unwrap();
+    }
+    for start in (4096..input.len()).step_by(137) {
+        let end = (start + 137).min(input.len());
+        capture.push(&input[start..end], Some(&aux[start..end]), &[&app[start..end]]);
+    }
+    assert!(!health.failed());
+    assert_eq!(capture.vocal.config().eq, controls.vocal_config().eq);
+    let mut expected = vec![0.0; input.len()];
+    VocalChain::new(48000, controls.vocal_config()).unwrap()
+        .process(&input, &mut expected, &mut vec![0.0; input.len()]).unwrap();
+    let monitor = capture.engine.output(0).unwrap();
+    let broadcast = capture.engine.output(1).unwrap();
+    assert!(monitor.sample_peak() < before * 0.7);
+    for (i, &voice) in expected[input.len() - monitor.left.len()..].iter().enumerate() {
+        assert!((monitor.left[i] - voice).abs() < 1e-5);
+        assert_eq!(monitor.left[i], monitor.right[i]);
+        assert!((broadcast.left[i] - voice - 0.0625).abs() < 1e-5);
+        assert!((broadcast.right[i] - voice + 0.125).abs() < 1e-5);
+    }
+}
+
+#[test]
 fn supplemental_trim_ramps_once_before_send_delay_and_keeps_input_meters_raw() {
     let health = Arc::new(Health::default());
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 2, VocalConfig::default()).unwrap());

@@ -97,6 +97,7 @@ VST3는 **설치된 VST3 검색**에서 표준 설치 경로의 후보를 골라
 - AUX/MR·앱별 공통 입력 trim(-96..0 dB). 입력 peak는 trim 전이며, 소스 trim은
   약 5 ms sample ramp로 적용하고 모든 연결된 목적지에 동일하게 반영한다. 장치·VST3는 다시 열지 않는다.
 - 라이브 보컬 trim·보정 비율·컴프레서/디에서 threshold·ratio·attack/release·최대 감쇠·리버브 비율·잔향 시간·에코 비율·피드백 슬라이더.
+  **실시간 EQ**에서 HPF(40..200 Hz)와 180/2800/7500 Hz 밴드의 프리셋 대비 gain(±6 dB)도 조절한다.
   EQ/다이내믹스 프리셋이 off이면 trim과 리버브·에코만 표시한다.
 - 실제 마이크 입력·내장 보정 후·전체 보컬 체인 후·AUX 입력·앱별 입력과 모니터/통화/방송 sample peak.
   약 100ms 간격의 최대값을 dBFS로 표시한다. 소스 peak는 mute 전, AUX와 앱은 입력 trim 전이며
@@ -114,7 +115,7 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 저장된 전체/믹스별 음량, AUX/앱 입력 trim, 소스·출력·전체 mute, 모든 경로의 연결·gain, 라이브 보컬 파라미터와 VST3 우회·상태는 다음 명시적 시작부터
 적용된다. 초기 mute는 스트림 시작 전에 복원한다. 오류·상태 수집 실패·기존 파일 충돌 시 이전 Scene 선택을
 유지하고 새 파일을 게시하지 않는다. 일반 정지/창 닫기는 저장하지 않는다.
-장치·출력, 음정 설정, EQ 계수와 프리셋, 리버브 pre-delay, 에코 시간 및 VST3 체인 순서 편집은 정지 상태에서만 제공한다.
+장치·출력, 음정 설정, 프리셋, 리버브 pre-delay, 에코 시간 및 VST3 체인 순서 편집은 정지 상태에서만 제공한다.
 실행 중 보컬 체인의 각 VST3 슬롯에서 **우회 켜기/끄기** 및 **원본 창 열기/닫기**를 선택할 수 있다.
 우회는 해당 슬롯의 신고 지연만큼 정렬한 dry 신호로 약 5 ms 교차 전환한다. 다른 슬롯과 PDC는
 유지하며 모든 native 효과는 계속 처리한다(CPU 절감이나 음량 일치 A/B가 아니다).
@@ -124,6 +125,15 @@ GPUI 객체의 변경 참조를 유지하지 않는다. 플러그인 자체의 c
 플러그인은 오류를 표시하며 해당 요청만 거절한다. GPUI가 메시지 루프를 소유하고 native
 창 조작은 UI 변경 참조 밖의 foreground 스레드에서 실행한다. 일반 정지/저장 후 정지는 모든
 원본 창을 닫으며, 저장을 선택한 경우 마지막 상태도 보존한다.
+원본 창 유무와 관계없이 슬롯의 **파라미터 편집** 버튼으로 같은 실행 인스턴스의 값을 조절할 수 있다.
+목록에서 파라미터를 고르고 선택 위치를 움직인 뒤 **적용**을 누른다. 슬라이더를 움직이는 동안에는
+미적용 값만 바뀌며, 적용할 때 선택한 값 하나를 전달한다. 표시 문자열과 단위는 플러그인에서 읽고,
+선택 위치의 비율을 임의의 Hz/dB 값으로 환산하지 않는다. 이산 파라미터는 플러그인의 단계 수에 맞춘다.
+읽기 전용 값은 표시만 하고 숨김 파라미터는 목록에서 제외한다. **새로고침**은 원본 창/processor의
+피드백을 포함한 값을 다시 조회하며, 다른 파라미터 선택과 함께 미적용 값을 버린다. 패널 닫기는 오디오를
+정지하지 않는다. 변경값은 기존 **정지 후 새 Scene 저장** 경로로 보존하며 Scene 형식은 13 그대로다.
+조회·포맷·편집은 foreground에서 수행한다. 기존 native host의 공유 mutex와 파라미터 큐 제약은 남으므로
+연속 자동화·hard-real-time 전달 보장을 추가한 기능은 아니다.
 표시된 endpoint 채널은 WASAPI 채널이고, 신고된 queue/plugin 지연은 실측 왕복 지연이 아니다.
 
 GPUI Deck은 [고정 revision](https://github.com/andongmin94/gpui-deck/tree/78c0898ccb6feba03e3a3243ac7d4729fd80aee6)의
@@ -177,11 +187,14 @@ unity에 복귀한다. 채널별 개별 클리핑 대신 gain을 낮추지만 �
 | `--broadcast-gain-db 0` | 방송 초기 추가 감쇠 -96..0 dB |
 
 자동 makeup gain은 없다. A/B 청취의 원본/보정 음량은 따로 맞춘다. 프리셋은 32..192 kHz,
-off는 8..192 kHz를 받는다. 음정 설정, 프리셋, EQ 계수와 리버브 pre-delay, 에코 시간은 실행 중 고정이며, 나머지 열두 보컬
+off는 8..192 kHz를 받는다. 음정 설정, 프리셋, 리버브 pre-delay, 에코 시간은 실행 중 고정이며, 나머지 열여섯 보컬
 파라미터는 실행 중에도 조절할 수 있다. 각 대상값은 블록 경계에서 읽고 처리 clock의 약 10 ms
 sample ramp를 적용한다. trim은 선형 gain, 보정/리버브 비율은 blend, threshold는 dB,
 ratio와 디에서 최대 감쇠는 요청값, attack/release는 envelope coefficient를 전환한다.
 decay는 각 FDN feedback gain을 전환하며, 에코의 blend와 feedback도 독립적으로 전환한다. 콜백 안에서 버퍼를 만들거나 VST3를 다시 로드하지 않는다.
+EQ는 기존 biquad의 Direct Form I 필터를 사용한다. 바뀐 밴드의 목표 계수만 계산하고 정규화된 계수를
+10 ms 동안 전환하며 입력·출력 이력을 유지한다. 추가 delay buffer는 없고, 동일 목표값을 다시 읽어도
+진행 중인 전환을 재시작하지 않는다. 저장 시에는 전환 중간값이 아닌 요청된 HPF/EQ 값을 보존한다.
 보정 비율 0에서도 선택한 EQ/다이내믹스 상태를 유지하며, 리버브 0에서도 room 이력을 갱신한다.
 따라서 처음 꺼 둔 리버브를 실행 중 켤 수 있고 다시 켤 때 정지된 과거 이력을 재생하지 않는다.
 이 구조는 off 상태에서도 내부 DSP 비용이 들며, 실제 장비 CPU/청취 지연은 미측정이다.
@@ -221,7 +234,8 @@ control thread에서 RustFFT 6.4.1의 자기상관과 정확한 중첩구간 에
 표시용 분석 자체는 오디오를 변경하지 않고 지연도 넣지 않는다. 별도로 `--pitch-correction 0.75 --pitch-retune-ms 20`을
 설정하면 마이크에 실험적 mono 자동 음정 보정이 활성화된다. 기존 RustFFT와 같은 음높이 검출식을 재사용하며
 sqrt-Hann 4-overlap phase vocoder로 샘플 수를 유지하면서 주파수를 이동한다. 목표 보정 강도와
-retune smoothing은 정지 상태에서 선택하고 조성과 함께 저장한다. 음정이 검출되지 않는 frame은
+retune smoothing은 정지 상태에서 선택하고 조성과 함께 저장한다. 새 유성 구간은 처음 검출한 목표로
+시작하고, 이어지는 유성 프레임 사이의 목표 변화에 retune을 적용한다. 음정이 검출되지 않는 frame은
 동일 지연의 dry 신호를 사용하고 앞 frame의 보정 차분은 overlap-add로 사라진다. 검출창 크기만큼
 고정 지연이 생긴다(48 kHz에서 2048 samples, 약 42.67 ms). 강도 0은 처리기 자체를 준비하지 않으므로
 추가 지연이 없다. 기존 통화·방송 보상에 이 지연을 합산하고 모니터에는 추가 AUX/app 보상을 하지 않는다.
@@ -334,6 +348,8 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또�
 | `trim aux -12`, `trim app1 -6` | AUX/앱 전체 입력 trim -96..0 dB |
 | `bypass 1 on`, `bypass 1 off` | 1번 VST3 슬롯의 지연 정렬 우회/효과 적용 |
 | `vocal trim -3`, `vocal strength 0.75` | 입력 trim(dB) / EQ·다이내믹스 blend(0..1) |
+| `vocal eq-hpf 95` | 하이패스 주파수(40..200 Hz) |
+| `vocal eq-body -2`, `vocal eq-presence 1.5`, `vocal eq-air 3` | 180/2800/7500 Hz EQ의 프리셋 대비 gain(±6 dB) |
 | `vocal compressor -28`, `vocal deesser -35` | threshold(-60..0 dBFS) |
 | `vocal ratio 3.5`, `vocal attack 5`, `vocal release 220`, `vocal deess-max 7` | ratio / attack·release(ms) / 디에서 최대 감쇠(dB) |
 | `vocal reverb 0.15`, `vocal decay 1.5` | room blend(0..1) / 명목 잔향 시간(0.2..5초) |
@@ -342,7 +358,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. 직접 `run` 또�
 
 일반형은 `route mic|aux|appN output|send|broadcast on|off`, `level mic|aux|appN output|send|broadcast <dB>`다. `appN`은 1부터 시작하는 현재 앱 슬롯이다.
 `vocal` 명령의 값 범위는 시작 옵션과 같다. off 프리셋의 EQ/다이내믹스 관련 라이브 제어는 거절하며,
-EQ 계수, pre-delay, 에코 시간 및 프리셋 전환은 실행 중 지원하지 않는다.
+pre-delay, 에코 시간 및 프리셋 전환은 실행 중 지원하지 않는다.
 꺼둔 경로의 level 변경은 켜짐이 아니고 전체 unmute도 개별 mute를 풀지 않는다.
 AUX/앱 trim은 입력 timeline에서 PDC 전에 적용되며, mute/경로별 gain은 PDC 뒤에서 적용된다.
 마이크는 `vocal trim`으로 조절한다. Scene 저장은 목표 trim을 기존 필드에 보존한다.

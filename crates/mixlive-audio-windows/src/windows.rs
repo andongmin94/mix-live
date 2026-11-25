@@ -183,7 +183,7 @@ impl Prepared {
                 index + 1, target.pid, map.left + 1, map.right + 1));
         }
         text.push_str(&format!("Initial mixer: {}\n", self.controls.describe()));
-        text.push_str("Pitch settings, vocal preset, EQ coefficients, reverb pre-delay, echo time and device bindings are fixed for this run. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
+        text.push_str("Pitch settings, vocal preset, reverb pre-delay, echo time and device bindings are fixed for this run. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
         text
     }
 
@@ -417,6 +417,18 @@ impl Active {
     pub fn set_editor_open(&mut self, index: usize, open: bool) -> Result<()> {
         let worker = self.plugin_worker.as_mut().ok_or("no active VST3 chain")?;
         Ok(worker.set_editor_open(index, open)?)
+    }
+
+    /// Explicit foreground query; never call native metadata/formatting from a UI render.
+    pub fn effect_parameters(&mut self, index: usize) -> Result<Vec<crate::plugin::LiveParameter>> {
+        let worker = self.plugin_worker.as_mut().ok_or("no active VST3 chain")?;
+        Ok(worker.effect_parameters(index)?)
+    }
+
+    /// Edit the running instance; the next audio block consumes the normalized parameter.
+    pub fn set_effect_parameter(&mut self, index: usize, id: u32, normalized: f64) -> Result<Vec<crate::plugin::LiveParameter>> {
+        let worker = self.plugin_worker.as_mut().ok_or("no active VST3 chain")?;
+        Ok(worker.set_effect_parameter(index, id, normalized)?)
     }
 
     /// Explicit normal completion. Stop all devices before joining/snapshotting the plugin.

@@ -3,7 +3,7 @@
 
 use mixlive_audio_windows::{
     control::{LiveCommand, LiveControls},
-    plugin::PluginArgs,
+    plugin::{LiveParameter, PluginArgs},
     scene::AudioScene,
     windows::{Active, LevelReadings, Prepared},
 };
@@ -168,6 +168,36 @@ impl Session {
 
     pub fn editor_is_open(&self, index: usize) -> bool {
         self.active.as_ref().is_some_and(|active| active.editor_is_open(index))
+    }
+
+    /// Native controller access must stay outside App/entity update, like original editors.
+    pub fn effect_parameters(&mut self, index: usize) -> Result<Vec<LiveParameter>, String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 시작 후 파라미터를 확인할 수 있습니다.", "audio is not running");
+        };
+        match active.effect_parameters(index) {
+            Ok(parameters) => {
+                self.error = None;
+                self.message = format!("VST3 {} 파라미터 조회 · 오디오 실행 중", index + 1);
+                Ok(parameters)
+            }
+            Err(error) => self.fail("VST3 파라미터를 읽지 못했습니다.", error),
+        }
+    }
+
+    /// Submit exactly one explicit edit and read back the same active instance.
+    pub fn set_effect_parameter(&mut self, index: usize, id: u32, normalized: f64) -> Result<Vec<LiveParameter>, String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 실행 중에만 파라미터를 적용할 수 있습니다.", "audio is not running");
+        };
+        match active.set_effect_parameter(index, id, normalized) {
+            Ok(parameters) => {
+                self.error = None;
+                self.message = format!("VST3 {} 파라미터 적용 · 오디오 실행 중", index + 1);
+                Ok(parameters)
+            }
+            Err(error) => self.fail("VST3 파라미터 적용 또는 결과 조회 중 오류가 발생했습니다. 새로고침으로 값을 확인하세요.", error),
+        }
     }
 
     /// Call outside a mutable GPUI update. An unavailable editor is not an audio-path fault.
@@ -341,6 +371,8 @@ mod tests {
         assert!(session.controls().is_none());
         assert!(!session.editor_is_open(0));
         assert!(session.set_editor_open(0, true).is_err());
+        assert!(session.effect_parameters(0).is_err());
+        assert!(session.set_effect_parameter(0, 0, 0.5).is_err());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("no-live-scene.json");
         assert!(session.stop_and_save(path.clone()).is_err());

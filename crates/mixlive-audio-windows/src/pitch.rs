@@ -1,7 +1,7 @@
 //! Non-intrusive microphone pitch observation. The audio callback publishes complete
 //! contiguous windows into a bounded SPSC queue for the display estimator.
 //! The optional correction processor also reuses the preallocated Estimator on its audio path.
-//! No voice modification, note correction, file output or additional audio-path latency.
+//! The display observer does not modify audio, write files or add audio-path latency.
 //! Normalized square difference: McLeod & Wyvill, "A Smarter Way to Find Pitch" (2005).
 //! Use FFT autocorrelation and exact overlapping energies, not an FFT-scaled denominator.
 use crate::config::PitchScale;
