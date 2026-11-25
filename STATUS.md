@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실험적 음정 보정 병합 · 라이브 EQ와 VST3 파라미터 편집 통합 검증**
+단계: **실험적 음정 보정 · 라이브 EQ · VST3 파라미터 편집 main 병합**
 
 ## 현재 구현
 
@@ -88,23 +88,24 @@
 
 ## 검증
 
-- [Audio #46](https://github.com/andongmin94/mix-live/actions/runs/45587784385) `d3bc037` 전체 성공:
-  음정 보정의 합성 주파수 이동·강도·스케일·처리 길이·무성음 지연·블록 경계·송출 PDC,
-  workspace/실제 native VST3 fixture, Clippy, locked Windows release 빌드, CLI 및 실제 GPUI
-  Scene 편집·취소·저장·재열기 검사 통과. PR #2를 `main`에 병합했다.
-  실제 노래 청취·포먼트·장치 지연/CPU 검증은 아니다.
+- [Audio #49](https://github.com/andongmin94/mix-live/actions/runs/45602634932) `25daa2d` 전체 성공:
+  Windows workspace 검사 130개와 실제 native VST3 fixture 검사 11개, 총 **141개 성공**.
+  Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
+  CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
+  PR #3의 병합 tree가 검증한 source tree와 동일함을 확인했다.
+- 이번 변경에서 라이브 EQ의 주파수 응답·전환 연속성·목표 재변경·처리 블록 독립성·
+  32/48/192 kHz 유한 출력, 마이크 send 반영과 AUX/앱 격리, 반복 Scene snapshot/JSON
+  저장을 검사했다. VST3 공통 편집은 실제 출력 변화·슬롯 독립성·이산값·읽기 전용 거절,
+  controller-only 값 새로고침·processor 피드백 보존·마지막 편집 후 상태 저장/복원을 검사했다.
+  앞선 음정 보정/limiter와 Scene 13 검사도 같은 Windows 묶음에서 통과했다.
+- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45602634932/artifacts/15015708424):
+  `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe`와 의존성/라이선스 고지.
+  실장비 라이브 패널 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
 - [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) `08d0007` 성공:
   세 고정 INF/PnP ID, transport 격리, WDK/INF/unsigned catalog 및 미서명 거절·부재 검사 완료.
   드라이버 서명·실제 설치/로드/제거, WASAPI 장치 노출 및 실제 Call/Broadcast/Return 오디오는 미검증이다.
-- 이번 라이브 EQ 변경: 로컬 `cargo test -p mixlive-effects --locked` 20개 성공.
-  실제 주파수 응답 변화, 전환 연속성, 목표 재변경, 처리 블록 독립성, 32/48/192 kHz의 유한 출력 검증.
-  `live_eq` capture 검사와 보컬 파라미터 검증/Scene snapshot·JSON roundtrip 검사도 각각 성공했다.
-- 공통 VST3 편집에는 실제 gain fixture의 출력 변화/슬롯 독립성, state fixture의 이산값·읽기 전용
-  거절 및 마지막 편집 후 state 저장/복원, native 창의 controller-only 값 새로고침과 processor 피드백
-  보존 검사를 추가했다. portable 파라미터 검증 검사 1개는 로컬에서 성공했다.
-  Linux library Clippy는 Windows 호출부가 제외된 기존 항목의 dead_code 경고로 종료됐다.
-  이 변경 묶음의 지원 플랫폼 Windows CI는 아직 실행 전이다.
-  실장비를 여는 라이브 패널 조작과 상용 VST3 호환성은 검증하지 않았다.
+- 로컬 DSP/변경 경로 검사는 통과했다. Linux library Clippy는 Windows 전용 호출부가
+  제외된 기존 항목의 dead_code 경고로 종료됐다. 지원 플랫폼 Windows의 엄격한 Clippy는 위 CI에서 통과했다.
 
 ## 남은 작업과 제한
 
