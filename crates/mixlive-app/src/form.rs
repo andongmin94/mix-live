@@ -11,6 +11,7 @@ use gpui_deck::{
 };
 use mixlive_audio_windows::{
     config::RouteOptions,
+    control::MixSettings,
     devices::{DeviceCatalog, DeviceInfo},
     scene::AudioScene,
 };
@@ -54,6 +55,7 @@ struct DeviceSetup {
     send_gain: Entity<InputState>,
     aux_gain: Entity<InputState>,
     queue_ms: Entity<InputState>,
+    mix: MixSettings,
 }
 
 enum Setup {
@@ -61,7 +63,7 @@ enum Setup {
         fields: Box<DeviceSetup>,
         editing: bool,
     },
-    Sound(RouteOptions),
+    Sound(Box<RouteOptions>),
 }
 
 pub struct SceneForm {
@@ -137,6 +139,7 @@ impl SceneForm {
                     SelectItem::new("send", "추가 송출에만"),
                     SelectItem::new("output", "주 출력에만"),
                     SelectItem::new("both", "두 출력 모두"),
+                    SelectItem::new("off", "어느 출력에도 보내지 않음"),
                 ],
                 cx,
             )
@@ -204,6 +207,7 @@ impl SceneForm {
             send_gain,
             aux_gain,
             queue_ms,
+            mix: draft.mix,
         };
         fields.set_busy(false, window, cx);
         Self {
@@ -223,7 +227,7 @@ impl SceneForm {
         let sound = cx.new(|cx| SoundEditor::new(SoundDraft::from_scene(scene), window, cx));
         let subscription = cx.observe(&sound, |_, _, cx| cx.notify());
         Self {
-            setup: Setup::Sound(scene.route.clone()),
+            setup: Setup::Sound(Box::new(scene.route.clone())),
             sound,
             busy: false,
             error: None,
@@ -287,6 +291,7 @@ impl DeviceSetup {
             send_gain_db: self.send_gain.read(cx).value().to_string(),
             aux_gain_db: self.aux_gain.read(cx).value().to_string(),
             queue_ms: self.queue_ms.read(cx).value().to_string(),
+            mix: self.mix,
             sound,
         }
         .build(&self.catalog)

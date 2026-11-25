@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use crate::control::MixSettings;
 use mixlive_effects::{Preset, VocalConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -60,10 +61,10 @@ pub enum SceneCommand {
 /// Which existing mix receives AUX. Send-only avoids replaying MR already heard elsewhere.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
-pub enum AuxDestination { Output, Send, Both }
+pub enum AuxDestination { Off, Output, Send, Both }
 impl AuxDestination {
     pub fn includes(self, mix: usize) -> bool {
-        match self { Self::Output => mix == 0, Self::Send => mix == 1, Self::Both => mix < 2 }
+        match self { Self::Off => false, Self::Output => mix == 0, Self::Send => mix == 1, Self::Both => mix < 2 }
     }
 }
 
@@ -143,6 +144,9 @@ pub struct RouteOptions {
     /// Target per-endpoint queue depth, not round-trip latency or a hardware buffer size.
     #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(10..=100))]
     pub queue_ms: u32,
+    /// Explicit initial mixer state in the Scene. Direct CLI runs use the normal defaults.
+    #[arg(skip)]
+    pub mix: Box<MixSettings>,
 }
 
 impl RouteOptions {
@@ -178,6 +182,7 @@ impl RouteOptions {
             return Err("AUX gain must be finite and between -96 and 0 dB".into());
         }
         self.vocal_config().validate().map_err(|e| e.to_string())?;
+        self.mix.validate()?;
         for db in [self.output_gain_db, self.send_gain_db] {
             if !db.is_finite() || !(-96.0..=0.0).contains(&db) {
                 return Err("output/send gain must be finite and between -96 and 0 dB".into());

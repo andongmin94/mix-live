@@ -1,4 +1,4 @@
-//! Device/vocal settings and the ordered VST3 chain in one explicit startup scene.
+//! Device/vocal/mixer settings and the ordered VST3 chain in one explicit startup scene.
 //! Reading/saving a scene never loads native plugins or opens an audio device.
 
 use crate::{config::RouteOptions, plugin::{EffectSpec, validate_effects}};
@@ -23,7 +23,7 @@ impl AudioScene {
         // CLI paths refer to the current working directory, not a future scene directory.
         // absolute() does not require the plugin to be present or execute its native code.
         for effect in &mut effects { effect.plugin = std::path::absolute(&effect.plugin)?; }
-        Ok(Self { schema: 3, route, effects })
+        Ok(Self { schema: 4, route, effects })
     }
 
     /// Relative paths in a hand-authored scene are anchored to that scene, never the caller's cwd.
@@ -39,7 +39,7 @@ impl AudioScene {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != 3 { return Err("unsupported MixLive scene schema; create a schema 3 scene".into()); }
+        if self.schema != 4 { return Err("unsupported MixLive scene schema; create a schema 4 scene".into()); }
         self.route.validate()?;
         validate_effects(&self.effects)?;
         Ok(())
@@ -105,6 +105,41 @@ mod tests {
     }
 
     #[test]
+    fn live_mix_snapshot_roundtrips_and_starts_muted_from_the_first_frame() {
+        use crate::control::{LiveControls, PlaybackGains, MuteTarget, RouteSource, RouteMix};
+        use std::sync::Arc;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot.json");
+        let mut route = route();
+        route.aux_input = Some("aux".into());
+        let controls = LiveControls::from_route(&route).unwrap();
+        for command in ["mute all", "mute mic", "mute send", "gain master -96", "gain send -8",
+            "route mic output off", "level mic output -13", "level mic send -7",
+            "route aux output off", "route aux send off", "level aux output -11", "level aux send -12"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        controls.snapshot_into(&mut route).unwrap();
+        assert_eq!(route.aux_to, crate::config::AuxDestination::Off);
+        AudioScene::new(route, vec![]).unwrap().save_new(&path).unwrap();
+        let restored = AudioScene::read(&path).unwrap();
+        let live = Arc::new(LiveControls::from_route(&restored.route).unwrap());
+        assert_eq!(live.describe(), controls.describe());
+        let mut playback = PlaybackGains::new(48000, &[0, 1], live.clone()).unwrap();
+        assert_eq!(playback.next_gains(), [0.0, 0.0]);
+        live.apply("unmute all".parse().unwrap()).unwrap();
+        assert!(live.is_muted(MuteTarget::Mic));
+        assert!(live.is_muted(MuteTarget::Send));
+        assert!(!live.route_state(RouteSource::Mic, RouteMix::Output).unwrap().0);
+        assert!(!live.route_state(RouteSource::Aux, RouteMix::Output).unwrap().0);
+        assert!(!live.route_state(RouteSource::Aux, RouteMix::Send).unwrap().0);
+        let mut different = restored.route.clone();
+        different.send = None;
+        let before = different.clone();
+        assert!(live.snapshot_into(&mut different).is_err());
+        assert_eq!(different, before);
+    }
+
+    #[test]
     fn scene_embeds_all_states_and_does_not_depend_on_the_imported_chain_file() {
         let directory = tempfile::tempdir().unwrap();
         let chain_path = directory.path().join("original.chain.json");
@@ -155,7 +190,7 @@ mod tests {
         let path = directory.path().join("invalid.mixlive-scene.json");
         let original = serde_json::to_value(AudioScene::new(route(), vec![]).unwrap()).unwrap();
         let mut cases = Vec::new();
-        for (key, value) in [("schema", json!(2)), ("unknown", json!(true))] {
+        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("unknown", json!(true))] {
             let mut document = original.clone();
             document[key] = value;
             cases.push(document);
@@ -182,6 +217,12 @@ mod tests {
             document["effects"] = effects;
             cases.push(document);
         }
+        let mut missing_mix = original.clone();
+        missing_mix["route"].as_object_mut().unwrap().remove("mix");
+        cases.push(missing_mix);
+        let mut bad_mix = original.clone();
+        bad_mix["route"]["mix"]["aux_send_gain_db"] = json!(1);
+        cases.push(bad_mix);
         let mut missing_effects = original.clone();
         missing_effects.as_object_mut().unwrap().remove("effects");
         cases.push(missing_effects);

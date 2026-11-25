@@ -141,7 +141,7 @@ impl Session {
                 self.timing = active.timing.clone();
                 self.last_report = Instant::now();
                 self.active = Some(active);
-                self.message = "실행 중 · 이 화면의 변경은 이번 실행에만 적용됩니다.".into();
+                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 믹서와 VST3 상태를 저장할 수 있습니다.".into();
                 Ok(())
             }
             Err(error) => self.fail("시작하지 못했습니다. 설정과 장치를 확인하세요.", error),
@@ -175,6 +175,23 @@ impl Session {
             self.report = active.report();
             self.last_report = Instant::now();
         }
+        Ok(())
+    }
+
+    /// Explicitly finish and save a new Scene. Failure or an occupied path keeps the old selection.
+    /// Like start/stop, call outside a mutable GPUI update.
+    pub fn stop_and_save(&mut self, path: PathBuf) -> Result<(), String> {
+        let Some(active) = self.active.take() else {
+            return self.fail("실행 중인 Scene이 없습니다.", "audio is not running");
+        };
+        let route = self.scene().expect("active session has a Scene").route.clone();
+        self.report = active.report();
+        let scene = match active.finish_scene(route) {
+            Ok(scene) => scene,
+            Err(error) => return self.fail("오디오를 정지했지만 실행 상태를 저장하지 못했습니다.", error),
+        };
+        self.save_new(path, scene)?;
+        self.message = "정지 후 현재 믹서와 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
         Ok(())
     }
 
@@ -282,6 +299,10 @@ mod tests {
                 .is_err()
         );
         assert!(session.controls().is_none());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("no-live-scene.json");
+        assert!(session.stop_and_save(path.clone()).is_err());
+        assert!(!path.exists());
         session.stop().unwrap();
         assert!(!session.running());
     }

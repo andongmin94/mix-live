@@ -2,6 +2,7 @@
 
 use mixlive_audio_windows::{
     config::{AuxDestination, InputMap, OutputMap, RouteOptions},
+    control::MixSettings,
     devices::{DeviceCatalog, DeviceConfig, DeviceInfo},
     scene::AudioScene,
 };
@@ -23,6 +24,7 @@ pub struct SceneDraft {
     pub aux_gain_db: String,
     pub aux_to: String,
     pub queue_ms: String,
+    pub mix: MixSettings,
     pub sound: SoundDraft,
 }
 
@@ -42,6 +44,7 @@ impl Default for SceneDraft {
             aux_gain_db: "-12".into(),
             aux_to: "send".into(),
             queue_ms: "30".into(),
+            mix: MixSettings::default(),
             sound: SoundDraft::default(),
         }
     }
@@ -72,12 +75,14 @@ impl SceneDraft {
             aux_channels: channel_text(&route.aux_channels),
             aux_gain_db: route.aux_gain_db.to_string(),
             aux_to: match route.aux_to {
+                AuxDestination::Off => "off",
                 AuxDestination::Output => "output",
                 AuxDestination::Send => "send",
                 AuxDestination::Both => "both",
             }
             .into(),
             queue_ms: route.queue_ms.to_string(),
+            mix: *route.mix,
             sound: SoundDraft::from_scene(scene),
         }
     }
@@ -111,6 +116,7 @@ impl SceneDraft {
             InputMap::new(&aux_channels, configuration(aux)?.channels)?;
         }
         let aux_to = match self.aux_to.as_str() {
+            "off" => AuxDestination::Off,
             "output" => AuxDestination::Output,
             "send" => AuxDestination::Send,
             "both" => AuxDestination::Both,
@@ -139,6 +145,7 @@ impl SceneDraft {
                 vocal_strength: vocal.strength,
                 vocal_threshold_db: vocal.compressor_threshold_db,
                 deess_threshold_db: vocal.deess_threshold_db,
+                mix: Box::new(self.mix),
                 queue_ms: self.queue_ms.trim().parse().map_err(|_| {
                     "Queue 목표에는 10~100 범위의 정수(ms)를 입력하세요.".to_owned()
                 })?,
@@ -271,9 +278,14 @@ mod tests {
             "--deess-threshold-db",
             "-29.125",
         ]);
-        let Command::Check(route) = cli.command else {
+        let Command::Check(mut route) = cli.command else {
             panic!("expected check")
         };
+        route.mix.mute_all = true;
+        route.mix.mute_aux = true;
+        route.mix.mic_output_enabled = false;
+        route.mix.mic_output_gain_db = -19.25;
+        route.mix.aux_send_gain_db = -6.5;
         AudioScene::new(
             route,
             vec![

@@ -226,7 +226,7 @@ jobs:
           $savedPath = Join-Path $sceneDirectory 'Edited scene.mixlive-scene.json'
           $pluginPath = Join-Path $sceneDirectory 'not-installed.vst3'
           $scene = [ordered]@{
-            schema = 3
+            schema = 4
             route = [ordered]@{
               input = 'ci-absent-mic'; input_channel = 2
               aux_input = 'ci-absent-aux'; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
@@ -235,6 +235,11 @@ jobs:
               input_gain_db = 1.25; output_gain_db = -23; send_gain_db = -6
               vocal = 'warm'; vocal_strength = 0.75; vocal_threshold_db = -20; deess_threshold_db = -28
               queue_ms = 20
+              mix = [ordered]@{
+                mute_mic = $true; mute_aux = $false; mute_output = $false; mute_send = $true; mute_all = $true
+                mic_output_enabled = $false; mic_send_enabled = $true
+                mic_output_gain_db = -13; mic_send_gain_db = -7; aux_output_gain_db = -11; aux_send_gain_db = -12
+              }
             }
             effects = @(
               [ordered]@{ plugin = $pluginPath; class_id = '0123456789ABCDEF0123456789ABCDEF'; state = @(1, 2) },
@@ -384,7 +389,7 @@ jobs:
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
             if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
             $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json
-            if ($saved.schema -ne 3 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
+            if ($saved.schema -ne 4 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
               throw 'The saved Scene did not contain the edited vocal values'
             }
             foreach ($field in $scene.route.Keys) {
@@ -394,6 +399,10 @@ jobs:
               if ($expected -is [array]) {
                 if (@($actual).Count -ne $expected.Count -or ($actual -join ',') -cne ($expected -join ',')) {
                   throw "Sound editing changed the route array: $field"
+                }
+              } elseif ($field -eq 'mix') {
+                foreach ($key in $expected.Keys) {
+                  if ($actual.$key -cne $expected[$key]) { throw "Sound editing changed the saved mixer field: $key" }
                 }
               } elseif ($actual -cne $expected) { throw "Sound editing changed the route field: $field" }
             }

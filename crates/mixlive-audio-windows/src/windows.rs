@@ -70,6 +70,7 @@ pub struct Prepared {
     output_gain_db: f32,
     send_gain_db: Option<f32>,
     queue_ms: u32,
+    controls: Arc<LiveControls>,
     outputs: Vec<OutputEndpoint>,
 }
 
@@ -143,7 +144,7 @@ impl Prepared {
         Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal,
             auxiliary, aux_mix: options.aux_input.as_ref().map(|_| (options.aux_gain_db, options.aux_to)),
             output_gain_db: options.output_gain_db, send_gain_db: options.send.as_ref().map(|_| options.send_gain_db),
-            queue_ms: options.queue_ms, outputs })
+            queue_ms: options.queue_ms, controls: Arc::new(LiveControls::from_route(options)?), outputs })
     }
 
     pub fn describe(&self) -> String {
@@ -162,6 +163,7 @@ impl Prepared {
                 else { "separate capture stream; buffered/resampled to the microphone clock (additional AUX delay)" }));
             text.push_str("AUX must carry only the intended MR/line audio, not MixLive output or call return. No app filtering or external feedback detection. Enable output/both only when AUX is not already heard through another path.\n");
         }
+        text.push_str(&format!("Initial mixer: {}\n", self.controls.describe()));
         text.push_str("Vocal preset/thresholds and device bindings are fixed for this run. --interactive enables live source/output mute and master/send gain with 5 ms ramps. Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain or lookahead buffer; IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
         text
     }
@@ -169,7 +171,7 @@ impl Prepared {
     pub fn start(self, plugin: &ResolvedPlugins) -> Result<Active> {
         plugin.validate()?;
         let health = Arc::new(Health::default());
-        let controls = Arc::new(LiveControls::new(self.output_gain_db, self.send_gain_db, self.aux_mix.is_some())?);
+        let controls = self.controls;
         let mut streams = Vec::new();
         let mut writers = Vec::new();
         let mut stats = Vec::new();
@@ -326,14 +328,34 @@ impl Active {
     /// Explicit normal completion. Stop all devices before joining/snapshotting the plugin.
     /// Errors and implicit Drop still tear down everything, but never save plugin state.
     pub fn finish(self, state_out: Option<&std::path::Path>) -> Result<()> {
+        let (worker, health) = self.stop_devices();
+        if let Some(worker) = worker { worker.finish(state_out)?; }
+        else if state_out.is_some() { return Err("no live VST3 instance to save".into()); }
+        if let Some(error) = health.error() { return Err(error.into()); }
+        Ok(())
+    }
+
+    /// Normal explicit stop with a complete Scene snapshot, including every native slot.
+    /// No file is published here; failure tears down the route and yields no partial Scene.
+    pub fn finish_scene(self, mut route: RouteOptions) -> Result<crate::scene::AudioScene> {
+        let settings = self.controls.snapshot_into(&mut route);
+        let (worker, health) = self.stop_devices();
+        settings?;
+        if let Some(error) = health.error() { return Err(error.into()); }
+        let effects = match worker {
+            Some(worker) => worker.snapshot()?.effects,
+            None => Vec::new(),
+        };
+        if let Some(error) = health.error() { return Err(error.into()); }
+        crate::scene::AudioScene::new(route, effects)
+    }
+
+    fn stop_devices(self) -> (Option<PluginWorker>, Arc<Health>) {
         let Self { _input, _aux_input, _outputs, plugin_worker, health, .. } = self;
         drop(_input);
         drop(_aux_input);
         drop(_outputs);
-        if let Some(worker) = plugin_worker { worker.finish(state_out)?; }
-        else if state_out.is_some() { return Err("no live VST3 instance to save".into()); }
-        if let Some(error) = health.error() { return Err(error.into()); }
-        Ok(())
+        (plugin_worker, health)
     }
 
     /// UI/CLI thread only. Peaks and gain reduction maxima are since the previous read.

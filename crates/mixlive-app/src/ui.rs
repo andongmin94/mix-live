@@ -51,12 +51,13 @@ struct Fader {
     state: Entity<SliderState>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Operation {
     Devices,
     EditDevices,
     Start,
     Stop,
+    StopAndSave(PathBuf),
     Close,
 }
 
@@ -279,6 +280,47 @@ impl MixLive {
         .detach();
     }
 
+    fn choose_snapshot_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.picking || self.busy.is_some() || !self.session.running() {
+            return;
+        }
+        let directory = self.session.path()
+            .and_then(|path| path.parent())
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .map(Ok)
+            .unwrap_or_else(std::env::current_dir);
+        let directory = match directory {
+            Ok(directory) => directory,
+            Err(error) => {
+                self.session.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.picking = true;
+        let path = cx.prompt_for_new_path(&directory, Some("실행 상태.mixlive-scene.json"));
+        cx.notify();
+        cx.spawn_in(window, async move |owner, cx| {
+            let result = path.await;
+            let _ = cx.update(move |window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.picking = false;
+                    match result {
+                        Ok(Ok(Some(path))) if this.session.running() && this.busy.is_none() => {
+                            this.perform(Operation::StopAndSave(path), window, cx);
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => this.session.error = Some(error.to_string()),
+                        Err(error) => this.session.error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn perform(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
@@ -295,19 +337,23 @@ impl MixLive {
         {
             return;
         }
-        self.busy = Some(operation);
+        self.busy = Some(operation.clone());
         self.faders.clear();
         self.subscriptions.clear();
         let mut session = std::mem::take(&mut self.session);
         cx.notify();
         cx.spawn_in(window, async move |owner, cx| {
             // These synchronous native calls MUST be outside App/entity update.
-            let catalog = match operation {
+            let catalog = match &operation {
                 Operation::Devices | Operation::EditDevices => {
                     Some(device_catalog().map_err(|error| error.to_string()))
                 }
                 Operation::Start => {
                     let _ = session.start();
+                    None
+                }
+                Operation::StopAndSave(path) => {
+                    let _ = session.stop_and_save(path.clone());
                     None
                 }
                 Operation::Stop | Operation::Close => {
@@ -318,6 +364,7 @@ impl MixLive {
             let _ = cx.update(move |window, cx| {
                 let _ = owner.update(cx, |this, cx| {
                     this.session = session;
+                    this.selected_name = scene_name(&this.session);
                     this.busy = None;
                     if let Some(catalog) = catalog {
                         match catalog {
@@ -492,10 +539,11 @@ impl MixLive {
 
     fn header(&self, cx: &Context<Self>) -> Div {
         let running = self.session.running();
-        let (status, color) = match self.busy {
+        let (status, color) = match &self.busy {
             Some(Operation::Devices | Operation::EditDevices) => ("장치 조회 중", MUTED),
             Some(Operation::Start) => ("시작 중", MUTED),
             Some(Operation::Stop | Operation::Close) => ("정지 중", MUTED),
+            Some(Operation::StopAndSave(_)) => ("정지 및 저장 중", MUTED),
             None if running => ("오디오 실행 중", ACCENT),
             None if self.form.is_some() => ("Scene 설정", MUTED),
             None if self.session.error.is_some() => ("확인 필요", DANGER),
@@ -595,7 +643,7 @@ impl MixLive {
                             ),
                     )
                     .child(if running {
-                        button("stop-audio", "정지", false).on_click(cx.listener(
+                        button("stop-audio", "정지", false).disabled(self.picking).on_click(cx.listener(
                             |this, _, window, cx| this.perform(Operation::Stop, window, cx),
                         ))
                     } else {
@@ -1090,6 +1138,17 @@ impl MixLive {
                     })),
                 ),
         );
+        if self.session.running() {
+            content = content.child(
+                button("save-running-scene", "정지 후 새 Scene 저장", true)
+                    .disabled(self.picking || self.busy.is_some())
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_snapshot_path(window, cx))),
+            );
+        } else if let Some(scene) = self.session.scene() {
+            let initial = mixlive_audio_windows::control::LiveControls::from_route(&scene.route)
+                .expect("loaded Scene validated");
+            content = content.child(detail_text("저장된 믹서 시작 설정", &initial.describe()));
+        }
         if self.details {
             if !self.session.device_details.is_empty() {
                 content = content.child(detail_text("장치 설정", &self.session.device_details));
@@ -1158,7 +1217,7 @@ impl Render for MixLive {
             .child(self.header(cx))
             .child(body)
             .child(div().flex_shrink_0().px_7().py_3().border_t_1().border_color(rgb(BORDER)).text_xs().text_color(rgb(MUTED))
-                .child("실행 중 조절값은 Scene에 저장되지 않습니다. 다시 시작하면 저장된 설정을 사용합니다."))
+                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 믹서와 VST3 상태를 보존합니다."))
     }
 }
 

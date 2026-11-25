@@ -252,6 +252,13 @@ impl PluginWorker {
         Ok(save.then_some(ChainFile { schema: 1, effects }))
     }
 
+    /// Devices have stopped. Return all slot states only after native teardown.
+    pub fn snapshot(mut self) -> Result<ChainFile, String> {
+        let snapshot = self.shutdown(true)?.ok_or("no live VST3 snapshot")?;
+        drop(self);
+        Ok(snapshot)
+    }
+
     /// Devices have stopped. Native teardown precedes a single all-or-nothing publication.
     pub fn finish(mut self, chain_out: Option<&Path>) -> Result<(), String> {
         let snapshot = self.shutdown(chain_out.is_some())?;

@@ -103,7 +103,7 @@ fn native_serial_stages_preserve_distinct_stereo_and_partial_blocks() {
 fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files() {
     let directory = tempfile::tempdir().unwrap();
     let spec = fixture("MIXLIVE_STATE_VST3");
-    for case in ["save", "fault", "discard", "exists", "partial-failure"] {
+    for case in ["save", "scene-snapshot", "fault", "snapshot-fault", "discard", "exists", "partial-failure", "snapshot-partial"] {
         let health = Arc::new(Health::default());
         let mut slots = Vec::new();
         for gain in [0.23, 0.61] {
@@ -114,26 +114,31 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
             plugin.set_parameter(0, gain).unwrap();
             slots.push(Slot { plugin: Arc::new(Mutex::new(plugin)), editor: None });
         }
-        if case == "partial-failure" { slots[1].plugin.lock().unwrap().stop_processing().unwrap(); }
+        if matches!(case, "partial-failure" | "snapshot-partial") { slots[1].plugin.lock().unwrap().stop_processing().unwrap(); }
         let worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
             stopped: false, health: health.clone(), description: String::new() };
         let path = directory.path().join(format!("{case}.json"));
         if case == "exists" { std::fs::write(&path, b"keep").unwrap(); }
-        if case == "fault" { health.fail(Fault::Device); }
+        if matches!(case, "fault" | "snapshot-fault") { health.fail(Fault::Device); }
         match case {
             "discard" => { drop(worker); assert!(!path.exists()); },
             "fault" | "partial-failure" => { assert!(worker.finish(Some(&path)).is_err()); assert!(!path.exists()); },
+            "snapshot-fault" | "snapshot-partial" => { assert!(worker.snapshot().is_err()); assert!(!path.exists()); },
             "exists" => { assert!(worker.finish(Some(&path)).is_err()); assert_eq!(std::fs::read(&path).unwrap(), b"keep"); },
             _ => {
                 use clap::Parser;
                 use crate::{config::{Cli, Command}, plugin::PluginArgs, scene::AudioScene};
-                worker.finish(Some(&path)).unwrap();
-                let restored = ChainFile::read(&path).unwrap();
+                let restored = if case == "scene-snapshot" {
+                    worker.snapshot().unwrap()
+                } else {
+                    worker.finish(Some(&path)).unwrap();
+                    ChainFile::read(&path).unwrap()
+                };
                 assert_eq!(restored.effects.len(), 2);
                 // Reuse the real native snapshots through the same scene/launch path as the CLI.
                 let Command::Check(route) = Cli::parse_from(["audio", "check", "--input", "fake-mic", "--output", "fake-phones"]).command
                     else { panic!("expected check") };
-                let scene_path = directory.path().join("voice.mixlive-scene.json");
+                let scene_path = directory.path().join(format!("{case}.mixlive-scene.json"));
                 AudioScene::new(route, restored.effects).unwrap().save_new(&scene_path).unwrap();
                 let scene = AudioScene::read(&scene_path).unwrap();
                 let setup = PluginArgs::default().resolve_scene(scene.effects).unwrap();
@@ -148,5 +153,5 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
         }
     }
     // Complete chain and embedded scene snapshots plus the pre-existing user file remain.
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 4);
 }

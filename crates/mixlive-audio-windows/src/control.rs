@@ -1,4 +1,6 @@
 //! Live session controls. Parsing/printing stays on the control thread; callbacks only load atomics.
+use crate::config::{AuxDestination, RouteOptions};
+use serde::{Deserialize, Serialize};
 use std::{str::FromStr, sync::{Arc, atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering}}};
 
 const MIC: u8 = 1;
@@ -100,6 +102,37 @@ fn validate_db(db: f32) -> Result<(), String> {
 }
 fn gain(db: f32) -> f32 { 10.0_f32.powf(db / 20.0) }
 
+/// Settings that cannot be represented by the device bindings and initial master/send gain.
+/// Inactive optional routes retain their values without creating additional audio paths.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MixSettings {
+    pub mute_mic: bool,
+    pub mute_aux: bool,
+    pub mute_output: bool,
+    pub mute_send: bool,
+    pub mute_all: bool,
+    pub mic_output_enabled: bool,
+    pub mic_send_enabled: bool,
+    pub mic_output_gain_db: f32,
+    pub mic_send_gain_db: f32,
+    pub aux_output_gain_db: f32,
+    pub aux_send_gain_db: f32,
+}
+impl Default for MixSettings {
+    fn default() -> Self {
+        Self { mute_mic: false, mute_aux: false, mute_output: false, mute_send: false, mute_all: false,
+            mic_output_enabled: true, mic_send_enabled: true, mic_output_gain_db: 0.0,
+            mic_send_gain_db: 0.0, aux_output_gain_db: 0.0, aux_send_gain_db: 0.0 }
+    }
+}
+impl MixSettings {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for db in [self.mic_output_gain_db, self.mic_send_gain_db, self.aux_output_gain_db, self.aux_send_gain_db] { validate_db(db)?; }
+        Ok(())
+    }
+}
+
 /// One session, initialized from its route. Neither commands nor runtime mutes rewrite a Scene.
 /// Individual controls are independent atomic values, not an atomic multi-parameter Scene swap.
 pub struct LiveControls {
@@ -123,6 +156,74 @@ impl LiveControls {
             // Capture preparation sets the saved AUX destination before any stream starts.
             routes_enabled: AtomicU8::new(if send_db.is_some() { 3 } else { 1 }),
             route_levels: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())) })
+    }
+    /// Restore requested controls before constructing any capture or playback ramps.
+    pub fn from_route(route: &RouteOptions) -> Result<Self, String> {
+        route.validate()?;
+        let controls = Self::new(route.output_gain_db, route.send.as_ref().map(|_| route.send_gain_db), route.aux_input.is_some())?;
+        let settings = *route.mix;
+        for (target, muted) in [(MuteTarget::Mic, settings.mute_mic), (MuteTarget::Output, settings.mute_output), (MuteTarget::All, settings.mute_all)] {
+            controls.apply(LiveCommand::Mute { target, muted })?;
+        }
+        if controls.has_aux { controls.apply(LiveCommand::Mute { target: MuteTarget::Aux, muted: settings.mute_aux })?; }
+        if controls.has_send { controls.apply(LiveCommand::Mute { target: MuteTarget::Send, muted: settings.mute_send })?; }
+        for (source, mix, enabled, db) in [
+            (RouteSource::Mic, RouteMix::Output, settings.mic_output_enabled, settings.mic_output_gain_db),
+            (RouteSource::Mic, RouteMix::Send, settings.mic_send_enabled, settings.mic_send_gain_db),
+            (RouteSource::Aux, RouteMix::Output, route.aux_to.includes(0), settings.aux_output_gain_db),
+            (RouteSource::Aux, RouteMix::Send, route.aux_to.includes(1), settings.aux_send_gain_db),
+        ] {
+            if (source == RouteSource::Aux && !controls.has_aux) || (mix == RouteMix::Send && !controls.has_send) { continue; }
+            controls.apply(LiveCommand::Route { source, mix, enabled })?;
+            controls.apply(LiveCommand::RouteGain { source, mix, db })?;
+        }
+        Ok(controls)
+    }
+
+    /// Control thread only, with edits suspended. Capture requested values, not transient ramps.
+    /// Preserve inactive optional values from the original route. Stop is never persisted.
+    pub fn snapshot_into(&self, route: &mut RouteOptions) -> Result<(), String> {
+        if self.has_aux != route.aux_input.is_some() || self.has_send != route.send.is_some() {
+            return Err("live controls do not match the Scene topology".into());
+        }
+        let mut saved = route.clone();
+        // Linear atomic gains were already validated in dB. Clamp logarithm roundoff at the bounds.
+        let db = |value: f32| value.clamp(-96.0, 0.0);
+        saved.output_gain_db = db(self.gain_db(GainTarget::Master)?);
+        if self.has_send { saved.send_gain_db = db(self.gain_db(GainTarget::Send)?); }
+        let settings = &mut saved.mix;
+        settings.mute_mic = self.is_muted(MuteTarget::Mic);
+        settings.mute_output = self.is_muted(MuteTarget::Output);
+        settings.mute_all = self.is_muted(MuteTarget::All);
+        let (enabled, gain_db) = self.route_state(RouteSource::Mic, RouteMix::Output)?;
+        settings.mic_output_enabled = enabled;
+        settings.mic_output_gain_db = db(gain_db);
+        if self.has_send {
+            settings.mute_send = self.is_muted(MuteTarget::Send);
+            let (enabled, gain_db) = self.route_state(RouteSource::Mic, RouteMix::Send)?;
+            settings.mic_send_enabled = enabled;
+            settings.mic_send_gain_db = db(gain_db);
+        }
+        if self.has_aux {
+            settings.mute_aux = self.is_muted(MuteTarget::Aux);
+            let (output, gain_db) = self.route_state(RouteSource::Aux, RouteMix::Output)?;
+            settings.aux_output_gain_db = db(gain_db);
+            let mut send = false;
+            if self.has_send {
+                let (enabled, gain_db) = self.route_state(RouteSource::Aux, RouteMix::Send)?;
+                send = enabled;
+                settings.aux_send_gain_db = db(gain_db);
+            }
+            saved.aux_to = match (output, send) {
+                (false, false) => AuxDestination::Off,
+                (true, false) => AuxDestination::Output,
+                (false, true) => AuxDestination::Send,
+                (true, true) => AuxDestination::Both,
+            };
+        }
+        saved.validate()?;
+        *route = saved;
+        Ok(())
     }
     pub fn mix_count(&self) -> usize { if self.has_send { 2 } else { 1 } }
     pub fn has_aux(&self) -> bool { self.has_aux }

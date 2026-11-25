@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **GPUI Deck 의존성·API 갱신 · Windows 통합 검증 대기**
+단계: **실행 상태를 포함하는 Scene 저장/복원 구현 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -18,7 +18,10 @@
 - **보컬 설정**은 장치를 조회하지 않고 내장 preset/trim/dry-wet/threshold와 VST3를 편집한다.
   파일/Windows bundle 폴더/체인 JSON 추가, 순서 변경·삭제를 지원하며 동일 DLL도 독립 슬롯이다.
   slot의 class/state가 함께 이동하고 상대 경로는 원래 파일 기준이다. DLL은 시작할 때만 연다.
-- schema 3의 원자적 새 파일 저장을 사용한다. 덮어쓰기 없음, 취소/저장 실패는 이전 Scene 유지,
+- 실행 중 정지 후 새 Scene 저장은 경로를 먼저 선택하고, 확정 후 장치 중지·worker join·모든 VST3 상태 수집을 수행한다.
+  현재 mute, master/send gain, 네 연결과 gain을 다음 시작 전에 복원한다. 일반 정지/닫기는 변경을 버린다.
+  실패 시 이전 Scene 선택 유지, 기존 파일 덮어쓰기 없음. 저장된 믹서 값은 보컬·장치 편집에서도 보존한다.
+- schema 4의 원자적 새 파일 저장을 사용한다. 덮어쓰기 없음, 취소/저장 실패는 이전 Scene 유지,
   성공은 새 파일 선택 후 명시적 시작 대기다. 실행 중 설정 편집은 막는다.
 - native 장치 조회/시작/종료는 GPUI foreground의 UI 객체 변경 참조 밖에서 실행한다.
   `Prepared::new/start`, `Active::poll_plugin/report/finish`, `LiveControls`와
@@ -28,7 +31,7 @@
   사용한다. Deck과 GPUI 계열의 잠금 파일은 Cargo로 갱신했다.
 - 엔진: WASAPI mic + optional mono/stereo AUX → 내장 DSP → 순차 stereo VST3 → mix 1~2개.
   공유 endpoint는 한 스트림, 별도 clock은 bounded queue/Rubato sinc bridge다. AUX는 보컬 체인 우회.
-  이번 묶음은 UI 의존성과 API만 갱신하며 엔진·CLI·파일 형식을 바꾸지 않는다. schema 1/2·DeviceScene 호환 경로는 없다.
+  schema 4는 필수 route.mix를 포함한다. schema 1~3·DeviceScene 호환 경로는 없다.
 
 ## 검증
 
@@ -37,12 +40,14 @@
 GPUI Deck 0.0.1과 GPUI family 0.3.12만 사용하며 기존 엔진 패키지 버전은 유지했다.
 이전 장치·보컬 편집 코드는 [Audio #26](https://github.com/andongmin94/mix-live/actions/runs/43690650750)에서
 Windows 검사 87개, Clippy, release 빌드 및 실제 Scene 편집·저장 검사를 통과했다.
-새 Deck revision의 Windows 통합 검증은 대기 중이다. 실제 장치와 라이브 fader는 미검증이다.
+새 Deck revision은 [Audio #27](https://github.com/andongmin94/mix-live/actions/runs/45548374397)에서
+Windows workspace, native fixture, Clippy, release 빌드 및 실제 Scene UI 검사를 모두 통과했다.
+이번 실행 상태 저장 코드의 Windows 통합 검증은 대기 중이다. 실제 장치와 라이브 fader는 미검증이다.
 
 ## 남은 작업과 제한
 
-- GUI 원본 VST3 editor 통합/재열기, 전체 실행 상태 저장은 남아 있다. Scene은 시작 설정이며
-  실행 중 mute/gain/route와 최신 native plugin 편집 상태의 세션 스냅샷이 아니다.
+- GUI 원본 VST3 editor 통합/재열기와 CLI 전체 Scene snapshot 출력은 남아 있다.
+  실제 장치에서 정지 후 저장 및 재실행하는 전체 경로는 미검증이다.
 - 실제 MiniFuse/가상 케이블/상용 VST3 GUI·청취·왕복 지연·장시간 안정성은 미검증이다.
   실제 장치 교체 후 GUI 저장·시작도 실장비에서 확인해야 한다. 자동 검사/native fixture를
   실장비·음질·상용 호환성 검증으로 부르지 않는다.
