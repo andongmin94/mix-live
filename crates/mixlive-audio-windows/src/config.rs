@@ -164,7 +164,7 @@ impl AppSource {
             muted: false, output_gain_db: 0.0, send_gain_db: 0.0, broadcast_gain_db: 0.0 }
     }
 
-    fn validate(&self, has_send: bool, has_broadcast: bool) -> Result<(), String> {
+    pub(crate) fn validate(&self, has_send: bool, has_broadcast: bool) -> Result<(), String> {
         if self.path.trim().is_empty() { return Err("application executable path must not be blank".into()); }
         InputMap::new(&self.channels, 2)?;
         if self.to.includes(1) && !has_send { return Err("application send destination requires --send".into()); }

@@ -1,7 +1,7 @@
 # 현재 상태
 
-기준일: 2026-11-25
-단계: **실행 중 프리셋·공간계 시간 변경 검증 완료 · main 병합**
+기준일: 2026-11-26
+단계: **실행 중 앱 소스 추가·삭제 구현 · Windows 통합 검증 전**
 
 ## 현재 구현
 
@@ -15,6 +15,17 @@
 - GPUI 앱 목록에 추가/삭제, 앱별 채널·trim·mute·모니터/통화/방송 연결 및 경로별 gain을
   제공한다. 새 앱은 모든 경로 off. 물리 AUX도 함께 사용할 수 있다. 중복/겹치는 프로세스 트리,
   모호한 루트, MixLive를 포함한 트리는 거절한다. 앱 이름이나 PID를 추정해 자동 선택하지 않는다.
+- 실행 중 앱 목록을 새로 조회하고 경로·입력 채널을 선택해 추가하거나 앱별 카드에서 삭제한다.
+  앱 clock reader를 기존 worker로 옮겨 mic/AUX queue에 이전 앱 인덱스를 담지 않는다.
+  준비한 reader/Engine을 기존 단일 요청·반환 큐로 같은 블록 경계에서 적용하며, 유지 앱의
+  캡처·리샘플러·control 객체·peak·음량 ramp·PDC 이력은 그대로 옮긴다. 마이크의
+  보컬·음정 보정·VST3 인스턴스와 장치 스트림은 유지한다. 새 캡처는 준비·시작 성공 후
+  worker 승인까지 packet 공급을 보류하므로 준비 실패는 기존 경로를 중단하지 않는다.
+  삭제 capture는 적용 경계에서 정지를 요청하고 join과 이전 저장소 해제는 제어 스레드에서 한다.
+  추가 시 유지 프로세스의 PID/시작 시각도 재확인하고 임의로 다른 프로세스로 바꾸지 않는다.
+  현재 목록으로 fader·계측·진단과 Scene 저장을 갱신하며, 일반 정지는 저장된 목록으로 돌아간다.
+  앱 목록 mutex는 제어/UI에서만 읽는다. 초기 priming 무음과 삭제 소스의 소리 종료는 있으며
+  실제 Windows process loopback·장비를 사용한 전환과 청취 품질은 미검증이다.
 - 실행 중 mic/AUX/앱별 mute 및 각 목적지로의 send·gain, master/믹스별 감쇠·출력 mute를 조절한다.
   AUX/앱 공통 trim은 기존 Scene 필드에서 시작하고 GUI/CLI에서 실시간 조절한다.
   입력 clock에서 5 ms ramp를 한 번 적용하고 PDC 이후 mute/send gain을 유지한다.
@@ -114,6 +125,9 @@
 
 ## 검증
 
+- 이번 앱 소스 편집 변경의 로컬 core 지연 이력 이동 검사 1개, Capture 검사 21개,
+  control 검사 11개가 성공했다. core strict Clippy도 통과했다. Windows 전용 worker/native/UI
+  검사와 전체 빌드는 아직 실행 전이며 아래 이전 CI 결과에 포함되지 않는다.
 - [Audio #56](https://github.com/andongmin94/mix-live/actions/runs/45636823189) `a4df88b` 전체 성공:
   Windows workspace 검사 145개와 실제 native VST3 fixture 검사 13개, 총 **158개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
@@ -145,8 +159,8 @@
 - 실제 MiniFuse/가상 케이블/복수 앱 process loopback/상용 VST3 및 장치+UI 전체 실행은
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
-- 탭 선택·ASIO·실행 중
-  소스 삽입/삭제·고급 formant 보존과 음정 보정 품질 수용은 미완료다(실험적 자동 보정은 구현).
+- 탭 선택·ASIO·실행 중 물리 장치 소스 교체·고급 formant 보존과 음정 보정 품질 수용은
+  미완료다(실험적 자동 보정은 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
   음정 설정/프리셋/리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.

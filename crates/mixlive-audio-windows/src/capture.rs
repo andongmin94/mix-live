@@ -1,9 +1,11 @@
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
-use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, SendDelays, Source};
+use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, Source};
+#[cfg(any(windows, test))]
+use mixlive_core::SendDelays;
 use mixlive_effects::{Meters, VocalChain, VocalParameter};
 #[cfg(any(windows, test))]
 use mixlive_effects::{PreparedVocalChange, VocalConfig};
-use crate::{bridge::{Fault, Health, OutputWriter}, config::{MAX_APPS, MAX_MIXES, PitchConfig}, pitch_correction::PitchCorrector, control::{GainRamp, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
+use crate::{bridge::{Fault, Health, OutputWriter}, config::{MAX_APPS, MAX_MIXES, PitchConfig}, pitch_correction::PitchCorrector, control::{AppControls, GainRamp, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
 
 pub const CAPTURE_BLOCK: usize = 256;
 
@@ -31,6 +33,13 @@ impl PreparedVoiceDelay {
 
 #[cfg(any(windows, test))]
 impl VoiceDelayLayout {
+    fn from_sources(source_slots: &[usize], mix_slots: &[usize]) -> Self {
+        let compensated = source_slots.iter().flat_map(|source| {
+            mix_slots.iter().map(move |mix| *source != 0 && *mix != 0)
+        }).collect();
+        Self { compensated }
+    }
+
     pub(crate) fn prepare(&self, total_voice_latency: u64, rate: u32) -> Result<PreparedVoiceDelay, String> {
         if total_voice_latency > u64::from(rate) * 2 {
             return Err("voice chain latency exceeds the supported 2-second outgoing compensation".into());
@@ -69,6 +78,100 @@ impl PreparedPitchChange {
     }
 }
 
+/// A new app routing plan prepared without touching the running processing state.
+/// Retained source identities carry their atomic targets, ramps and delay histories.
+/// After application this plan owns the retired engine/storage for control-thread drop.
+#[cfg(any(windows, test))]
+pub(crate) struct PreparedAppChange {
+    engine: Engine,
+    app_controls: Vec<Arc<AppControls>>,
+    source_slots: Vec<usize>,
+    source_mutes: [GainRamp; MAX_SOURCES],
+    source_trims: [GainRamp; MAX_SOURCES],
+    route_count: usize,
+    route_ramps: [GainRamp; MAX_ROUTES],
+    retained_sources: Vec<(usize, usize)>,
+    retained_routes: Vec<(usize, usize)>,
+    layout: VoiceDelayLayout,
+    voice_latency: usize,
+    compensation: usize,
+}
+
+#[cfg(any(windows, test))]
+impl PreparedAppChange {
+    pub(crate) fn new(controls: &LiveControls, current: &[Arc<AppControls>],
+        next: Vec<Arc<AppControls>>, rate: u32, total_voice_latency: usize) -> Result<Self, String> {
+        if !(8_000..=192_000).contains(&rate) { return Err("unsupported capture sample rate".into()); }
+        if current.len() > MAX_APPS || next.len() > MAX_APPS { return Err("too many application sources".into()); }
+        if total_voice_latency as u64 > u64::from(rate) * 2 {
+            return Err("voice chain latency exceeds the supported 2-second outgoing compensation".into());
+        }
+        for apps in [current, next.as_slice()] {
+            if apps.iter().enumerate().any(|(index, app)| apps[..index].iter().any(|other| Arc::ptr_eq(app, other))) {
+                return Err("application routing contains a duplicate source identity".into());
+            }
+        }
+        let mix_slots: Vec<_> = controls.mixes().map(RouteMix::index).collect();
+        let mix_count = mix_slots.len();
+        let source_slots = source_slots(controls.has_aux(), next.len());
+        let route_count = source_slots.len() * mix_count;
+        let mut retained_sources = vec![(0, 0)];
+        if controls.has_aux() { retained_sources.push((1, 1)); }
+        let first_app = 1 + usize::from(controls.has_aux());
+        for (index, app) in next.iter().enumerate() {
+            if let Some(old) = current.iter().position(|other| Arc::ptr_eq(app, other)) {
+                retained_sources.push((first_app + index, first_app + old));
+            }
+        }
+        let retained_routes: Vec<_> = retained_sources.iter().flat_map(|&(next, old)| {
+            (0..mix_count).map(move |mix| (next * mix_count + mix, old * mix_count + mix))
+        }).collect();
+        let layout = VoiceDelayLayout::from_sources(&source_slots, &mix_slots);
+        let compensation = if layout.compensated.contains(&true) { total_voice_latency } else { 0 };
+        let frames: Vec<_> = layout.compensated.iter().enumerate().map(|(index, &compensated)| {
+            // Retained lines are swapped in on the worker; only new apps need storage.
+            if compensated && !retained_routes.iter().any(|&(next, _)| next == index) { total_voice_latency } else { 0 }
+        }).collect();
+        let mut engine = routing_engine(controls.has_aux(), next.len(), mix_count)?;
+        engine.swap_send_delays(&mut SendDelays::new(&frames)).map_err(|error| error.to_string())?;
+        let targets = controls.route_targets(&next);
+        let route_ramps = std::array::from_fn(|index| GainRamp::new(rate,
+            if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
+        let source_mutes = controls.source_targets(&next).map(|gain| GainRamp::new(rate, gain));
+        let source_trims = controls.trim_targets(&next).map(|gain| GainRamp::new(rate, gain));
+        Ok(Self { engine, app_controls: next, source_slots, source_mutes, source_trims,
+            route_count, route_ramps, retained_sources, retained_routes, layout,
+            voice_latency: total_voice_latency, compensation })
+    }
+
+    pub(crate) fn delay_layout(&self) -> VoiceDelayLayout { self.layout.clone() }
+    pub(crate) fn compensation(&self) -> usize { self.compensation }
+}
+
+fn source_slots(has_aux: bool, app_count: usize) -> Vec<usize> {
+    [0].into_iter().chain(has_aux.then_some(1)).chain((0..app_count).map(|index| 2 + index)).collect()
+}
+
+fn routing_engine(has_aux: bool, app_count: usize, mix_count: usize) -> Result<Engine, String> {
+    let mut scene = Scene {
+        sources: vec![Source { name: "Processed mic".into(), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false }],
+        mixes: (0..mix_count).map(|index| Mix {
+            name: format!("Output {index}"), gain_db: 0.0, muted: false, excluded_sources: vec![],
+        }).collect(),
+        sends: (0..mix_count).map(|mix| Send { source: 0, mix, gain_db: 0.0, enabled: true }).collect(),
+    };
+    if has_aux {
+        scene.sources.push(Source { name: "AUX".into(), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false });
+        scene.sends.extend((0..mix_count).map(|mix| Send { source: 1, mix, gain_db: 0.0, enabled: true }));
+    }
+    for index in 0..app_count {
+        let source = scene.sources.len();
+        scene.sources.push(Source { name: format!("App {}", index + 1), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false });
+        scene.sends.extend((0..mix_count).map(|mix| Send { source, mix, gain_db: 0.0, enabled: true }));
+    }
+    Engine::new(&scene, CAPTURE_BLOCK).map_err(|error| error.to_string())
+}
+
 #[derive(Default)]
 pub struct VocalStats {
     peak: AtomicU32,
@@ -103,7 +206,7 @@ pub struct Capture {
     aux_enabled: bool,
     aux_left: [f32; CAPTURE_BLOCK],
     aux_right: [f32; CAPTURE_BLOCK],
-    app_count: usize,
+    app_controls: Vec<Arc<AppControls>>,
     app_buffers: [[[f32; CAPTURE_BLOCK]; 2]; MAX_APPS],
     controls: Arc<LiveControls>,
     // Core indices are compact; control slots retain mic/AUX/app identity.
@@ -137,39 +240,54 @@ impl Capture {
                 *mix = mix_slots.iter().position(|slot| *slot == *mix).expect("validated output mix");
             }
         }
-        let mut scene = Scene {
-            // The built-in chain produces stereo, and VST3 preserves both channels.
-            sources: vec![Source { name: "Processed mic".into(), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false }],
-            mixes: (0..mix_count).map(|index| Mix {
-                name: format!("Output {index}"), gain_db: 0.0, muted: false, excluded_sources: vec![],
-            }).collect(),
-            sends: (0..mix_count).map(|mix| Send { source: 0, mix, gain_db: 0.0, enabled: true }).collect(),
-        };
-        if controls.has_aux() {
-            scene.sources.push(Source { name: "AUX".into(), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false });
-            scene.sends.extend((0..mix_count).map(|mix| Send { source: 1, mix, gain_db: 0.0, enabled: true }));
-        }
-        for index in 0..controls.app_count() {
-            let source = scene.sources.len();
-            scene.sources.push(Source { name: format!("App {}", index + 1), channels: ChannelLayout::Stereo, gain_db: 0.0, muted: false });
-            scene.sends.extend((0..mix_count).map(|mix| Send { source, mix, gain_db: 0.0, enabled: true }));
-        }
-        let engine = Engine::new(&scene, CAPTURE_BLOCK).map_err(|e| e.to_string())?;
-        let source_slots: Vec<_> = controls.sources().map(RouteSource::index).collect();
-        let route_count = scene.sends.len();
-        let targets = controls.route_targets();
+        let app_controls = controls.app_controls();
+        let engine = routing_engine(controls.has_aux(), app_controls.len(), mix_count)?;
+        let source_slots = source_slots(controls.has_aux(), app_controls.len());
+        let route_count = source_slots.len() * mix_count;
+        let targets = controls.route_targets(&app_controls);
         let route_ramps = std::array::from_fn(|index| GainRamp::new(sample_rate,
             if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
-        let source_mutes = controls.source_targets().map(|gain| GainRamp::new(sample_rate, gain));
-        let source_trims = controls.trim_targets().map(|gain| GainRamp::new(sample_rate, gain));
+        let source_mutes = controls.source_targets(&app_controls).map(|gain| GainRamp::new(sample_rate, gain));
+        let source_trims = controls.trim_targets(&app_controls).map(|gain| GainRamp::new(sample_rate, gain));
         Ok(Self { engine, voice_latency: 0, compensation: 0, vocal, pitch: None, pitch_config: PitchConfig::default(), corrected_mic: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
             aux_enabled: controls.has_aux(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
-            app_count: controls.app_count(), app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
+            app_controls, app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
             controls, source_slots, mix_slots, source_mutes, source_trims, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
             vocal_stats: Arc::new(VocalStats::default()) })
     }
     #[cfg(windows)]
-    pub(crate) fn app_count(&self) -> usize { self.app_count }
+    pub(crate) fn app_count(&self) -> usize { self.app_controls.len() }
+
+    #[cfg(windows)]
+    pub(crate) fn has_aux(&self) -> bool { self.aux_enabled }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn app_controls(&self) -> Vec<Arc<AppControls>> { self.app_controls.clone() }
+
+    /// The worker applies source identity, routing and histories at one block boundary.
+    /// Retained ramps are copied before swapping arrays so compacting indices cannot
+    /// overwrite a later source. The prepared plan takes every retired allocation.
+    #[cfg(any(windows, test))]
+    pub(crate) fn apply_app_change(&mut self, prepared: &mut PreparedAppChange) {
+        assert_eq!(self.voice_latency, prepared.voice_latency, "prepared app routing voice latency");
+        prepared.engine.swap_retained_send_delays(&mut self.engine, &prepared.retained_routes)
+            .expect("prepared retained source mapping");
+        for &(next, old) in &prepared.retained_sources {
+            let next = prepared.source_slots[next];
+            let old = self.source_slots[old];
+            prepared.source_mutes[next] = self.source_mutes[old];
+            prepared.source_trims[next] = self.source_trims[old];
+        }
+        for &(next, old) in &prepared.retained_routes { prepared.route_ramps[next] = self.route_ramps[old]; }
+        std::mem::swap(&mut self.engine, &mut prepared.engine);
+        std::mem::swap(&mut self.app_controls, &mut prepared.app_controls);
+        std::mem::swap(&mut self.source_slots, &mut prepared.source_slots);
+        std::mem::swap(&mut self.source_mutes, &mut prepared.source_mutes);
+        std::mem::swap(&mut self.source_trims, &mut prepared.source_trims);
+        std::mem::swap(&mut self.route_count, &mut prepared.route_count);
+        std::mem::swap(&mut self.route_ramps, &mut prepared.route_ramps);
+        std::mem::swap(&mut self.compensation, &mut prepared.compensation);
+    }
 
     #[cfg(any(windows, test))]
     pub(crate) fn vocal_config(&self) -> VocalConfig { self.vocal.config() }
@@ -208,11 +326,7 @@ impl Capture {
 
     #[cfg(any(windows, test))]
     pub(crate) fn delay_layout(&self) -> VoiceDelayLayout {
-        let mix_count = self.mix_slots.len();
-        let compensated = (0..self.route_count).map(|index| {
-            self.source_slots[index / mix_count] != 0 && self.mix_slots[index % mix_count] != 0
-        }).collect();
-        VoiceDelayLayout { compensated }
+        VoiceDelayLayout::from_sources(&self.source_slots, &self.mix_slots)
     }
 
     /// Swap together with the VST3 chain at a block boundary. The caller takes the
@@ -247,7 +361,7 @@ impl Capture {
         effect: &mut impl FnMut(&mut [f32], &mut [f32]) -> bool) {
         if self.health.failed() { return; }
         if aux.is_some() != self.aux_enabled || aux.is_some_and(|frames| frames.len() != samples.len())
-            || apps.len() != self.app_count || apps.iter().any(|frames| frames.len() != samples.len()) {
+            || apps.len() != self.app_controls.len() || apps.iter().any(|frames| frames.len() != samples.len()) {
             self.health.fail(Fault::Input); return;
         }
         for (block_index, block) in samples.chunks(CAPTURE_BLOCK).enumerate() {
@@ -259,9 +373,9 @@ impl Capture {
                     self.health.fail(Fault::Routing); return;
                 }
             }
-            for (ramp, target) in self.source_mutes.iter_mut().zip(self.controls.source_targets()) { ramp.set(target); }
-            for (ramp, target) in self.source_trims.iter_mut().zip(self.controls.trim_targets()) { ramp.set(target); }
-            let targets = self.controls.route_targets();
+            for (ramp, target) in self.source_mutes.iter_mut().zip(self.controls.source_targets(&self.app_controls)) { ramp.set(target); }
+            for (ramp, target) in self.source_trims.iter_mut().zip(self.controls.trim_targets(&self.app_controls)) { ramp.set(target); }
+            let targets = self.controls.route_targets(&self.app_controls);
             let mix_count = self.mix_slots.len();
             for (index, ramp) in self.route_ramps[..self.route_count].iter_mut().enumerate() {
                 ramp.set(targets[self.source_slots[index / mix_count] * MAX_MIXES + self.mix_slots[index % mix_count]]);
@@ -322,16 +436,15 @@ impl Capture {
                     buffer[1][index] = frame[1] * gain;
                     peak = peak.max(frame[0].abs()).max(frame[1].abs());
                 }
-                self.health.app_peaks[slot].fetch_max(peak.to_bits(), Ordering::Relaxed);
+                self.app_controls[slot].record_peak(peak);
             }
-            for (slot, buffer) in self.app_buffers.iter().take(self.app_count).enumerate() {
+            for (slot, buffer) in self.app_buffers.iter().take(self.app_controls.len()).enumerate() {
                 inputs[next + slot] = Input::Stereo { left: &buffer[0][..block.len()], right: &buffer[1][..block.len()] };
             }
             let rendered = self.engine.render_with_send_gains(block.len(), &inputs[..self.source_slots.len()], envelopes);
             if rendered.is_err() { self.health.fail(Fault::Input); return; }
             let peak = block.iter().fold(0.0_f32, |p, x| p.max(x.abs()));
             self.health.input_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
-            self.health.captured_frames.fetch_add(block.len() as u64, Ordering::Relaxed);
             self.vocal_stats.record(meters);
             for (writer, mixes) in &mut self.outputs {
                 for frame in 0..block.len() {
@@ -343,6 +456,8 @@ impl Capture {
                     writer.push(packed);
                 }
             }
+            // Publish completion only after every output received this block.
+            self.health.captured_frames.fetch_add(block.len() as u64, Ordering::Release);
         }
     }
 }

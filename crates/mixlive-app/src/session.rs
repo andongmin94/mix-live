@@ -2,7 +2,7 @@
 //! Scene reads/writes do not resolve endpoints or load plugins. Existing files are never replaced.
 
 use mixlive_audio_windows::{
-    config::PitchConfig,
+    config::{AppSource, PitchConfig},
     control::{LiveCommand, LiveControls},
     plugin::{ChainEdit, EffectSpec, LiveParameter, PluginArgs},
     scene::AudioScene,
@@ -65,6 +65,15 @@ impl Session {
             &self.live_effects
         } else {
             self.scene().map_or(&[], |scene| scene.effects.as_slice())
+        }
+    }
+
+    /// Source indices follow the active capture layout, not the saved startup Scene.
+    pub fn apps(&self) -> &[AppSource] {
+        if let Some(active) = &self.active {
+            active.apps()
+        } else {
+            self.scene().map_or(&[], |scene| scene.route.apps.as_slice())
         }
     }
 
@@ -173,7 +182,7 @@ impl Session {
                 self.last_report = Instant::now();
                 self.last_meter = Instant::now();
                 self.active = Some(active);
-                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 믹서·보컬 설정과 VST3 상태를 저장할 수 있습니다.".into();
+                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 앱 소스·믹서·보컬 설정과 VST3 상태를 저장할 수 있습니다.".into();
                 Ok(())
             }
             Err(error) => self.fail("시작하지 못했습니다. 설정과 장치를 확인하세요.", error),
@@ -211,6 +220,52 @@ impl Session {
                 Ok(())
             }
             Err(error) => self.fail("VST3 체인 변경을 완료하지 못했습니다.", error),
+        }
+    }
+
+    /// Prepare and start the selected process client outside mutable GPUI updates.
+    pub fn add_app(&mut self, source: AppSource) -> Result<(), String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 실행 중에만 앱을 추가할 수 있습니다.", "audio is not running");
+        };
+        let previous = active.apps().to_vec();
+        let result = active.add_app(source);
+        self.timing = active.timing.clone();
+        if active.apps() != previous {
+            // An acknowledged layout can change before a later cleanup error. Old
+            // meter slots must never be displayed against the new source names.
+            self.levels = None;
+            self.report.clear();
+        }
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.message = "앱 추가 완료 · 소스별 보내기에서 연결할 출력을 켜세요. 정지 후 새 Scene 저장으로 보존할 수 있습니다.".into();
+                Ok(())
+            }
+            Err(error) => self.fail("앱 추가 중 오류가 발생했습니다.", error),
+        }
+    }
+
+    /// Retire only the selected capture client; the runtime publishes the compacted layout.
+    pub fn remove_app(&mut self, index: usize) -> Result<(), String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 실행 중에만 앱을 삭제할 수 있습니다.", "audio is not running");
+        };
+        let previous = active.apps().to_vec();
+        let result = active.remove_app(index);
+        self.timing = active.timing.clone();
+        if active.apps() != previous {
+            self.levels = None;
+            self.report.clear();
+        }
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.message = "앱 삭제 완료 · 남은 소스의 믹서 설정은 유지됩니다. 정지 후 새 Scene 저장으로 보존할 수 있습니다.".into();
+                Ok(())
+            }
+            Err(error) => self.fail("앱 삭제를 완료하지 못했습니다.", error),
         }
     }
 
@@ -349,7 +404,7 @@ impl Session {
             Err(error) => return self.fail("오디오를 정지했지만 실행 상태를 저장하지 못했습니다.", error),
         };
         self.save_new(path, scene)?;
-        self.message = "정지 후 현재 믹서·보컬 설정과 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
+        self.message = "정지 후 현재 앱 소스·믹서·보컬 설정과 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
         Ok(())
     }
 
@@ -410,6 +465,8 @@ mod tests {
             "not-a-device",
             "--output",
             "also-not-a-device",
+            "--app",
+            "C:\\Apps\\browser.exe",
         ]);
         let Command::Check(route) = cli.command else {
             panic!("expected route")
@@ -446,6 +503,12 @@ mod tests {
         assert_eq!(session.effects(), session.scene().unwrap().effects.as_slice());
         assert!(session.edit_chain(ChainEdit::Remove { index: 0 }).is_err());
         assert_eq!(session.effects().len(), 1);
+        assert_eq!(session.apps(), session.scene().unwrap().route.apps.as_slice());
+        assert_eq!(session.apps().len(), 1);
+        let apps = session.apps().to_vec();
+        assert!(session.add_app(AppSource::new("C:\\Apps\\player.exe".into())).is_err());
+        assert!(session.remove_app(0).is_err());
+        assert_eq!(session.apps(), apps);
         assert!(session.device_details.is_empty());
         assert!(session.report.is_empty());
         session.poll().unwrap();
@@ -456,6 +519,7 @@ mod tests {
         assert!(session.pitch_config().is_none());
         assert!(session.path().is_none());
         assert!(session.vocal_settings().is_none());
+        assert!(session.apps().is_empty());
         assert!(session.error.is_some());
     }
 
@@ -483,6 +547,9 @@ mod tests {
         assert!(session.set_effect_parameter(0, 0, 0.5).is_err());
         assert!(session.edit_chain(ChainEdit::Remove { index: 0 }).is_err());
         assert!(session.effects().is_empty());
+        assert!(session.apps().is_empty());
+        assert!(session.add_app(AppSource::new("not-running.exe".into())).is_err());
+        assert!(session.remove_app(0).is_err());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("no-live-scene.json");
         assert!(session.stop_and_save(path.clone()).is_err());
