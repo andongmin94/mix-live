@@ -9,4 +9,6 @@ pub mod devices;
 pub mod plugin;
 pub mod scene;
 #[cfg(windows)]
+pub(crate) mod process_capture;
+#[cfg(windows)]
 pub mod windows;

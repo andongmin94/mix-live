@@ -15,6 +15,8 @@ pub struct Cli {
 pub enum Command {
     /// List endpoint IDs and their default channel/rate/format configuration. Opens no streams.
     Devices,
+    /// List running application executable paths and unambiguous process-tree roots.
+    Apps,
     /// Validate devices, channels and vocal settings. Does not capture or play sound.
     Check(RouteOptions),
     /// Save, inspect, validate or run a device/vocal scene. Loading alone never starts audio.
@@ -97,9 +99,12 @@ pub struct RouteOptions {
     #[arg(long, default_value_t = 1)]
     pub input_channel: u16,
     /// Optional capture endpoint carrying MR/line/virtual-cable audio, NOT an app name or playback ID.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "aux_app")]
     pub aux_input: Option<String>,
-    /// One-based mono channel or stereo pair. May share the mic endpoint on other channels.
+    /// Exact executable path from apps; capture that process tree, not the entire desktop.
+    #[arg(long, conflicts_with = "aux_input")]
+    pub aux_app: Option<String>,
+    /// One-based mono channel or stereo pair. App capture exposes channels 1 and 2.
     #[arg(long, value_delimiter = ',', default_value = "1,2")]
     pub aux_channels: Vec<u16>,
     /// AUX trim before mixing (-96..0 dB); vocal effects never process this source.
@@ -150,6 +155,8 @@ pub struct RouteOptions {
 }
 
 impl RouteOptions {
+    pub fn has_aux(&self) -> bool { self.aux_input.is_some() || self.aux_app.is_some() }
+
     pub fn vocal_config(&self) -> VocalConfig {
         VocalConfig { preset: self.vocal, input_gain_db: self.input_gain_db, strength: self.vocal_strength,
             compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db }
@@ -169,11 +176,18 @@ impl RouteOptions {
             return Err("output and send channels must not overlap on the same endpoint".into());
         }
         let aux = InputMap::new(&self.aux_channels, u16::MAX)?;
+        if self.aux_input.is_some() && self.aux_app.is_some() {
+            return Err("choose an AUX device OR an application, not both".into());
+        }
+        if let Some(path) = &self.aux_app {
+            if path.trim().is_empty() { return Err("application executable path must not be blank".into()); }
+            InputMap::new(&self.aux_channels, 2)?;
+        }
+        if self.has_aux() && self.aux_to.includes(1) && self.send.is_none() {
+            return Err("AUX destination send/both requires --send; use --aux-to output for one mix".into());
+        }
         if let Some(id) = &self.aux_input {
             if id.trim().is_empty() { return Err("AUX endpoint ID must not be blank".into()); }
-            if self.aux_to.includes(1) && self.send.is_none() {
-                return Err("AUX destination send/both requires --send; use --aux-to output for one mix".into());
-            }
             if id == &self.input && aux.contains(usize::from(self.input_channel - 1)) {
                 return Err("microphone and AUX channels must not overlap on the same input endpoint".into());
             }

@@ -27,6 +27,12 @@ ASIO feature는 꺼져 있다. 공식 설치 파일·드라이버 릴리스는 �
   `licenses/gpui-APACHE-2.0.txt`에 보존한다. 바이너리 artifact에도 두 고지를 포함한다.
 
 - CPAL 0.18.2 (Apache-2.0): https://github.com/RustAudio/cpal/tree/v0.18.2
+- wasapi 0.27.0 (MIT): https://github.com/HEnquist/wasapi-rs/tree/v0.27.0
+  기존 CPAL endpoint 경로와 분리한 Windows process-loopback에만 사용한다.
+  원본 라이선스는 licenses/wasapi-MIT.txt에 보존한다. Registry checksum: `58b35dbcb6fae6fbaba9f6f52a22686bb405978ee112ed6eb33d98bd63c97583`.
+- sysinfo 0.31.4 (MIT): https://github.com/GuillaumeGomez/sysinfo/tree/v0.31.4
+  기존 lock에 있는 패키지의 process 조회 API를 직접 사용한다. 원본 고지는 licenses/sysinfo-MIT.txt.
+  실행 파일 경로, PID, parent, 시작 시각만 요청한다.
 - Rubato 5.0.1 (MIT OR Apache-2.0): https://github.com/HEnquist/rubato
 - rtrb 0.4.0 (MIT OR Apache-2.0): https://github.com/mgeier/rtrb
 - clap 4.6 (MIT OR Apache-2.0): https://github.com/clap-rs/clap

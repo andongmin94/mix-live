@@ -60,6 +60,8 @@ jobs:
         run: |
           ./target/release/mixlive-audio.exe --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./target/release/mixlive-audio.exe apps | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-audio.exe run --help
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./target/release/mixlive-plugins.exe inspect --help
@@ -226,10 +228,10 @@ jobs:
           $savedPath = Join-Path $sceneDirectory 'Edited scene.mixlive-scene.json'
           $pluginPath = Join-Path $sceneDirectory 'not-installed.vst3'
           $scene = [ordered]@{
-            schema = 4
+            schema = 5
             route = [ordered]@{
               input = 'ci-absent-mic'; input_channel = 2
-              aux_input = 'ci-absent-aux'; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
+              aux_input = 'ci-absent-aux'; aux_app = $null; aux_channels = @(4, 3); aux_gain_db = -9; aux_to = 'both'
               output = 'ci-absent-output'; output_channels = @(4, 3)
               send = 'ci-absent-send'; send_channels = @(1)
               input_gain_db = 1.25; output_gain_db = -23; send_gain_db = -6
@@ -389,7 +391,7 @@ jobs:
             $null = Wait-UiName $env:MIXLIVE_UI_START -Enabled
             if (!(Test-Path -LiteralPath $savedPath)) { throw 'The edited Scene was not saved to the chosen new file' }
             $saved = Get-Content -LiteralPath $savedPath -Raw | ConvertFrom-Json
-            if ($saved.schema -ne 4 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
+            if ($saved.schema -ne 5 -or $saved.route.input_gain_db -ne 3.5 -or $saved.route.vocal_strength -ne 0.5) {
               throw 'The saved Scene did not contain the edited vocal values'
             }
             foreach ($field in $scene.route.Keys) {

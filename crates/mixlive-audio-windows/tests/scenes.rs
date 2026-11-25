@@ -39,6 +39,33 @@ fn save_and_show_work_without_audio_hardware_and_do_not_overwrite() {
 }
 
 #[test]
+fn app_binding_persists_an_executable_path_not_a_pid_and_is_exclusive_with_device_aux() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("app.json");
+    let app = r"C:\Program Files\Browser\browser.exe";
+    let saved = command().args(["scene", "save"]).arg(&path)
+        .args(["--input", "mic", "--output", "phones", "--send", "cable", "--aux-app", app])
+        .output().unwrap();
+    assert!(saved.status.success(), "{}", String::from_utf8_lossy(&saved.stderr));
+    let restored = AudioScene::read(&path).unwrap();
+    assert_eq!(restored.route.aux_app.as_deref(), Some(app));
+    assert!(restored.route.aux_input.is_none() && restored.route.has_aux());
+    assert!(restored.route.validate().is_ok());
+    let mut route = restored.route;
+    route.aux_input = Some("other-device".into());
+    assert!(route.validate().is_err());
+    route.aux_input = None;
+    route.aux_channels = vec![3];
+    assert!(route.validate().is_err());
+    route.aux_channels = vec![1, 2];
+    route.send = None;
+    assert!(route.validate().is_err());
+    route.aux_to = mixlive_audio_windows::config::AuxDestination::Output;
+    assert!(route.validate().is_ok());
+    assert!(!String::from_utf8(std::fs::read(&path).unwrap()).unwrap().contains("\"pid\""));
+}
+
+#[test]
 fn invalid_scene_never_reaches_device_check_or_start_and_run_requires_valid_duration() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("invalid.mixlive-scene.json");

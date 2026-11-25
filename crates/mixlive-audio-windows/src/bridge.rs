@@ -13,7 +13,7 @@ const CEILING: f32 = 0.98; // Sample clipping guard, NOT a transparent or true-p
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub enum Fault { Device = 1, Input = 2, Overflow = 3, Resampler = 4, Routing = 5 }
+pub enum Fault { Device = 1, Input = 2, Overflow = 3, Resampler = 4, Routing = 5, Application = 6 }
 
 #[derive(Default)]
 pub struct Health {
@@ -35,6 +35,7 @@ impl Health {
             2 => Some("invalid or non-finite capture samples"),
             3 => Some("audio clock queue overflow; stopped instead of building unbounded latency"),
             4 => Some("resampler failed"),
+            6 => Some("application audio capture failed or lost continuity; stopped without changing capture targets"),
             _ => Some("routing failed"),
         }
     }

@@ -50,6 +50,7 @@ struct DeviceSetup {
     output: EndpointField,
     send: EndpointField,
     aux: EndpointField,
+    aux_app: Entity<SelectState>,
     aux_to: Entity<SelectState>,
     output_gain: Entity<InputState>,
     send_gain: Entity<InputState>,
@@ -133,6 +134,21 @@ impl SceneForm {
             window,
             cx,
         );
+        let aux_app = cx.new(|cx| {
+            let mut items = vec![SelectItem::new("", "사용 안 함")];
+            for app in &catalog.apps {
+                let label = match &app.target {
+                    Ok(target) => format!("{} · PID {}", app.path, target.pid),
+                    Err(error) => format!("{} · {error}", app.path),
+                };
+                items.push(SelectItem::new(app.path.clone(), label)
+                    .disabled(app.target.is_err() && draft.aux_app.as_ref() != Some(&app.path)));
+            }
+            if let Some(path) = draft.aux_app.as_ref().filter(|path| !catalog.apps.iter().any(|app| &app.path == *path)) {
+                items.push(SelectItem::new(path.clone(), format!("현재 없는 앱 · {path}")));
+            }
+            SelectState::new(items, cx).default_value(draft.aux_app.as_deref().unwrap_or(""))
+        });
         let aux_to = cx.new(|cx| {
             SelectState::new(
                 [
@@ -192,6 +208,18 @@ impl SceneForm {
                 },
             ));
         }
+        subscriptions.push(cx.observe(&aux_app, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe_in(&aux_app, window, |this, _, event, window, cx| {
+            if this.is_busy(cx) { return; }
+            let Setup::Devices { fields, .. } = &this.setup else { return; };
+            let SelectEvent::Change(id) = event;
+            if !id.is_empty() && selected(&fields.aux.select, cx).is_none() {
+                fields.aux.channels.update(cx, |input, cx| input.set_value("1,2", window, cx));
+            }
+            fields.set_busy(false, window, cx);
+            this.error = None;
+            cx.notify();
+        }));
         subscriptions.push(cx.observe(&aux_to, |_, _, cx| cx.notify()));
         for input in [&output_gain, &send_gain, &aux_gain, &queue_ms] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
@@ -202,6 +230,7 @@ impl SceneForm {
             output,
             send,
             aux,
+            aux_app,
             aux_to,
             output_gain,
             send_gain,
@@ -285,6 +314,7 @@ impl DeviceSetup {
             send: selected(&self.send.select, cx),
             send_channels: self.send.channels.read(cx).value().to_string(),
             aux_input: selected(&self.aux.select, cx),
+            aux_app: selected(&self.aux_app, cx),
             aux_channels: self.aux.channels.read(cx).value().to_string(),
             aux_to: selected(&self.aux_to, cx).unwrap_or_default(),
             output_gain_db: self.output_gain.read(cx).value().to_string(),
@@ -317,7 +347,14 @@ impl DeviceSetup {
                 .channels
                 .update(cx, |input, cx| input.set_disabled(busy || !available, cx));
         }
-        let aux_disabled = busy || selected(&self.aux.select, cx).is_none();
+        self.aux_app.update(cx, |state, cx| state.set_disabled(busy, window, cx));
+        let app = selected(&self.aux_app, cx);
+        if selected(&self.aux.select, cx).is_none() {
+            let available = app.as_ref().is_some_and(|path| self.catalog.apps.iter()
+                .any(|app| &app.path == path && app.target.is_ok()));
+            self.aux.channels.update(cx, |input, cx| input.set_disabled(busy || !available, cx));
+        }
+        let aux_disabled = busy || (selected(&self.aux.select, cx).is_none() && app.is_none());
         self.aux_to
             .update(cx, |state, cx| state.set_disabled(aux_disabled, window, cx));
         self.aux_gain
@@ -337,8 +374,31 @@ impl DeviceSetup {
             .gap_5()
             .child(section_title("01", "소스 선택"))
             .child(self.device_field(Endpoint::Mic, "new-mic", "내 목소리 · 필수", window, cx))
-            .child(self.device_field(Endpoint::Aux, "new-aux", "AUX / MR · 선택", window, cx));
-        if selected(&self.aux.select, cx).is_some() {
+            .child(self.device_field(Endpoint::Aux, "new-aux", "AUX / MR · 선택", window, cx))
+            .child(div().flex().flex_col().gap_2().min_w_0()
+                .child(div().font_semibold().child("AUX 앱 캡처 · 선택"))
+                .child(select_control("new-aux-app", "AUX 앱 캡처 · 선택", &self.aux_app, None, window, cx))
+                .child(div().text_xs().text_color(rgb(MUTED)).child("녹음 장치 또는 실행 중인 앱 하나를 선택하세요. 원래 앱 재생은 유지됩니다.")));
+        let app = selected(&self.aux_app, cx);
+        let device = selected(&self.aux.select, cx);
+        if let Some(path) = &app {
+            if device.is_none() {
+                sources = sources.child(div().flex().items_center().gap_3()
+                    .child(div().text_xs().text_color(rgb(MUTED)).child("앱 채널 1 또는 1,2"))
+                    .child(number_input("new-aux-app", &self.aux.channels, window, cx)));
+            }
+            let problem = match self.catalog.apps.iter().find(|app| &app.path == path) {
+                Some(app) => app.target.as_ref().err().cloned(),
+                None => Some("저장된 앱이 현재 실행 목록에 없습니다. 앱을 실행하고 장치 설정을 다시 여세요.".into()),
+            };
+            if let Some(problem) = problem {
+                sources = sources.child(div().text_xs().text_color(rgb(DANGER)).child(problem));
+            }
+            if device.is_some() {
+                sources = sources.child(div().text_xs().text_color(rgb(DANGER)).child("AUX 장치와 앱 중 하나만 선택하세요."));
+            }
+        }
+        if device.is_some() || app.is_some() {
             sources = sources.child(
                 div()
                     .flex()
@@ -364,7 +424,7 @@ impl DeviceSetup {
             div()
                 .text_xs()
                 .text_color(rgb(MUTED))
-                .child("AUX는 녹음 장치의 소리를 받습니다. 보컬 보정은 거치지 않습니다."),
+                .child("AUX는 선택한 녹음 장치 또는 앱의 소리를 받으며 보컬 보정을 거치지 않습니다."),
         );
         let destinations = panel()
             .flex_1()

@@ -721,7 +721,13 @@ impl MixLive {
                     route.input_channel, route.input_gain_db
                 ),
             ));
-        if let Some(aux) = &route.aux_input {
+        if let Some(app) = &route.aux_app {
+            sources = sources.child(device(
+                "AUX / MR · 앱 캡처",
+                app,
+                format!("프로세스 트리 · 채널 {} · {:+.1} dB", channels(&route.aux_channels), route.aux_gain_db),
+            ));
+        } else if let Some(aux) = &route.aux_input {
             sources = sources.child(device(
                 "AUX / MR",
                 aux,
@@ -1291,20 +1297,6 @@ fn peak_meter(label: &'static str, peak: Option<f32>) -> Div {
             .child(div().h_full().w(relative(fill)).rounded_full().bg(rgb(color))))
 }
 
-#[cfg(test)]
-mod meter_tests {
-    use super::*;
-    #[test]
-    fn sample_peak_display_has_a_logarithmic_scale_and_no_synthetic_signal() {
-        assert_eq!(peak_display(None).0, 0.0);
-        assert_eq!(peak_display(Some(0.0)).1, "−∞ dBFS");
-        assert_eq!(peak_display(Some(0.0001)).0, 0.0);
-        assert!((peak_display(Some(10.0_f32.powf(-30.0 / 20.0))).0 - 0.5).abs() < 1e-6);
-        assert_eq!(peak_display(Some(1.0)), (1.0, "0.0 dBFS".into(), DANGER));
-        assert_eq!(peak_display(Some(2.0)), (1.0, "6.0 dBFS".into(), DANGER));
-    }
-}
-
 fn scene_name(session: &Session) -> String {
     session
         .path()
@@ -1469,4 +1461,18 @@ pub fn run(scene: Option<PathBuf>) {
         .expect("failed to open MixLive window");
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::*;
+    #[test]
+    fn sample_peak_display_has_a_logarithmic_scale_and_no_synthetic_signal() {
+        assert_eq!(peak_display(None).0, 0.0);
+        assert_eq!(peak_display(Some(0.0)).1, "−∞ dBFS");
+        assert_eq!(peak_display(Some(0.0001)).0, 0.0);
+        assert!((peak_display(Some(10.0_f32.powf(-30.0 / 20.0))).0 - 0.5).abs() < 1e-6);
+        assert_eq!(peak_display(Some(1.0)), (1.0, "0.0 dBFS".into(), DANGER));
+        assert_eq!(peak_display(Some(2.0)), (1.0, "6.0 dBFS".into(), DANGER));
+    }
 }

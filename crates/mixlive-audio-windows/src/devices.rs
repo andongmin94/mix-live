@@ -5,6 +5,21 @@
 pub struct DeviceCatalog {
     pub inputs: Vec<DeviceInfo>,
     pub outputs: Vec<DeviceInfo>,
+    pub apps: Vec<AppInfo>,
+}
+
+/// A process-tree identity observed in the current catalog, never persisted in a Scene.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessTarget {
+    pub pid: u32,
+    pub started: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppInfo {
+    pub path: String,
+    /// Multiple independent roots or a tree containing MixLive are not selectable.
+    pub target: Result<ProcessTarget, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

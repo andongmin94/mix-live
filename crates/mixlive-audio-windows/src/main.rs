@@ -25,6 +25,7 @@ fn run(cli: Cli, plugin: PluginArgs) -> Result<()> {
     }
     match cli.command {
         Command::Devices => device::list(),
+        Command::Apps => device::apps(),
         Command::Check(route) => device::check(&route),
         Command::Run { route, seconds, interactive } => {
             let setup = plugin.resolve()?;
@@ -92,6 +93,16 @@ mod device {
         Ok(())
     }
 
+    pub fn apps() -> Result<()> {
+        for app in mixlive_audio_windows::windows::list_apps() {
+            match app.target {
+                Ok(target) => println!("{}\n  PID {} + descendants", app.path, target.pid),
+                Err(error) => println!("{}\n  unavailable: {error}", app.path),
+            }
+        }
+        Ok(())
+    }
+
     pub fn check(route: &RouteOptions) -> Result<()> {
         println!("{}", Prepared::new(route)?.describe());
         Ok(())
@@ -148,6 +159,7 @@ mod device {
     use super::{ResolvedPlugins, Result, RouteOptions};
     const UNSUPPORTED: &str = "audio devices are implemented for Windows only; scene save/show do not require devices";
     pub fn list() -> Result<()> { Err(UNSUPPORTED.into()) }
+    pub fn apps() -> Result<()> { Err(UNSUPPORTED.into()) }
     pub fn check(_route: &RouteOptions) -> Result<()> { Err(UNSUPPORTED.into()) }
     pub fn run(_route: &RouteOptions, _seconds: u64, _interactive: bool, _plugin: &ResolvedPlugins) -> Result<()> { Err(UNSUPPORTED.into()) }
 }

@@ -4,7 +4,7 @@
 
 Windows용 실시간 마이크·MR 라우팅/믹싱/보정 앱을 만드는 프로젝트다. DAW 타임라인이나
 OBS 전용 플러그인이 아니다. 현재는 **GPUI Scene 실행 화면과 명령줄 도구를 제공하는 개발 빌드**다.
-자체 가상 마이크·ASIO·앱별 직접 캡처는 아직 없다. 실제 검증 결과와 미검증 범위는
+자체 가상 마이크·ASIO는 아직 없다. 하나의 앱 프로세스 트리를 AUX로 직접 캡처할 수 있다. 실제 검증 결과와 미검증 범위는
 [STATUS.md](STATUS.md)를 따른다.
 
 ## 현재 처리 경로
@@ -37,7 +37,7 @@ cargo build --release -p mixlive-app -p mixlive-audio-windows -p mixlive-vst3 --
 ### 네이티브 Scene 화면
 
 `mixlive.exe`에서 **새 Scene → 장치·보컬·VST3 선택 → 새 파일로 저장 → 오디오 시작** 순서로 시작할 수 있다.
-마이크와 주 출력은 직접 선택하며, AUX/MR 녹음 장치와 추가 송출 재생 장치는 선택 사항이다.
+마이크와 주 출력은 직접 선택하며, AUX/MR 녹음 장치 또는 실행 중인 앱 하나와 추가 송출 재생 장치는 선택 사항이다.
 목록은 실제 WASAPI endpoint 이름·ID·기본 채널/샘플레이트/형식을 표시한다. 같은 이름이어도
 ID로 구분하며, 사용할 수 없는 설정은 이유를 표시한다. 장치를 연결한 뒤에는 새 Scene이나
 **장치·출력 설정**을 다시 열어 목록을 조회한다. 조회는 스트림을 만들지 않고 시스템 기본 장치를 바꾸지 않는다.
@@ -50,7 +50,7 @@ AUX를 추가 송출로 보내려면 해당 출력 장치도 선택해야 한다
 내장 보정 `off/natural/warm/bright`를 고를 수 있으며, 새 Scene의 초기값은 출력 −18 dB,
 AUX −12 dB, 입력 trim 0 dB, 보정 비율 100%, queue 목표 30 ms다. 전체/추가 송출/AUX 시작 음량과
 queue 목표, 입력 trim, 보정 비율, 컴프레서/디에서 threshold와 VST3 순서를 저장 전에 바꿀 수 있다.
-저장은 기존 schema 4의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
+저장은 기존 schema 5의 **새 파일만** 만들며 기존 파일을 덮어쓰지 않는다. 취소/저장 실패 시
 이전 Scene 선택을 유지한다. 장치와 현재 설정은 실제 시작 때 다시 검사한다.
 
 기존 체인은 **Scene 열기 → 저장된 소스·보컬 체인·목적지 확인 → 오디오 시작**으로 실행한다.
@@ -166,7 +166,7 @@ Windows가 stereo만 노출하면 ASIO 3/4를 만들어 주지 않는다.
 ```
 
 `--aux-input`은 **INPUT 목록의 캡처 endpoint**다. 분리된 루프백/라인 입력 또는 기존 가상
-케이블의 녹음 쪽을 받으며 Chrome/PID/탭 직접 캡처가 아니다. 의도한 MR만 선택하고 MixLive 출력·
+케이블의 녹음 쪽을 받는다. 앱 직접 캡처는 별도의 --aux-app 옵션을 사용한다. 의도한 MR만 선택하고 MixLive 출력·
 통화 수신음이 포함된 전체 루프백을 다시 넣지 않는다. 외부 피드백 자동 검출은 없다.
 `--aux-to send|output|both`의 기본 send-only는 이미 듣는 MR의 이중 모니터를 피한다.
 send/both에는 `--send`가 필요하다. AUX gain은 -96..0 dB, mono 복제·stereo·역순을 지원한다.
@@ -177,9 +177,28 @@ send/both에는 `--send`가 필요하다. AUX gain은 -96..0 dB, mono 복제·st
 장치/비유한 sample/overflow 오류는 전체 경로 중단이다. `stream0`/`stream1` 통계는
 물리 출력 스트림 단위이며 `queue-ms`는 queue 목표이지 하드웨어 버퍼/실측 왕복 지연이 아니다.
 
+### 앱 직접 캡처 (Windows 11)
+
+앱을 실행한 뒤 장치·출력 설정의 **AUX 앱 캡처**에서 실제 실행 파일 경로를 선택한다.
+AUX 녹음 장치와 앱 중 하나만 사용할 수 있다. 앱은 기존 출력에서 계속 재생하며 기본 AUX
+목적지는 추가 송출이다. 주 출력에도 보내면 원래 소리와 이중 모니터링될 수 있다.
+
+```powershell
+.\target\release\mixlive-audio.exe apps
+.\target\release\mixlive-audio.exe run --input "<MIC INPUT ID>" --output "<HEADPHONE OUTPUT ID>" --send "<CALL OUTPUT ID>" --aux-app "C:\Program Files\Browser\browser.exe" --aux-to send --seconds 30
+```
+
+`--aux-app`에는 apps가 표시한 정확한 실행 파일 경로를 지정한다. Scene에는 경로만 저장하고
+시작 때 해당 경로의 프로세스 트리 루트를 다시 조회한다. 동일 경로에 독립 루트가 둘 이상이면
+거절하고 MixLive가 포함된 트리도 거절한다. 시작 후 다른 PID로 자동 전환하지 않는다.
+Windows Process Loopback의 include-tree 모드만 사용하며 전체 시스템 캡처로 대체하지 않는다.
+별도 MTA 스레드에서 float32 stereo 48 kHz를 요청하고 기존 AUX clock bridge를 재사용한다.
+앱의 원래 재생이나 개별 브라우저 탭 제어, 다중 앱 동시 캡처, 자체 private render endpoint는 제공하지 않는다.
+실제 프로세스 오디오 수신은 실장비 확인이 필요하다.
+
 ## 장치·보컬·VST3를 Scene 하나로 재실행
 
-**Scene schema 4**는 mic/AUX/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
+**Scene schema 5**는 mic/AUX/출력/내장 보컬/queue 설정과 VST3의 순서·경로·class·state를
 한 파일에 담는다. 기존 체인을 넣으면 상태 바이트를 복사하므로 원래 체인 JSON은 재실행에
 필요하지 않다. 플러그인 DLL과 외부 샘플/라이선스 등은 여전히 설치되어 있어야 한다.
 
@@ -202,7 +221,7 @@ Scene과 체인 파일은 자동으로 덮어쓰지 않는다. CLI는 실행 중
 GUI의 정지 후 새 Scene 저장에서만 전체 실행 상태를 저장한다. CLI에서 편집한 VST3 상태는 새 체인 파일로 내보낸 뒤 다음 `scene save`에 넣는다.
 
 상대 경로는 들어 있던 chain/scene 파일 기준으로 해석한다. CLI에서 지정한 경로는 현재 작업
-폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~3은 읽지 않으며 현재 옵션으로
+폴더 기준으로 절대화한 뒤 Scene에 저장한다. 이전 schema 1~4는 읽지 않으며 현재 옵션으로
 다시 저장한다. 마이그레이션/누락값 복구는 없다. Scene에는 개인 장치 ID와 플러그인 상태가
 포함되므로 공개하지 않는다. `*.mixlive-scene.json`은 Git에서 제외한다.
 

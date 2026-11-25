@@ -20,6 +20,7 @@ pub struct SceneDraft {
     pub send_channels: String,
     pub send_gain_db: String,
     pub aux_input: Option<String>,
+    pub aux_app: Option<String>,
     pub aux_channels: String,
     pub aux_gain_db: String,
     pub aux_to: String,
@@ -40,6 +41,7 @@ impl Default for SceneDraft {
             send_channels: "1,2".into(),
             send_gain_db: "0".into(),
             aux_input: None,
+            aux_app: None,
             aux_channels: "1,2".into(),
             aux_gain_db: "-12".into(),
             aux_to: "send".into(),
@@ -72,6 +74,7 @@ impl SceneDraft {
             send_channels: channel_text(&route.send_channels),
             send_gain_db: route.send_gain_db.to_string(),
             aux_input: route.aux_input.clone(),
+            aux_app: route.aux_app.clone(),
             aux_channels: channel_text(&route.aux_channels),
             aux_gain_db: route.aux_gain_db.to_string(),
             aux_to: match route.aux_to {
@@ -115,6 +118,15 @@ impl SceneDraft {
             let aux = selected(&self.aux_input, &catalog.inputs, "AUX / MR 입력")?;
             InputMap::new(&aux_channels, configuration(aux)?.channels)?;
         }
+        if let Some(path) = &self.aux_app {
+            if self.aux_input.is_some() {
+                return Err("AUX 장치와 앱 중 하나만 선택하세요.".into());
+            }
+            let app = catalog.apps.iter().find(|app| &app.path == path)
+                .ok_or("저장된 앱이 현재 실행 목록에 없습니다. 앱을 실행하고 장치 설정을 다시 여세요.")?;
+            app.target.as_ref().map_err(Clone::clone)?;
+            InputMap::new(&aux_channels, 2)?;
+        }
         let aux_to = match self.aux_to.as_str() {
             "off" => AuxDestination::Off,
             "output" => AuxDestination::Output,
@@ -122,7 +134,7 @@ impl SceneDraft {
             "both" => AuxDestination::Both,
             _ => return Err("AUX를 보낼 목적지를 선택하세요.".into()),
         };
-        if self.aux_input.is_some() && aux_to.includes(1) && self.send.is_none() {
+        if (self.aux_input.is_some() || self.aux_app.is_some()) && aux_to.includes(1) && self.send.is_none() {
             return Err("AUX를 추가 송출로 보내려면 추가 송출 장치를 선택하세요. 주 출력만 사용하려면 AUX 목적지를 주 출력으로 바꾸세요.".into());
         }
         let vocal = self.sound.vocal_config()?;
@@ -131,6 +143,7 @@ impl SceneDraft {
                 input: input.id.clone(),
                 input_channel,
                 aux_input: self.aux_input.clone(),
+                aux_app: self.aux_app.clone(),
                 aux_channels,
                 aux_gain_db: number(&self.aux_gain_db, "AUX 음량")?,
                 aux_to,
@@ -226,6 +239,10 @@ mod tests {
         DeviceCatalog {
             inputs: vec![device("input-a", 4), device("input-b", 1)],
             outputs: vec![device("output-a", 4), device("output-b", 1)],
+            apps: vec![mixlive_audio_windows::devices::AppInfo {
+                path: "C:\\Apps\\browser.exe".into(),
+                target: Ok(mixlive_audio_windows::devices::ProcessTarget { pid: 11, started: 1 }),
+            }],
         }
     }
 
@@ -331,6 +348,24 @@ mod tests {
         assert_eq!(scene.route.input, "input-b");
         assert_eq!(scene.route.output, "output-b");
         assert_eq!(scene.route.output_channels, [1]);
+    }
+
+    #[test]
+    fn application_aux_uses_an_explicit_running_tree_and_preserves_the_saved_path() {
+        let mut draft = draft();
+        draft.aux_app = Some("C:\\Apps\\browser.exe".into());
+        draft.aux_to = "output".into();
+        let mut devices = catalog();
+        let scene = draft.build(&devices).unwrap();
+        assert!(scene.route.aux_input.is_none());
+        assert_eq!(scene.route.aux_app, draft.aux_app);
+        let restored = SceneDraft::from_scene(&scene);
+        devices.apps[0].target.as_mut().unwrap().pid = 22;
+        assert_eq!(restored.build(&devices).unwrap().route, scene.route);
+        devices.apps[0].target = Err("ambiguous process tree".into());
+        assert!(restored.build(&devices).unwrap_err().contains("ambiguous"));
+        devices.apps.clear();
+        assert!(restored.build(&devices).is_err());
     }
 
     #[test]

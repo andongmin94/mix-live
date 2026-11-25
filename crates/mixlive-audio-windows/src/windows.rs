@@ -2,7 +2,8 @@
 use std::{error::Error, sync::{Arc, atomic::Ordering}};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use mixlive_effects::VocalChain;
-use crate::devices::{DeviceCatalog, DeviceConfig, DeviceInfo};
+use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget};
+use crate::process_capture::{self, ProcessCapture};
 use crate::{bridge::{self, Fault, Health, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AuxDestination, InputMap, OutputMap, RouteOptions, output_sample}, control::{LiveControls, PlaybackGains}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
@@ -18,8 +19,12 @@ pub fn device_catalog() -> Result<DeviceCatalog> {
     for device in host.output_devices()? {
         catalog.outputs.push(device_info(&device, device.default_output_config())?);
     }
+    catalog.apps = process_capture::app_catalog();
     Ok(catalog)
 }
+
+/// Running application paths and process-tree roots; no native audio activation.
+pub fn list_apps() -> Vec<AppInfo> { process_capture::app_catalog() }
 
 fn device_info(device: &Device, config: std::result::Result<SupportedStreamConfig, cpal::Error>) -> Result<DeviceInfo> {
     let config = config.map_err(|error| error.to_string()).and_then(|config| {
@@ -65,6 +70,7 @@ pub struct Prepared {
     input_config: SupportedStreamConfig,
     input_channel: usize,
     auxiliary: Option<AuxiliaryEndpoint>,
+    app: Option<(String, ProcessTarget, InputMap)>,
     aux_mix: Option<(f32, AuxDestination)>,
     vocal: VocalChain,
     output_gain_db: f32,
@@ -117,6 +123,9 @@ impl Prepared {
             }
             Ok(AuxiliaryEndpoint { device, config, map })
         }).transpose()?;
+        let app = options.aux_app.as_ref().map(|path| -> Result<_> {
+            Ok((path.clone(), process_capture::resolve(path)?, InputMap::new(&options.aux_channels, 2)?))
+        }).transpose()?;
         let vocal = VocalChain::new(input_config.sample_rate(), options.vocal_config())?;
         let mut outputs: Vec<OutputEndpoint> = Vec::new();
         let mut add = |id: &str, channels: &[u16], mix: usize| -> Result<()> {
@@ -142,7 +151,7 @@ impl Prepared {
         add(&options.output, &options.output_channels, 0)?;
         if let Some(id) = &options.send { add(id, &options.send_channels, 1)?; }
         Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal,
-            auxiliary, aux_mix: options.aux_input.as_ref().map(|_| (options.aux_gain_db, options.aux_to)),
+            auxiliary, app, aux_mix: options.has_aux().then_some((options.aux_gain_db, options.aux_to)),
             output_gain_db: options.output_gain_db, send_gain_db: options.send.as_ref().map(|_| options.send_gain_db),
             queue_ms: options.queue_ms, controls: Arc::new(LiveControls::from_route(options)?), outputs })
     }
@@ -162,6 +171,10 @@ impl Prepared {
                 if aux.device == self.input { "shares the microphone capture stream and clock" }
                 else { "separate capture stream; buffered/resampled to the microphone clock (additional AUX delay)" }));
             text.push_str("AUX must carry only the intended MR/line audio, not MixLive output or call return. No app filtering or external feedback detection. Enable output/both only when AUX is not already heard through another path.\n");
+        }
+        if let Some((path, target, map)) = &self.app {
+            text.push_str(&format!("AUX application: {path}\n  PID {} and descendants; 48000 Hz float32 stereo, channels {},{}; mix settings {:?}\n  Independent clock bridge. Original application playback is unchanged; no automatic rebind or whole-desktop capture.\n",
+                target.pid, map.left + 1, map.right + 1, self.aux_mix));
         }
         text.push_str(&format!("Initial mixer: {}\n", self.controls.describe()));
         text.push_str("Vocal preset/thresholds and device bindings are fixed for this run. --interactive enables live source/output mute and master/send gain with 5 ms ramps. Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain or lookahead buffer; IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
@@ -220,6 +233,16 @@ impl Prepared {
                 AuxFeed::Independent(Box::new(reader))
             }
         };
+        // Prepare the same independent AUX clock bridge for a process source.
+        // Do not start its producer until plugins and device streams are built.
+        let (aux_feed, app_start) = if let Some((path, target, map)) = self.app {
+            let (writer, reader) = bridge::channel(process_capture::RATE, self.input_config.sample_rate(), self.queue_ms, 1, health.clone())?;
+            timing.push(format!("AUX application boundary: queue target {:.2} ms + resampler delay {:.2} ms (excludes OS/hardware)", reader.queue_ms, reader.resampler_delay_ms));
+            aux_clock_stats = Some(reader.stats.clone());
+            (AuxFeed::Independent(Box::new(reader)), Some((path, target, map, writer)))
+        } else {
+            (aux_feed, None)
+        };
         let capture = Capture::new(self.vocal, self.input_config.sample_rate(), self.aux_mix, writers, health.clone(), controls.clone())?;
         let vocal_stats = capture.vocal_stats.clone();
         let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, self.aux_mix.is_some(), health.clone())?;
@@ -235,11 +258,13 @@ impl Prepared {
             _ => return Err("sample format changed after validation".into()),
         };
         timing.push(format!("input driver buffer query: {:?} frames", input_stream.buffer_size()));
+        let app_capture = app_start.map(|(path, target, map, writer)|
+            ProcessCapture::start(path, target, map, writer, health.clone())).transpose()?;
         // Output emits silence until each queue is primed. Any startup error drops every stream.
         for stream in &streams { stream.play()?; }
         if let Some(stream) = &aux_stream { stream.play()?; }
         input_stream.play()?;
-        Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, plugin_worker, health, outputs: stats,
+        Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, _app_capture: app_capture, plugin_worker, health, outputs: stats,
             controls, aux_enabled: self.aux_mix.is_some(), aux_clock_stats, vocal_stats, timing })
     }
 }
@@ -264,6 +289,7 @@ pub struct Active {
     _input: Stream,
     _aux_input: Option<Stream>,
     _outputs: Vec<Stream>,
+    _app_capture: Option<ProcessCapture>,
     plugin_worker: Option<PluginWorker>,
     pub health: Arc<Health>,
     pub controls: Arc<LiveControls>,
@@ -379,10 +405,11 @@ impl Active {
     }
 
     fn stop_devices(self) -> (Option<PluginWorker>, Arc<Health>) {
-        let Self { _input, _aux_input, _outputs, plugin_worker, health, .. } = self;
+        let Self { _input, _aux_input, _outputs, _app_capture, plugin_worker, health, .. } = self;
         drop(_input);
         drop(_aux_input);
         drop(_outputs);
+        drop(_app_capture);
         (plugin_worker, health)
     }
 

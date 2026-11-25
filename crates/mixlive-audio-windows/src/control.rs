@@ -160,7 +160,7 @@ impl LiveControls {
     /// Restore requested controls before constructing any capture or playback ramps.
     pub fn from_route(route: &RouteOptions) -> Result<Self, String> {
         route.validate()?;
-        let controls = Self::new(route.output_gain_db, route.send.as_ref().map(|_| route.send_gain_db), route.aux_input.is_some())?;
+        let controls = Self::new(route.output_gain_db, route.send.as_ref().map(|_| route.send_gain_db), route.has_aux())?;
         let settings = route.mix;
         for (target, muted) in [(MuteTarget::Mic, settings.mute_mic), (MuteTarget::Output, settings.mute_output), (MuteTarget::All, settings.mute_all)] {
             controls.apply(LiveCommand::Mute { target, muted })?;
@@ -183,7 +183,7 @@ impl LiveControls {
     /// Control thread only, with edits suspended. Capture requested values, not transient ramps.
     /// Preserve inactive optional values from the original route. Stop is never persisted.
     pub fn snapshot_into(&self, route: &mut RouteOptions) -> Result<(), String> {
-        if self.has_aux != route.aux_input.is_some() || self.has_send != route.send.is_some() {
+        if self.has_aux != route.has_aux() || self.has_send != route.send.is_some() {
             return Err("live controls do not match the Scene topology".into());
         }
         let mut saved = route.clone();
