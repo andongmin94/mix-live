@@ -223,8 +223,9 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
         processors.push(Processor::new(plugin.clone(), buffers, bypassed.clone(), rate, latency));
         owner.slots.push(Slot { plugin, editor: None, bypassed });
     }
-    let compensation = capture.prepare_vst3_delay(total_latency, rate)?;
-    owner.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOutgoing AUX/app send compensation: {compensation} samples ({:.2} ms); monitor adds no compensation. Only reported VST3 latency, not device or clock alignment.\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. Explicit slot bypass blends with latency-aligned dry audio; effects still process. No automatic dry fallback or crash isolation. Restart requests stop the route.",
+    let pitch_latency = capture.pitch_latency();
+    let compensation = capture.prepare_voice_delay(total_latency, rate)?;
+    owner.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOutgoing AUX/app send compensation: {compensation} samples ({:.2} ms); monitor adds no compensation. Includes {pitch_latency} samples of built-in pitch latency plus reported VST3 latency, not device or clock alignment.\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. Explicit slot bypass blends with latency-aligned dry audio; effects still process. No automatic dry fallback or crash isolation. Restart requests stop the route.",
         processors.len(), total_latency, total_latency as f64 * 1000.0 / f64::from(rate),
         compensation as f64 * 1000.0 / f64::from(rate), capacity as f64 * 1000.0 / f64::from(rate)));
     let stop = owner.stop.clone();

@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **가상 장치 개발 패키지 빌드 완료 · 출력 리미터 및 스케일 기준 음정 관측**
+단계: **가상 장치 개발 패키지 빌드 완료 · 실험적 자동 음정 보정 경로 추가**
 
 ## 현재 구현
 
@@ -26,14 +26,18 @@
   마이크 raw window를 기존 bounded SPSC로 control thread에 전달한다. RustFFT 자기상관과
   정확한 중첩 에너지 정규화로 pitch(70..1200 Hz, A440 note/cents/clarity)를 추정한다.
   Scene에 chromatic/major/natural minor 및 기준 조성을 저장하고 가장 가까운 허용음과 편차를 표시한다.
-  자동 보정·오디오 변경·녹음은 없다.
+  표시용 관측은 오디오를 변경하지 않는다. 선택적 자동 보정은 별도로 0..1 강도와 5..200 ms
+  retune smoothing을 설정한다. 같은 Estimator와 RustFFT 기반 sqrt-Hann 4-overlap phase vocoder를
+  사용하고 1:1 샘플 수를 유지한다. 강도 0이면 추가 지연 없이 비활성, 활성 시 분석창만큼 고정 지연
+  (48 kHz에서 2048 samples)을 추가하며 무성음은 정렬된 dry다. 실제 음질과 CPU는 미검증이다.
 - 정지 상태의 장치·출력 설정은 기존 장치/앱·채널·보컬·플러그인 설정과 모든 앱의 mixer 값을
   보존한다. 누락/지원 불가 장치와 앱을 명시하며 저장/시작을 거절하고 임의로 대체하지 않는다.
   보컬 설정은 장치 조회 없이 preset·trim·strength·threshold·VST3 순서와 상태를 편집한다.
   기존 CLI의 filesystem-only VST3 표준 경로 검색을 GPUI에서 재사용해 발견 후보를 명시적으로
   추가한다. native DLL 로딩·class/호환성 검증은 시작 시점이며 경로 검색 자체는 이를 보장하지 않는다.
   검색 성공 이후 명시적 다시 검색 버튼을 표시해 완료 상태를 접근성 트리에서 구분한다.
-- 최종 활성화된 VST3 체인의 신고 latency 합으로 통화·방송의 AUX/앱 send를 정수 샘플 지연한다.
+- 내장 pitch correction의 고정 latency와 최종 활성 VST3 체인의 신고 latency 합으로 통화·방송의
+  AUX/앱 send를 정수 샘플 지연한다. VST3 없는 경로에도 pitch 지연 보상을 적용한다.
   모니터는 추가 보상하지 않는다. 지연 뒤에 소스 mute/route gain을 적용하며, 실제 보상이 필요할 때
   2초 상한을 넘으면 시작을 거절한다. 준비 시 할당하며 지연 변경 restart는 기존대로 경로를 중단한다.
   장치 timestamp/clock bridge/OS 지연을 실측·보상하는 것은 아니다.
@@ -58,11 +62,11 @@
 - 정지 후 새 Scene 저장은 장치 중지 → 앱 capture thread join → VST3 worker join → 모든
   상태 수집 → 새 파일 게시를 사용한다. 실행 중 모든 소스/출력 mute·route·gain, 보컬 파라미터와 VST3 상태를
   다음 시작 전에 복원한다. 일반 정지/닫기/오류는 저장하지 않으며 파일 덮어쓰기 없음.
-  schema 12는 음정 기준 및 EQ·다이내믹스·에코 설정과 슬롯별 `bypassed`와 `route.apps` 배열(실행 파일 경로와 슬롯별 설정), 방송 장치·채널·감쇠와 각 믹스의 상태 및 리버브 설정을 저장하고 PID나 잔향 버퍼는 저장하지 않는다.
+  schema 13은 음정 기준·보정 설정 및 EQ·다이내믹스·에코 설정과 슬롯별 `bypassed`와 `route.apps` 배열(실행 파일 경로와 슬롯별 설정), 방송 장치·채널·감쇠와 각 믹스의 상태 및 리버브 설정을 저장하고 PID나 잔향 버퍼는 저장하지 않는다.
   CLI의 직접 `run`/`scene run --scene-out`도 같은 전체 snapshot을 정상 정지 후 새 파일에 저장한다.
   종료 시 console 명령을 닫아 늦은 입력이 snapshot을 바꾸지 못하게 한다. 기존 파일·chain-out 동시 요청은
   시작 전에 거절한다. VST3 chain schema는 2이며 bypassed는 필수다.
-  Scene schema 1~11 및 chain schema 1, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
+  Scene schema 1~12 및 chain schema 1, 기존 단일 `aux_app` 필드와 `--aux-app` 옵션은 제거했다. CLI는 반복 `--app` 및
   `appN` 제어 명령을 사용한다.
 
 - `drivers/virtual-audio/`에 고정 Call/Broadcast/Return PnP 하드웨어 ID와 독립 render/capture
@@ -108,7 +112,11 @@
   limiter의 stereo 비율/회복/믹스 격리/계측 테스트 성공. 기존 pitch-detection 정규화로 인해
   낮은 합성음 검출 테스트가 실패했다. 기존 FFT dependency를 직접 사용하고 lag별 양쪽 중첩 에너지를
   계산하도록 교체했다. 75..1190 Hz 순음, 대역 밖 거절, 배음 포함, 기준 스케일·Scene/UI 검사를 추가했다.
-  [PR #1](https://github.com/andongmin94/mix-live/pull/1)의 수정된 통합 검사 결과는 아직 확인하지 않았다.
+- [Audio #45](https://github.com/andongmin94/mix-live/actions/runs/45585569425) `60184e1`:
+  수정된 detector/limiter/Scene workspace·native VST3·Clippy 통과, 확인 시점 Windows release/GUI 미완료.
+- 실험적 pitch correction: 44.1/48/96 kHz 합성 주파수 이동·강도·스케일·처리 길이·무성음 지연·
+  블록 경계·통화/방송 PDC 및 저장 UI 회귀 검사를 추가했다. 같은 수식의 NumPy 검산에서
+  예제 순음이 목표에 0.2 cent 이내였으나 Rust CI 및 실제 노래 청취는 아직 미완료다.
 
 ## 남은 작업과 제한
 
@@ -116,9 +124,9 @@
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
 - 탭 선택·ASIO·실행 중
-  소스/체인 삽입/삭제·내장 음정 보정은 미구현이다(마이크 음정 관측은 별도 구현).
+  소스/체인 삽입/삭제·고급 formant 보존과 음정 보정 품질 수용은 미완료다(실험적 자동 보정은 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
-  실행 중 EQ 계수/프리셋/pre-delay/에코 시간 변경은 미구현이다. 리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
+  실행 중 음정 설정/EQ 계수/프리셋/pre-delay/에코 시간 변경은 미구현이다. 리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.
 - 원래 앱 재생 경로·장치 기본값은 변경하지 않는다. 자동 mix-minus 추정/외부 피드백 검출/
