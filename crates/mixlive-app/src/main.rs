@@ -10,6 +10,8 @@ mod form;
 #[cfg(windows)]
 mod parameter_editor;
 #[cfg(windows)]
+mod pitch_editor;
+#[cfg(windows)]
 mod session;
 #[cfg(any(windows, test))]
 mod sound;

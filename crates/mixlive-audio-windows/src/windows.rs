@@ -162,7 +162,7 @@ impl Prepared {
 
     pub fn describe(&self) -> String {
         let mut text = format!("WASAPI input: {}\n  {:?}; channel {}\nvocal: {:?}\ninitial master attenuation: {} dB\nplayback streams: {}\n", self.input, self.input_config, self.input_channel + 1, self.vocal.config(), self.output_gain_db, self.outputs.len());
-        text.push_str(&format!("Pitch reference: {} {}; correction {:.0}%; retune {:.1} ms (fixed at start)\n", PitchScale::NAMES[usize::from(self.pitch.key)], self.pitch.scale.name(), self.pitch.strength * 100.0, self.pitch.retune_ms));
+        text.push_str(&format!("Initial pitch reference: {} {}; correction {:.0}%; retune {:.1} ms\n", PitchScale::NAMES[usize::from(self.pitch.key)], self.pitch.scale.name(), self.pitch.strength * 100.0, self.pitch.retune_ms));
         for (index, endpoint) in self.outputs.iter().enumerate() {
             text.push_str(&format!("stream {index}: {}\n  {:?}; one queue/resampler for {} mix(es)\n", endpoint.device, endpoint.config, endpoint.routes.len()));
             for (mix, map) in &endpoint.routes {
@@ -183,7 +183,7 @@ impl Prepared {
                 index + 1, target.pid, map.left + 1, map.right + 1));
         }
         text.push_str(&format!("Initial mixer: {}\n", self.controls.describe()));
-        text.push_str("Pitch settings, vocal preset, reverb pre-delay, echo time and device bindings are fixed for this run. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
+        text.push_str("Vocal preset, reverb pre-delay, echo time and device bindings are fixed for this run. GPUI can apply live pitch settings and their delay compensation together. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
         text
     }
 
@@ -254,17 +254,14 @@ impl Prepared {
         }
         let rate = self.input_config.sample_rate();
         let mut capture = Capture::new(self.vocal, rate, writers, health.clone(), controls.clone())?;
-        let pitch_latency = capture.prepare_pitch(rate, self.pitch)?;
-        if pitch_latency > 0 {
-            timing.push(format!("Built-in pitch correction: {pitch_latency} samples ({:.2} ms) nominal algorithmic delay; not round-trip latency", pitch_latency as f64 * 1000.0 / f64::from(rate)));
-        }
+        capture.prepare_pitch(rate, self.pitch)?;
         let vocal_stats = capture.vocal_stats.clone();
         let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, controls.has_aux(), health.clone(), &controls)?;
         let plugin_timing = timing.len();
         timing.push(plugin_worker.description.clone());
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
-        let (pitch_tap, pitch_monitor) = pitch::channel(self.input_config.sample_rate(), self.pitch.key, self.pitch.scale)?;
+        let (pitch_tap, pitch_monitor) = pitch::channel(self.input_config.sample_rate())?;
         let feeds = InputFeeds { aux: aux_feed, apps: app_readers, pitch: pitch_tap };
         let input_stream = match format {
             SampleFormat::F32 => input::<f32>(&self.input, config, self.input_channel, capture, feeds, health.clone())?,
@@ -435,6 +432,16 @@ impl Active {
         Ok(result?)
     }
 
+    pub fn pitch_config(&self) -> PitchConfig { self.plugin_worker.pitch_config() }
+
+    /// Apply one validated pitch configuration and any changed PDC at a block boundary.
+    /// Query authoritative state after an error too: a later audio fault may follow its commit.
+    pub fn set_pitch_config(&mut self, config: PitchConfig) -> Result<()> {
+        let result = self.plugin_worker.set_pitch_config(config);
+        self.timing[self.plugin_timing] = self.plugin_worker.description.clone();
+        Ok(result?)
+    }
+
     /// Explicit normal completion. Stop all devices before joining/snapshotting the plugin.
     /// Errors and implicit Drop still tear down everything, but never save plugin state.
     pub fn finish(self, state_out: Option<&std::path::Path>) -> Result<()> {
@@ -447,6 +454,7 @@ impl Active {
     /// Normal explicit stop with a complete Scene snapshot, including every native slot.
     /// No file is published here; failure tears down the route and yields no partial Scene.
     pub fn finish_scene(self, mut route: RouteOptions) -> Result<crate::scene::AudioScene> {
+        route.set_pitch_config(self.pitch_config());
         let settings = self.controls.snapshot_into(&mut route);
         let (worker, health) = self.stop_devices();
         settings?;
@@ -467,6 +475,7 @@ impl Active {
 
     /// Single consumer on the control thread. Peak intervals are independent of callback blocks.
     pub fn take_levels(&mut self) -> LevelReadings {
+        let pitch = self.pitch_config();
         let mut outputs = [None; MAX_MIXES];
         let mut limiters = [None; MAX_MIXES];
         for endpoint in &self.outputs {
@@ -482,7 +491,7 @@ impl Active {
                 .then(|| f32::from_bits(self.health.app_peaks[index].swap(0, Ordering::Relaxed)))),
             vocal: self.vocal_stats.take(),
             voice: f32::from_bits(self.health.voice_peak.swap(0, Ordering::Relaxed)),
-            outputs, limiters, pitch: self.pitch_monitor.take(),
+            outputs, limiters, pitch: self.pitch_monitor.take(pitch.key, pitch.scale),
         }
     }
 

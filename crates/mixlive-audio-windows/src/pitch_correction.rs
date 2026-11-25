@@ -8,6 +8,7 @@ use std::{f64::consts::{PI, TAU}, sync::Arc};
 
 pub(crate) struct PitchCorrector {
     config: PitchConfig,
+    rate: u32,
     detector: Estimator,
     fft: Arc<dyn Fft<f64>>,
     inverse: Arc<dyn Fft<f64>>,
@@ -42,7 +43,7 @@ impl PitchCorrector {
         let scratch_len = fft.get_inplace_scratch_len().max(inverse.get_inplace_scratch_len());
         let window = (0..size).map(|i| (0.5 - 0.5 * (TAU * i as f64 / size as f64).cos()).sqrt()).collect();
         Ok(Some(Self {
-            config, detector: Estimator::new(rate as usize, size), fft, inverse,
+            config, rate, detector: Estimator::new(rate as usize, size), fft, inverse,
             spectrum: vec![Complex64::default(); size], synthesis: vec![Complex64::default(); size],
             scratch: vec![Complex64::default(); scratch_len],
             history: vec![0.0; size], frame: vec![0.0; size], window, delta: vec![0.0; size],
@@ -53,6 +54,15 @@ impl PitchCorrector {
     }
 
     pub(crate) fn latency(&self) -> usize { self.history.len() }
+
+    /// Apply an already validated, enabled setting at a processing boundary.
+    /// Keep the analysis, synthesis and overlap histories; retune starts from
+    /// the current shift instead of creating a new analysis-window gap.
+    pub(crate) fn set_config(&mut self, config: PitchConfig) {
+        self.config = config;
+        self.retune_alpha = (-(self.hop as f64)
+            / (f64::from(self.rate) * f64::from(config.retune_ms) * 0.001)).exp();
+    }
 
     /// Arbitrary callback block lengths, exactly one output for each input sample.
     pub(crate) fn process(&mut self, input: &[f32], output: &mut [f32]) -> bool {
@@ -201,5 +211,60 @@ mod tests {
         for block in [1, 17, 256, 1024] {
             assert_eq!(render(rate, &input, config, block).0, reference);
         }
+    }
+
+    #[test]
+    fn live_settings_retarget_without_resetting_history_or_block_alignment() {
+        const RATE: u32 = 48000;
+        let hz = 278.8;
+        let configs = [
+            PitchConfig { key: 0, scale: PitchScale::Major, strength: 1.0, retune_ms: 20.0 },
+            PitchConfig { key: 2, scale: PitchScale::Major, strength: 0.75, retune_ms: 5.0 },
+            PitchConfig { key: 0, scale: PitchScale::Chromatic, strength: 0.5, retune_ms: 200.0 },
+        ];
+        let input: Vec<_> = (0..RATE as usize * configs.len())
+            .map(|i| (0.2 * (TAU * hz * i as f64 / f64::from(RATE)).sin()) as f32).collect();
+        let render_changes = |block: usize| {
+            let mut corrector = PitchCorrector::new(RATE, configs[0]).unwrap().unwrap();
+            let mut output = vec![0.0; input.len()];
+            for ((input, output), config) in input.chunks(RATE as usize)
+                .zip(output.chunks_mut(RATE as usize)).zip(configs) {
+                corrector.set_config(config);
+                for (part, result) in input.chunks(block).zip(output.chunks_mut(block)) {
+                    assert!(corrector.process(part, result));
+                }
+            }
+            (output, corrector.latency())
+        };
+        let (output, latency) = render_changes(137);
+        assert!(output.iter().all(|sample| sample.is_finite() && sample.abs() < 1.0));
+        for (index, config) in configs.into_iter().enumerate() {
+            let end = (index + 1) * RATE as usize;
+            let tail: Vec<_> = output[end - latency..end].iter().copied().map(f64::from).collect();
+            let measured = Estimator::new(RATE as usize, latency).estimate(&tail).unwrap().0;
+            let note = 69.0 + 12.0 * (hz / 440.0).log2();
+            let target = config.scale.nearest_note(config.key, note);
+            let target_hz = 440.0 * 2.0_f64.powf((f64::from(target) - 69.0) / 12.0);
+            let expected = hz * (target_hz / hz).powf(f64::from(config.strength));
+            assert!((1200.0 * (measured / expected).log2()).abs() < 8.0, "{config:?}: {measured} != {expected}");
+            if index > 0 {
+                let boundary = index * RATE as usize;
+                let energy = output[boundary..boundary + latency].iter().map(|sample| sample * sample).sum::<f32>();
+                assert!(energy / latency as f32 > 0.005, "a setting change restarted the analysis window");
+            }
+        }
+        for block in [1, 17, 256] { assert_eq!(render_changes(block).0, output); }
+
+        // A setting change while an unvoiced impulse is in flight must not erase
+        // the delayed sample or move it to a different output frame.
+        let mut corrector = PitchCorrector::new(RATE, configs[0]).unwrap().unwrap();
+        let mut impulse = vec![0.0; latency * 2];
+        impulse[137] = 0.5;
+        let mut delayed = vec![0.0; impulse.len()];
+        assert!(corrector.process(&impulse[..1000], &mut delayed[..1000]));
+        corrector.set_config(configs[2]);
+        assert!(corrector.process(&impulse[1000..], &mut delayed[1000..]));
+        assert!(delayed[..latency].iter().all(|&sample| sample == 0.0));
+        assert_eq!(&delayed[latency..], &impulse[..latency]);
     }
 }
