@@ -1,7 +1,7 @@
 //! Editable startup devices and sound in the existing schema. This layer has no device I/O.
 
 use mixlive_audio_windows::{
-    config::{AppSource, AuxDestination, InputMap, OutputMap, RouteOptions},
+    config::{AppSource, AuxDestination, AuxSource, InputMap, OutputMap, RouteOptions},
     control::MixSettings,
     devices::{DeviceCatalog, DeviceConfig, DeviceInfo, resolve_apps},
     scene::AudioScene,
@@ -250,6 +250,22 @@ pub(crate) fn channels(text: &str) -> Result<Vec<u16>, String> {
         .collect()
 }
 
+/// Validate an explicit live AUX choice against the queried input catalog. The
+/// runtime rechecks the resolved endpoint and the existing microphone stream.
+pub(crate) fn auxiliary_source(
+    input: Option<&str>, channel_text: &str, devices: &[DeviceInfo], microphone: (&str, u16),
+) -> Result<AuxSource, String> {
+    let input = input.filter(|id| !id.is_empty()).ok_or("AUX 입력 장치를 선택하세요.")?;
+    let device = devices.iter().find(|device| device.id == input)
+        .ok_or("선택한 AUX 장치가 현재 목록에 없습니다. 장치 목록을 새로고침하세요.")?;
+    let channels = channels(channel_text)?;
+    InputMap::new(&channels, configuration(device)?.channels)?;
+    if input == microphone.0 && channels.contains(&microphone.1) {
+        return Err("마이크와 같은 장치에서는 마이크 채널과 겹치지 않는 AUX 채널을 선택하세요.".into());
+    }
+    Ok(AuxSource { input: input.to_owned(), channels })
+}
+
 pub(crate) fn number(value: &str, label: &str) -> Result<f32, String> {
     value
         .trim()
@@ -276,6 +292,26 @@ mod tests {
                 sample_format: "f32".into(),
             }),
         }
+    }
+
+    #[test]
+    fn live_aux_selection_validates_exact_device_and_channel_mapping() {
+        let mut unavailable = device("unavailable", 2);
+        unavailable.config = Err("device configuration is unavailable".into());
+        let inputs = vec![device("mic", 4), device("line", 2), unavailable];
+        let microphone = ("mic", 1);
+        assert_eq!(auxiliary_source(Some("mic"), " 4, 3 ", &inputs, microphone).unwrap(),
+            AuxSource { input: "mic".into(), channels: vec![4, 3] });
+        assert_eq!(auxiliary_source(Some("line"), "1", &inputs, microphone).unwrap().channels, [1]);
+        for input in [None, Some(""), Some("missing"), Some("Same display name")] {
+            assert!(auxiliary_source(input, "1,2", &inputs, microphone).is_err());
+        }
+        for channels in ["", "abc", "0", "3", "1,1", "1,2,3", "-1"] {
+            assert!(auxiliary_source(Some("line"), channels, &inputs, microphone).is_err());
+        }
+        assert!(auxiliary_source(Some("mic"), "2,1", &inputs, microphone).unwrap_err().contains("마이크"));
+        assert!(auxiliary_source(Some("unavailable"), "1,2", &inputs, microphone).unwrap_err()
+            .contains("device configuration is unavailable"));
     }
 
     fn catalog() -> DeviceCatalog {

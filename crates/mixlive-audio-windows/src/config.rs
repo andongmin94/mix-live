@@ -144,6 +144,13 @@ impl AuxDestination {
 /// Bound the real-time frame/queue and UI route matrix to eight independent applications.
 pub const MAX_APPS: usize = 8;
 
+/// The active physical AUX binding. Mixer values remain in the live controls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuxSource {
+    pub input: String,
+    pub channels: Vec<u16>,
+}
+
 /// A persistent source identity and its independent initial mix settings. No PID is stored.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

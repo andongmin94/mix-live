@@ -2,7 +2,7 @@
 //! Scene reads/writes do not resolve endpoints or load plugins. Existing files are never replaced.
 
 use mixlive_audio_windows::{
-    config::{AppSource, PitchConfig},
+    config::{AppSource, AuxSource, PitchConfig},
     control::{LiveCommand, LiveControls},
     plugin::{ChainEdit, EffectSpec, LiveParameter, PluginArgs},
     scene::AudioScene,
@@ -74,6 +74,16 @@ impl Session {
             active.apps()
         } else {
             self.scene().map_or(&[], |scene| scene.route.apps.as_slice())
+        }
+    }
+
+    pub fn aux_source(&self) -> Option<AuxSource> {
+        if let Some(active) = &self.active {
+            active.aux_source().cloned()
+        } else {
+            self.scene().and_then(|scene| scene.route.aux_input.as_ref().map(|input| AuxSource {
+                input: input.clone(), channels: scene.route.aux_channels.clone(),
+            }))
         }
     }
 
@@ -182,7 +192,7 @@ impl Session {
                 self.last_report = Instant::now();
                 self.last_meter = Instant::now();
                 self.active = Some(active);
-                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 앱 소스·믹서·보컬 설정과 VST3 상태를 저장할 수 있습니다.".into();
+                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 AUX·앱 소스·믹서·보컬 설정과 VST3 상태를 저장할 수 있습니다.".into();
                 Ok(())
             }
             Err(error) => self.fail("시작하지 못했습니다. 설정과 장치를 확인하세요.", error),
@@ -266,6 +276,36 @@ impl Session {
                 Ok(())
             }
             Err(error) => self.fail("앱 삭제를 완료하지 못했습니다.", error),
+        }
+    }
+
+    /// Native device activation and retirement stay outside mutable GPUI updates.
+    pub fn set_aux_source(&mut self, source: Option<AuxSource>) -> Result<(), String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 실행 중에만 AUX를 변경할 수 있습니다.", "audio is not running");
+        };
+        let previous = active.aux_source().cloned();
+        let result = active.set_aux_source(source);
+        self.timing = active.timing.clone();
+        if active.aux_source() != previous.as_ref() {
+            // The acknowledged source is authoritative even after a later error.
+            if let Some(levels) = &mut self.levels { levels.aux_input = None; }
+            self.report.clear();
+        }
+        let present = active.aux_source().is_some();
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.message = if !present {
+                    "AUX 삭제 완료 · 정지 후 새 Scene 저장으로 보존할 수 있습니다."
+                } else if previous.is_none() {
+                    "AUX 추가 완료 · 소스별 보내기에서 연결할 출력을 켜세요. 정지 후 새 Scene 저장으로 보존할 수 있습니다."
+                } else {
+                    "AUX 적용 완료 · 현재 trim·음소거·보내기 설정을 유지합니다. 정지 후 새 Scene 저장으로 보존할 수 있습니다."
+                }.into();
+                Ok(())
+            }
+            Err(error) => self.fail("AUX 변경을 완료하지 못했습니다.", error),
         }
     }
 
@@ -404,7 +444,7 @@ impl Session {
             Err(error) => return self.fail("오디오를 정지했지만 실행 상태를 저장하지 못했습니다.", error),
         };
         self.save_new(path, scene)?;
-        self.message = "정지 후 현재 앱 소스·믹서·보컬 설정과 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
+        self.message = "정지 후 현재 AUX·앱 소스·믹서·보컬 설정과 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
         Ok(())
     }
 
@@ -467,6 +507,12 @@ mod tests {
             "also-not-a-device",
             "--app",
             "C:\\Apps\\browser.exe",
+            "--aux-input",
+            "not-an-aux-device",
+            "--aux-to",
+            "off",
+            "--aux-channels",
+            "2,1",
         ]);
         let Command::Check(route) = cli.command else {
             panic!("expected route")
@@ -509,6 +555,12 @@ mod tests {
         assert!(session.add_app(AppSource::new("C:\\Apps\\player.exe".into())).is_err());
         assert!(session.remove_app(0).is_err());
         assert_eq!(session.apps(), apps);
+        let aux = session.aux_source().unwrap();
+        assert_eq!(aux.input, "not-an-aux-device");
+        assert_eq!(aux.channels, [2, 1]);
+        assert!(session.set_aux_source(None).is_err());
+        assert!(session.set_aux_source(Some(AuxSource { input: "other-device".into(), channels: vec![1] })).is_err());
+        assert_eq!(session.aux_source(), Some(aux));
         assert!(session.device_details.is_empty());
         assert!(session.report.is_empty());
         session.poll().unwrap();
@@ -520,6 +572,7 @@ mod tests {
         assert!(session.path().is_none());
         assert!(session.vocal_settings().is_none());
         assert!(session.apps().is_empty());
+        assert!(session.aux_source().is_none());
         assert!(session.error.is_some());
     }
 
@@ -550,6 +603,8 @@ mod tests {
         assert!(session.apps().is_empty());
         assert!(session.add_app(AppSource::new("not-running.exe".into())).is_err());
         assert!(session.remove_app(0).is_err());
+        assert!(session.aux_source().is_none());
+        assert!(session.set_aux_source(Some(AuxSource { input: "not-running".into(), channels: vec![1, 2] })).is_err());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("no-live-scene.json");
         assert!(session.stop_and_save(path.clone()).is_err());

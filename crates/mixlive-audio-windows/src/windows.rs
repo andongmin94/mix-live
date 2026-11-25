@@ -1,11 +1,11 @@
 //! WASAPI adapter. Endpoint selection, stream setup and text formatting stay off callbacks.
-use std::{error::Error, sync::{Arc, atomic::Ordering}};
+use std::{error::Error, sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}}};
 use cpal::{traits::{DeviceTrait, HostTrait, StreamTrait}, Device, Host, Sample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use mixlive_effects::{VocalChain, VocalSettings};
 use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget, resolve_apps};
 use crate::process_capture::{self, ProcessCapture};
 use crate::pitch::{self, PitchMonitor, PitchReading, PitchTap};
-use crate::{bridge::{self, Fault, Health, LimiterReading, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AppSource, InputMap, OutputMap, PitchConfig, PitchScale, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{AppControls, LiveControls, PlaybackGains, RouteMix, RouteSource}, plugin::{ResolvedPlugins, native::{self, CaptureSink, PluginWorker}}};
+use crate::{bridge::{self, Fault, Health, LimiterReading, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AppSource, AuxSource, InputMap, OutputMap, PitchConfig, PitchScale, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{AppControls, LiveControls, PlaybackGains, RouteMix, RouteSource}, plugin::{ResolvedPlugins, native::{self, AuxFeed, CaptureSink, PluginWorker, SourceFeeds}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -61,10 +61,14 @@ pub fn list_devices() -> Result<Vec<String>> {
 // Each entry owns exactly one device stream/clock bridge; routes index the independent mixes.
 struct OutputEndpoint { device: Device, config: SupportedStreamConfig, routes: Vec<(usize, OutputMap)> }
 
-struct AuxiliaryEndpoint { device: Device, config: SupportedStreamConfig, map: InputMap }
+struct AuxiliaryEndpoint { source: AuxSource, device: Device, config: SupportedStreamConfig, map: InputMap }
 
-// Shared input channels need neither a second stream nor another clock queue.
-enum AuxFeed { Disabled, Shared(InputMap), Independent(Box<OutputReader>) }
+struct AuxiliaryStream { stream: Stream, enabled: Arc<AtomicBool>, stats: Arc<OutputStats> }
+impl Drop for AuxiliaryStream {
+    fn drop(&mut self) { self.enabled.store(false, Ordering::Release); }
+}
+
+struct PreparedAux { feed: AuxFeed, stream: Option<AuxiliaryStream>, description: String }
 
 pub struct Prepared {
     input: Device,
@@ -96,6 +100,59 @@ fn validate_config(config: &SupportedStreamConfig) -> Result<()> {
     Ok(())
 }
 
+fn resolve_aux(host: &Host, source: AuxSource, input: &Device, input_config: SupportedStreamConfig,
+    input_channel: usize) -> Result<AuxiliaryEndpoint> {
+    if source.input.trim().is_empty() { return Err("AUX endpoint ID must not be blank".into()); }
+    let device = find(host, &source.input)?;
+    if !host.input_devices()?.any(|candidate| candidate == device) {
+        return Err("AUX must be a capture endpoint listed under INPUT, not a playback endpoint".into());
+    }
+    let config = if &device == input { input_config } else { device.default_input_config()? };
+    validate_config(&config)?;
+    let map = InputMap::new(&source.channels, config.channels())?;
+    if &device == input && map.contains(input_channel) {
+        return Err("microphone and AUX channels overlap on the resolved input endpoint".into());
+    }
+    Ok(AuxiliaryEndpoint { source, device, config, map })
+}
+
+fn shared_aux_tag(generation: u64, map: InputMap) -> u64 {
+    (generation << 16) | (map.left as u64) | ((map.right as u64) << 8)
+}
+
+fn shared_aux_map(tag: u64) -> InputMap {
+    InputMap { left: (tag & 255) as usize, right: ((tag >> 8) & 255) as usize }
+}
+
+fn prepare_aux(endpoint: Option<AuxiliaryEndpoint>, input: &Device, rate: u32, queue_ms: u32,
+    shared_tag: u64) -> Result<PreparedAux> {
+    let Some(aux) = endpoint else {
+        return Ok(PreparedAux { feed: AuxFeed::Disabled, stream: None, description: "Current AUX: disabled".into() });
+    };
+    let mut description = format!("Current AUX: {}\n  {:?}; channels {:?}\n", aux.source.input, aux.config, aux.source.channels);
+    if &aux.device == input {
+        description.push_str("Shares the microphone stream/clock; changed shared selections discard queued samples from the old selection.\n");
+        return Ok(PreparedAux { feed: AuxFeed::Shared(shared_tag), stream: None, description });
+    }
+    let health = Arc::new(Health::default());
+    let enabled = Arc::new(AtomicBool::new(false));
+    let (writer, reader) = bridge::channel(aux.config.sample_rate(), rate, queue_ms, 1, health.clone())?;
+    description.push_str(&format!("Independent AUX queue target {:.2} ms + resampler delay {:.2} ms (excludes OS/hardware).\n", reader.queue_ms, reader.resampler_delay_ms));
+    let stats = reader.stats.clone();
+    let config = aux.config.config();
+    let stream = match aux.config.sample_format() {
+        SampleFormat::F32 => input_aux::<f32>(&aux.device, config, aux.map, writer, health.clone(), enabled.clone())?,
+        SampleFormat::F64 => input_aux::<f64>(&aux.device, config, aux.map, writer, health.clone(), enabled.clone())?,
+        SampleFormat::I16 => input_aux::<i16>(&aux.device, config, aux.map, writer, health.clone(), enabled.clone())?,
+        SampleFormat::I32 => input_aux::<i32>(&aux.device, config, aux.map, writer, health.clone(), enabled.clone())?,
+        SampleFormat::U16 => input_aux::<u16>(&aux.device, config, aux.map, writer, health.clone(), enabled.clone())?,
+        _ => return Err("AUX sample format changed after validation".into()),
+    };
+    description.push_str(&format!("AUX driver buffer query: {:?} frames", stream.buffer_size()));
+    Ok(PreparedAux { feed: AuxFeed::Independent { reader: Box::new(reader), health, enabled: enabled.clone() },
+        stream: Some(AuxiliaryStream { stream, enabled, stats }), description })
+}
+
 impl Prepared {
     /// Resolve exact IDs, channels and DSP coefficients without building or starting streams.
     pub fn new(options: &RouteOptions) -> Result<Self> {
@@ -111,19 +168,9 @@ impl Prepared {
         if options.input_channel > input_config.channels() {
             return Err(format!("input channel {} exceeds this endpoint's {} channels", options.input_channel, input_config.channels()).into());
         }
-        let auxiliary = options.aux_input.as_deref().map(|id| -> Result<AuxiliaryEndpoint> {
-            let device = find(&host, id)?;
-            if !host.input_devices()?.any(|candidate| candidate == device) {
-                return Err("AUX must be a capture endpoint listed under INPUT, not a playback endpoint".into());
-            }
-            let config = if device == input { input_config } else { device.default_input_config()? };
-            validate_config(&config)?;
-            let map = InputMap::new(&options.aux_channels, config.channels())?;
-            if device == input && map.contains(usize::from(options.input_channel - 1)) {
-                return Err("microphone and AUX channels overlap on the resolved input endpoint".into());
-            }
-            Ok(AuxiliaryEndpoint { device, config, map })
-        }).transpose()?;
+        let auxiliary = options.aux_input.as_ref().map(|id| resolve_aux(&host,
+            AuxSource { input: id.clone(), channels: options.aux_channels.clone() },
+            &input, input_config, usize::from(options.input_channel - 1))).transpose()?;
         let apps = if options.apps.is_empty() { Vec::new() } else {
             let targets = resolve_apps(&options.apps, &process_capture::app_catalog())?;
             options.apps.iter().zip(targets).map(|(app, target)| -> Result<_> {
@@ -171,7 +218,7 @@ impl Prepared {
             }
         }
         if let Some(aux) = &self.auxiliary {
-            text.push_str(&format!("AUX input: {}\n  {:?}; channels {},{}; trim {:.1} dB\n  {}\n",
+            text.push_str(&format!("Initial AUX input: {}\n  {:?}; channels {},{}; trim {:.1} dB\n  {}\n",
                 aux.device, aux.config, aux.map.left + 1, aux.map.right + 1, self.controls.source_trim_db(RouteSource::Aux).expect("configured AUX"),
                 if aux.device == self.input { "shares the microphone capture stream and clock" }
                 else { "separate capture stream; buffered/resampled to the microphone clock (additional AUX delay)" }));
@@ -183,7 +230,7 @@ impl Prepared {
                 index + 1, app.path, target.pid, map.left + 1, map.right + 1));
         }
         text.push_str(&format!("Initial mixer: {}\n", self.controls.describe()));
-        text.push_str("Device bindings are fixed for this run. GPUI can apply live vocal preset, reverb pre-delay and echo time settings, as well as pitch settings and their delay compensation. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
+        text.push_str("Microphone and output device bindings are fixed for this run. GPUI can add, replace or remove physical AUX; its new capture/PDC history starts empty and changed shared selections briefly silence AUX. Live vocal preset, reverb pre-delay, echo time and pitch settings are also available. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
         text
     }
 
@@ -218,29 +265,15 @@ impl Prepared {
             timing.push(format!("output driver buffer query: {:?} frames", stream.buffer_size()));
             streams.push(stream);
         }
-        let mut aux_stream = None;
-        let mut aux_clock_stats = None;
-        let aux_feed = match self.auxiliary {
-            None => AuxFeed::Disabled,
-            Some(aux) if aux.device == self.input => AuxFeed::Shared(aux.map),
-            Some(aux) => {
-                let (writer, reader) = bridge::channel(aux.config.sample_rate(), self.input_config.sample_rate(), self.queue_ms, 1, health.clone())?;
-                timing.push(format!("AUX input boundary: queue target {:.2} ms + resampler delay {:.2} ms BEFORE output queues (not acoustic/round-trip latency)", reader.queue_ms, reader.resampler_delay_ms));
-                aux_clock_stats = Some(reader.stats.clone());
-                let config = aux.config.config();
-                let stream = match aux.config.sample_format() {
-                    SampleFormat::F32 => input_aux::<f32>(&aux.device, config, aux.map, writer, health.clone())?,
-                    SampleFormat::F64 => input_aux::<f64>(&aux.device, config, aux.map, writer, health.clone())?,
-                    SampleFormat::I16 => input_aux::<i16>(&aux.device, config, aux.map, writer, health.clone())?,
-                    SampleFormat::I32 => input_aux::<i32>(&aux.device, config, aux.map, writer, health.clone())?,
-                    SampleFormat::U16 => input_aux::<u16>(&aux.device, config, aux.map, writer, health.clone())?,
-                    _ => return Err("AUX sample format changed after validation".into()),
-                };
-                timing.push(format!("AUX driver buffer query: {:?} frames", stream.buffer_size()));
-                aux_stream = Some(stream);
-                AuxFeed::Independent(Box::new(reader))
-            }
-        };
+        let aux_source = self.auxiliary.as_ref().map(|aux| aux.source.clone());
+        let aux_generation = u64::from(self.auxiliary.as_ref().is_some_and(|aux| aux.device == self.input));
+        let shared_tag = self.auxiliary.as_ref().filter(|aux| aux.device == self.input)
+            .map_or(0, |aux| shared_aux_tag(aux_generation, aux.map));
+        let shared_aux = Arc::new(AtomicU64::new(shared_tag));
+        let prepared_aux = prepare_aux(self.auxiliary, &self.input, self.input_config.sample_rate(), self.queue_ms, shared_tag)?;
+        let aux_timing = timing.len();
+        timing.push(prepared_aux.description);
+        let aux_stream = prepared_aux.stream;
         // Each app retains its own clock/queue. Prepare all clients before starting any of them.
         let mut app_readers = Vec::with_capacity(self.apps.len());
         let mut apps = Vec::with_capacity(self.apps.len());
@@ -259,13 +292,14 @@ impl Prepared {
         let mut capture = Capture::new(self.vocal, rate, writers, health.clone(), controls.clone())?;
         capture.prepare_pitch(rate, self.pitch)?;
         let vocal_stats = capture.vocal_stats.clone();
-        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, health.clone(), &controls, app_readers)?;
+        let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, health.clone(), &controls,
+            SourceFeeds { aux: prepared_aux.feed, aux_source, apps: app_readers })?;
         let plugin_timing = timing.len();
         timing.push(plugin_worker.description.clone());
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
         let (pitch_tap, pitch_monitor) = pitch::channel(self.input_config.sample_rate())?;
-        let feeds = InputFeeds { aux: aux_feed, pitch: pitch_tap };
+        let feeds = InputFeeds { shared_aux: shared_aux.clone(), pitch: pitch_tap };
         let input_stream = match format {
             SampleFormat::F32 => input::<f32>(&self.input, config, self.input_channel, capture, feeds, health.clone())?,
             SampleFormat::F64 => input::<f64>(&self.input, config, self.input_channel, capture, feeds, health.clone())?,
@@ -280,11 +314,12 @@ impl Prepared {
         for app in &mut app_captures { app.capture.attach()?; }
         // Output emits silence until each queue is primed. Any startup error drops every stream.
         for stream in &streams { stream.play()?; }
-        if let Some(stream) = &aux_stream { stream.play()?; }
+        if let Some(stream) = &aux_stream { stream.stream.play()?; }
         input_stream.play()?;
-        let mut active = Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, app_captures, apps,
-            input_rate: self.input_config.sample_rate(), queue_ms: self.queue_ms, plugin_worker, health, outputs: stats,
-            aux_enabled: controls.has_aux(), controls, aux_clock_stats, vocal_stats, pitch_monitor, plugin_timing, app_timing, timing };
+        let mut active = Active { _input: input_stream, aux_input: aux_stream, _outputs: streams, app_captures, apps,
+            input_device: self.input, input_config: self.input_config, input_channel: self.input_channel,
+            shared_aux, aux_generation, queue_ms: self.queue_ms, plugin_worker, health, outputs: stats,
+            controls, vocal_stats, pitch_monitor, plugin_timing, aux_timing, app_timing, timing };
         active.refresh_app_timing();
         Ok(active)
     }
@@ -319,28 +354,31 @@ pub struct LevelReadings {
 pub struct Active {
     // Drop devices, then join processing and release native plugin state on the loading thread.
     _input: Stream,
-    _aux_input: Option<Stream>,
+    aux_input: Option<AuxiliaryStream>,
     _outputs: Vec<Stream>,
     app_captures: Vec<ActiveAppCapture>,
     apps: Vec<AppSource>,
-    input_rate: u32,
+    input_device: Device,
+    input_config: SupportedStreamConfig,
+    input_channel: usize,
+    shared_aux: Arc<AtomicU64>,
+    aux_generation: u64,
     queue_ms: u32,
     plugin_worker: PluginWorker,
     pub health: Arc<Health>,
     pub controls: Arc<LiveControls>,
     /// One set per physical playback endpoint, shared by its channel routes.
     outputs: Vec<PlaybackStats>,
-    aux_enabled: bool,
-    aux_clock_stats: Option<Arc<OutputStats>>,
     pub vocal_stats: Arc<VocalStats>,
     pitch_monitor: PitchMonitor,
     plugin_timing: usize,
+    aux_timing: usize,
     app_timing: usize,
     pub timing: Vec<String>,
 }
 
 struct InputFeeds {
-    aux: AuxFeed,
+    shared_aux: Arc<AtomicU64>,
     pitch: PitchTap,
 }
 
@@ -350,35 +388,33 @@ where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
     let error_health = health.clone();
     let mut mono = [0.0_f32; CAPTURE_BLOCK];
     let mut auxiliary = [[0.0_f32; 2]; CAPTURE_BLOCK];
-    let has_aux = !matches!(&feeds.aux, AuxFeed::Disabled);
     Ok(device.build_input_stream::<T, _, _>(config, move |data, _| {
         if health.failed() { return; }
         if data.len() % channels != 0 { health.fail(Fault::Input); return; }
         for part in data.chunks(channels * CAPTURE_BLOCK) {
             let frames = part.len() / channels;
+            let aux_tag = feeds.shared_aux.load(Ordering::Acquire);
+            let map = shared_aux_map(aux_tag);
             for (index, frame) in part.chunks_exact(channels).enumerate() {
                 mono[index] = f32::from_sample(frame[selected]);
-                auxiliary[index] = match &mut feeds.aux {
-                    AuxFeed::Disabled => [0.0; 2],
-                    AuxFeed::Shared(map) => map.read(frame).map(f32::from_sample),
-                    AuxFeed::Independent(reader) => reader.next_source_frame(),
-                };
+                auxiliary[index] = if aux_tag == 0 { [0.0; 2] } else { map.read(frame).map(f32::from_sample) };
             }
             feeds.pitch.push(&mono[..frames]);
-            capture.push(&mono[..frames], has_aux.then_some(&auxiliary[..frames]));
+            capture.push(&mono[..frames], (aux_tag != 0).then_some((aux_tag, &auxiliary[..frames])));
         }
     }, move |_| error_health.fail(Fault::Device), None)?)
 }
 
 // An independent AUX device produces only its selected raw source; voice DSP runs elsewhere.
-fn input_aux<T>(device: &Device, config: StreamConfig, map: InputMap, mut writer: OutputWriter, health: Arc<Health>) -> Result<Stream>
+fn input_aux<T>(device: &Device, config: StreamConfig, map: InputMap, mut writer: OutputWriter, health: Arc<Health>, enabled: Arc<AtomicBool>) -> Result<Stream>
 where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
     let channels = usize::from(config.channels);
     let error_health = health.clone();
     Ok(device.build_input_stream::<T, _, _>(config, move |data, _| {
-        if health.failed() { return; }
+        if health.failed() || !enabled.load(Ordering::Acquire) { return; }
         if data.len() % channels != 0 { health.fail(Fault::Input); return; }
         for frame in data.chunks_exact(channels) {
+            if !enabled.load(Ordering::Acquire) { break; }
             let [left, right] = map.read(frame).map(f32::from_sample);
             writer.push([left, right, 0.0, 0.0, 0.0, 0.0]);
         }
@@ -404,6 +440,41 @@ where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
 }
 
 impl Active {
+    pub fn aux_source(&self) -> Option<&AuxSource> { self.plugin_worker.aux_source() }
+
+    pub fn set_aux_source(&mut self, next: Option<AuxSource>) -> Result<()> {
+        if self.aux_source() == next.as_ref() { return Ok(()); }
+        if self.health.failed() { return Err("audio path has failed; stop before editing AUX".into()); }
+        let endpoint = next.clone().map(|source| {
+            let host = cpal::host_from_id(cpal::HostId::Wasapi)?;
+            resolve_aux(&host, source, &self.input_device, self.input_config, self.input_channel)
+        }).transpose()?;
+        let mut generation = self.aux_generation;
+        let shared_tag = if let Some(aux) = endpoint.as_ref().filter(|aux| aux.device == self.input_device) {
+            generation = generation.checked_add(1).filter(|value| *value <= u64::MAX >> 16)
+                .ok_or("shared AUX selection generation is exhausted")?;
+            shared_aux_tag(generation, aux.map)
+        } else { 0 };
+        let prepared = prepare_aux(endpoint, &self.input_device, self.input_config.sample_rate(), self.queue_ms, shared_tag)?;
+        // The new independent callback drains its device but leaves its bounded
+        // queue empty until the worker accepts the source and opens its gate.
+        if let Some(stream) = &prepared.stream { stream.stream.play()?; }
+        let result = self.plugin_worker.set_aux_source(next.clone(), prepared.feed, &self.controls);
+        if self.aux_source() == next.as_ref() {
+            // Any queued pair with the previous tag stays invalid for this binding.
+            self.shared_aux.store(shared_tag, Ordering::Release);
+            self.aux_generation = generation;
+            let previous = std::mem::replace(&mut self.aux_input, prepared.stream);
+            self.controls.publish_aux(next.is_some());
+            self.timing[self.aux_timing] = prepared.description;
+            self.timing[self.plugin_timing] = self.plugin_worker.description.clone();
+            drop(previous);
+        }
+        result?;
+        if let Some(error) = self.health.error() { return Err(error.into()); }
+        Ok(())
+    }
+
     pub fn apps(&self) -> &[AppSource] { &self.apps }
 
     /// Prepare an exact new process tree while the current path keeps running.
@@ -421,7 +492,7 @@ impl Active {
         let target = *targets.last().expect("newly resolved application");
         let map = InputMap::new(&app.channels, 2)?;
         let controls = Arc::new(AppControls::new(&app)?);
-        let (writer, reader) = bridge::channel(process_capture::RATE, self.input_rate, self.queue_ms, 1, self.health.clone())?;
+        let (writer, reader) = bridge::channel(process_capture::RATE, self.input_config.sample_rate(), self.queue_ms, 1, self.health.clone())?;
         let mut added = ActiveAppCapture {
             capture: ProcessCapture::prepare(app.path.clone(), target, map, writer, self.health.clone())?,
             target, stats: reader.stats.clone(), queue_ms: reader.queue_ms, resampler_delay_ms: reader.resampler_delay_ms,
@@ -545,6 +616,8 @@ impl Active {
     pub fn finish_scene(self, mut route: RouteOptions) -> Result<crate::scene::AudioScene> {
         route.set_pitch_config(self.pitch_config());
         route.apps = self.apps.clone();
+        route.aux_input = self.aux_source().map(|source| source.input.clone());
+        if let Some(source) = self.aux_source() { route.aux_channels.clone_from(&source.channels); }
         let settings = self.controls.snapshot_into(&mut route);
         let (worker, health) = self.stop_devices();
         settings?;
@@ -555,9 +628,9 @@ impl Active {
     }
 
     fn stop_devices(self) -> (PluginWorker, Arc<Health>) {
-        let Self { _input, _aux_input, _outputs, app_captures, plugin_worker, health, .. } = self;
+        let Self { _input, aux_input, _outputs, app_captures, plugin_worker, health, .. } = self;
         drop(_input);
-        drop(_aux_input);
+        drop(aux_input);
         drop(_outputs);
         drop(app_captures);
         (plugin_worker, health)
@@ -577,7 +650,7 @@ impl Active {
         }
         LevelReadings {
             mic_input: f32::from_bits(self.health.input_peak.swap(0, Ordering::Relaxed)),
-            aux_input: self.aux_enabled.then(|| f32::from_bits(self.health.aux_peak.swap(0, Ordering::Relaxed))),
+            aux_input: self.aux_source().is_some().then(|| f32::from_bits(self.health.aux_peak.swap(0, Ordering::Relaxed))),
             app_inputs: std::array::from_fn(|index| apps.get(index).map(|app| app.take_peak())),
             vocal: self.vocal_stats.take(),
             voice: f32::from_bits(self.health.voice_peak.swap(0, Ordering::Relaxed)),
@@ -594,7 +667,8 @@ impl Active {
         } else { text.push_str(" pitch=unvoiced"); }
         if let Some(aux) = levels.aux_input {
             text.push_str(&format!(" aux_peak={aux:.3}"));
-            if let Some(stats) = &self.aux_clock_stats {
+            if let Some(aux) = &self.aux_input {
+                let stats = &aux.stats;
                 text.push_str(&format!(" aux_queue={} frames aux_correction={}ppm aux_underruns={}",
                     stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed),
                     stats.underruns.load(Ordering::Relaxed)));
@@ -617,5 +691,24 @@ impl Active {
             }
         }
         text
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_aux_tag_carries_one_channel_pair_and_a_distinct_generation() {
+        let frame: Vec<_> = (0..256).map(|index| index as f32).collect();
+        for channels in [vec![1], vec![256], vec![256, 2], vec![3, 4]] {
+            let map = InputMap::new(&channels, 256).unwrap();
+            let first = shared_aux_tag(1, map);
+            let next = shared_aux_tag(2, map);
+            assert_ne!(first, 0);
+            assert_ne!(first, next);
+            assert_eq!(shared_aux_map(first), map);
+            assert_eq!(shared_aux_map(next).read(&frame), map.read(&frame));
+        }
     }
 }

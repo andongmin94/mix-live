@@ -232,7 +232,7 @@ pub struct LiveControls {
     master: AtomicU32,
     mix_gains: [AtomicU32; MAX_MIXES],
     enabled_mixes: [bool; MAX_MIXES],
-    has_aux: bool,
+    has_aux: AtomicBool,
     // Published after a worker acknowledgment. Audio processing owns its own Arc list.
     apps: Mutex<Vec<Arc<AppControls>>>,
     // Fixed microphone/physical AUX slots; applications retain their own atomic controls.
@@ -263,7 +263,7 @@ impl LiveControls {
         Ok(Self { muted: AtomicU32::new(0), stop_requested: AtomicBool::new(false),
             master: AtomicU32::new(gain(master_db).to_bits()),
             mix_gains: mix_db.map(|db| AtomicU32::new(gain(db.unwrap_or(0.0)).to_bits())),
-            enabled_mixes, has_aux, apps: Mutex::new((0..app_count).map(|_| Arc::new(AppControls::default())).collect()),
+            enabled_mixes, has_aux: AtomicBool::new(has_aux), apps: Mutex::new((0..app_count).map(|_| Arc::new(AppControls::default())).collect()),
             routes_enabled: AtomicU32::new(mic_routes),
             route_levels: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
             source_trims: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
@@ -284,9 +284,15 @@ impl LiveControls {
         for (target, muted) in [(MuteTarget::Mic, settings.mute_mic), (MuteTarget::All, settings.mute_all)] {
             controls.apply(LiveCommand::Mute { target, muted })?;
         }
-        if controls.has_aux {
-            controls.apply(LiveCommand::Mute { target: MuteTarget::Aux, muted: settings.mute_aux })?;
-            controls.apply(LiveCommand::SourceTrim { source: RouteSource::Aux, db: route.aux_gain_db })?;
+        // Keep inactive AUX values too: removing a source must not make a later
+        // Scene snapshot restore obsolete mixer values from the loaded file.
+        if settings.mute_aux { controls.muted.fetch_or(AUX, Ordering::Relaxed); }
+        controls.source_trims[1].store(gain(route.aux_gain_db).to_bits(), Ordering::Relaxed);
+        for (mix, db) in [settings.aux_output_gain_db, settings.aux_send_gain_db, settings.aux_broadcast_gain_db]
+            .into_iter().enumerate() {
+            let index = MAX_MIXES + mix;
+            controls.route_levels[index].store(gain(db).to_bits(), Ordering::Relaxed);
+            if route.aux_to.includes(mix) { controls.routes_enabled.fetch_or(1 << index, Ordering::Relaxed); }
         }
         for (mix, muted) in [(RouteMix::Output, settings.mute_output), (RouteMix::Send, settings.mute_send),
             (RouteMix::Broadcast, settings.mute_broadcast)] {
@@ -296,11 +302,8 @@ impl LiveControls {
             (RouteSource::Mic, RouteMix::Output, settings.mic_output_enabled, settings.mic_output_gain_db),
             (RouteSource::Mic, RouteMix::Send, settings.mic_send_enabled, settings.mic_send_gain_db),
             (RouteSource::Mic, RouteMix::Broadcast, settings.mic_broadcast_enabled, settings.mic_broadcast_gain_db),
-            (RouteSource::Aux, RouteMix::Output, route.aux_to.includes(0), settings.aux_output_gain_db),
-            (RouteSource::Aux, RouteMix::Send, route.aux_to.includes(1), settings.aux_send_gain_db),
-            (RouteSource::Aux, RouteMix::Broadcast, route.aux_to.includes(2), settings.aux_broadcast_gain_db),
         ] {
-            if (source == RouteSource::Aux && !controls.has_aux) || !controls.has_mix(mix) { continue; }
+            if !controls.has_mix(mix) { continue; }
             controls.apply(LiveCommand::Route { source, mix, enabled })?;
             controls.apply(LiveCommand::RouteGain { source, mix, db })?;
         }
@@ -309,7 +312,7 @@ impl LiveControls {
 
     /// Capture requested values with edits suspended, preserving inactive optional settings.
     pub fn snapshot_into(&self, route: &mut RouteOptions) -> Result<(), String> {
-        if self.has_aux != route.has_aux() || self.enabled_mixes != [true, route.send.is_some(), route.broadcast.is_some()]
+        if self.has_aux() != route.has_aux() || self.enabled_mixes != [true, route.send.is_some(), route.broadcast.is_some()]
             || self.app_count() != route.apps.len() {
             return Err("live controls do not match the Scene topology".into());
         }
@@ -332,20 +335,13 @@ impl LiveControls {
                 RouteMix::Broadcast => { settings.mute_broadcast = muted; settings.mic_broadcast_enabled = enabled; settings.mic_broadcast_gain_db = db(gain); }
             }
         }
-        if self.has_aux {
-            saved.aux_gain_db = db(self.source_trim_db(RouteSource::Aux)?);
-            settings.mute_aux = self.is_muted(MuteTarget::Aux);
-            let mut enabled = [false; MAX_MIXES];
-            for mix in self.mixes() {
-                let (on, gain) = self.route_state(RouteSource::Aux, mix)?;
-                enabled[mix.index()] = on;
-                match mix {
-                    RouteMix::Output => settings.aux_output_gain_db = db(gain),
-                    RouteMix::Send => settings.aux_send_gain_db = db(gain),
-                    RouteMix::Broadcast => settings.aux_broadcast_gain_db = db(gain),
-                }
-            }
-            saved.aux_to = AuxDestination::from_enabled(enabled);
+        saved.aux_gain_db = db(20.0 * f32::from_bits(self.source_trims[1].load(Ordering::Relaxed)).log10());
+        settings.mute_aux = self.is_muted(MuteTarget::Aux);
+        let aux_routes = self.routes_enabled.load(Ordering::Relaxed);
+        saved.aux_to = AuxDestination::from_enabled(std::array::from_fn(|mix| aux_routes & (1 << (MAX_MIXES + mix)) != 0));
+        let aux_gains = [ &mut settings.aux_output_gain_db, &mut settings.aux_send_gain_db, &mut settings.aux_broadcast_gain_db ];
+        for (mix, saved_gain) in aux_gains.into_iter().enumerate() {
+            *saved_gain = db(20.0 * f32::from_bits(self.route_levels[MAX_MIXES + mix].load(Ordering::Relaxed)).log10());
         }
         for (index, app) in saved.apps.iter_mut().enumerate() {
             let source = RouteSource::App(index);
@@ -373,7 +369,21 @@ impl LiveControls {
         RouteMix::ALL.into_iter().filter(move |&mix| self.has_mix(mix))
     }
     pub fn mix_count(&self) -> usize { self.mixes().count() }
-    pub fn has_aux(&self) -> bool { self.has_aux }
+    pub fn has_aux(&self) -> bool { self.has_aux.load(Ordering::Acquire) }
+
+    /// Foreground publication follows the worker's source-topology acknowledgment.
+    #[cfg(any(windows, test))]
+    pub(crate) fn publish_aux(&self, enabled: bool) { self.has_aux.store(enabled, Ordering::Release); }
+
+    /// A newly attached source starts disconnected. Called only at its apply boundary.
+    #[cfg(any(windows, test))]
+    pub(crate) fn reset_aux_for_add(&self) {
+        self.muted.fetch_and(!AUX, Ordering::Relaxed);
+        self.source_trims[1].store(gain(-12.0).to_bits(), Ordering::Relaxed);
+        let aux_mask = ((1 << MAX_MIXES) - 1) << MAX_MIXES;
+        self.routes_enabled.fetch_and(!aux_mask, Ordering::Relaxed);
+        for level in &self.route_levels[MAX_MIXES..] { level.store(1.0_f32.to_bits(), Ordering::Relaxed); }
+    }
     pub fn app_count(&self) -> usize { self.apps.lock().expect("control app list").len() }
 
     /// Foreground preparation only. The audio worker keeps these handles across edits.
@@ -392,7 +402,7 @@ impl LiveControls {
     }
 
     pub fn sources(&self) -> impl Iterator<Item = RouteSource> {
-        [RouteSource::Mic].into_iter().chain(self.has_aux.then_some(RouteSource::Aux))
+        [RouteSource::Mic].into_iter().chain(self.has_aux().then_some(RouteSource::Aux))
             .chain((0..self.app_count()).map(RouteSource::App))
     }
     pub fn stop_requested(&self) -> bool { self.stop_requested.load(Ordering::Relaxed) }
@@ -485,7 +495,7 @@ impl LiveControls {
     fn trim_index(&self, source: RouteSource) -> Result<usize, String> {
         match source {
             RouteSource::Mic => Err("use vocal trim for the microphone".into()),
-            RouteSource::Aux if self.has_aux => Ok(source.index()),
+            RouteSource::Aux if self.has_aux() => Ok(source.index()),
             RouteSource::Aux => Err("this route has no AUX source".into()),
             RouteSource::App(_) => Err("application slot is outside the active scene".into()),
         }
@@ -521,7 +531,7 @@ impl LiveControls {
                     self.app_control(index)?.muted.store(muted, Ordering::Relaxed);
                     return Ok(());
                 }
-                if target == MuteTarget::Aux && !self.has_aux { return Err("this route has no AUX source".into()); }
+                if target == MuteTarget::Aux && !self.has_aux() { return Err("this route has no AUX source".into()); }
                 for mix in RouteMix::ALL {
                     if target == mix.mute_target() && !self.has_mix(mix) {
                         return Err(format!("this route has no {} mix", mix.name()));
@@ -585,7 +595,7 @@ impl LiveControls {
     }
 
     fn route_index(&self, source: RouteSource, mix: RouteMix) -> Result<usize, String> {
-        if source == RouteSource::Aux && !self.has_aux { return Err("this route has no AUX source".into()); }
+        if source == RouteSource::Aux && !self.has_aux() { return Err("this route has no AUX source".into()); }
         if matches!(source, RouteSource::App(_)) { return Err("application controls require their live handle".into()); }
         self.check_mix(mix)?;
         Ok(source.index() * MAX_MIXES + mix.index())
@@ -869,6 +879,93 @@ mod tests {
         assert!(!controls.is_muted(MuteTarget::App(0)));
         assert_eq!(controls.app_controls()[0].take_peak(), 0.0);
         assert_eq!(controls.route_state(RouteSource::App(0), RouteMix::Send).unwrap(), (false, 0.0));
+    }
+
+    #[test]
+    fn inactive_aux_snapshot_and_fresh_add_preserve_other_live_controls() {
+        use crate::config::{Cli, Command};
+        use clap::Parser;
+        let Command::Check(mut route) = Cli::parse_from(["audio", "check", "--input", "mic", "--output", "phones",
+            "--app", "browser.exe"]).command else { panic!("expected check") };
+        // The inactive send remains representable without opening a send output.
+        route.aux_gain_db = -21.0;
+        route.mix.mute_aux = true;
+        route.mix.aux_output_gain_db = -3.0;
+        route.mix.aux_send_gain_db = -9.0;
+        route.mix.aux_broadcast_gain_db = -15.0;
+        let controls = LiveControls::from_route(&route).unwrap();
+        for command in ["mute mic", "level mic output -7", "gain master -24", "mute output",
+            "trim app1 -18", "route app1 output on", "level app1 output -5"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        controls.snapshot_into(&mut route).unwrap();
+        assert!(!controls.has_aux());
+        assert!(route.mix.mute_aux);
+        assert_eq!(route.aux_to, AuxDestination::Send);
+        for (actual, expected) in [(route.aux_gain_db, -21.0), (route.mix.aux_output_gain_db, -3.0),
+            (route.mix.aux_send_gain_db, -9.0), (route.mix.aux_broadcast_gain_db, -15.0)] {
+            assert!((actual - expected).abs() < 1e-4);
+        }
+        let apps = controls.app_controls();
+        let source_targets = controls.source_targets(&apps);
+        let trim_targets = controls.trim_targets(&apps);
+        let route_targets = controls.route_targets(&apps);
+        let output_targets = controls.output_targets();
+        controls.reset_aux_for_add();
+        // Resetting at the worker boundary does not expose controls before acknowledgment.
+        assert!(controls.apply("trim aux -6".parse().unwrap()).is_err());
+        controls.publish_aux(true);
+        assert_eq!(controls.sources().collect::<Vec<_>>(), [RouteSource::Mic, RouteSource::Aux, RouteSource::App(0)]);
+        assert!((controls.source_trim_db(RouteSource::Aux).unwrap() + 12.0).abs() < 1e-4);
+        assert!(!controls.is_muted(MuteTarget::Aux));
+        for mix in controls.mixes() { assert_eq!(controls.route_state(RouteSource::Aux, mix).unwrap(), (false, 0.0)); }
+        for index in [0, 2] {
+            assert_eq!(controls.source_targets(&apps)[index], source_targets[index]);
+            assert_eq!(controls.trim_targets(&apps)[index], trim_targets[index]);
+            let routes = index * MAX_MIXES..(index + 1) * MAX_MIXES;
+            assert_eq!(controls.route_targets(&apps)[routes.clone()], route_targets[routes]);
+        }
+        assert_eq!(controls.output_targets(), output_targets);
+        let unchanged = route.clone();
+        assert!(controls.snapshot_into(&mut route).is_err());
+        assert_eq!(route, unchanged);
+        route.aux_input = Some("line".into());
+        controls.snapshot_into(&mut route).unwrap();
+        assert_eq!(route.aux_to, AuxDestination::Off);
+        assert_eq!([route.mix.aux_output_gain_db, route.mix.aux_send_gain_db, route.mix.aux_broadcast_gain_db], [0.0; 3]);
+    }
+
+    #[test]
+    fn removing_aux_saves_latest_values_and_readding_starts_disconnected() {
+        use crate::config::{Cli, Command};
+        use clap::Parser;
+        let Command::Check(mut route) = Cli::parse_from(["audio", "check", "--input", "mic", "--output", "phones",
+            "--send", "call", "--broadcast", "stream", "--aux-input", "line"]).command else { panic!("expected check") };
+        let controls = LiveControls::from_route(&route).unwrap();
+        for command in ["trim aux -6", "mute aux", "route aux output on", "route aux broadcast on",
+            "level aux output -3", "level aux send -8", "level aux broadcast -17"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        controls.publish_aux(false);
+        route.aux_input = None;
+        controls.snapshot_into(&mut route).unwrap();
+        assert!(route.mix.mute_aux);
+        assert_eq!(route.aux_to, AuxDestination::All);
+        for (actual, expected) in [(route.aux_gain_db, -6.0), (route.mix.aux_output_gain_db, -3.0),
+            (route.mix.aux_send_gain_db, -8.0), (route.mix.aux_broadcast_gain_db, -17.0)] {
+            assert!((actual - expected).abs() < 1e-4);
+        }
+        let restored = LiveControls::from_route(&route).unwrap();
+        assert!(!restored.has_aux());
+        assert!(restored.apply("route aux send on".parse().unwrap()).is_err());
+        let before = route.clone();
+        restored.snapshot_into(&mut route).unwrap();
+        assert_eq!(route, before);
+        controls.reset_aux_for_add();
+        controls.publish_aux(true);
+        for mix in controls.mixes() { assert_eq!(controls.route_state(RouteSource::Aux, mix).unwrap(), (false, 0.0)); }
+        assert!((controls.source_trim_db(RouteSource::Aux).unwrap() + 12.0).abs() < 1e-4);
+        assert!(!controls.is_muted(MuteTarget::Aux));
     }
 
     #[test]
