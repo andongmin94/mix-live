@@ -3,7 +3,7 @@
 
 use mixlive_audio_windows::{
     control::{LiveCommand, LiveControls},
-    plugin::{LiveParameter, PluginArgs},
+    plugin::{ChainEdit, EffectSpec, LiveParameter, PluginArgs},
     scene::AudioScene,
     windows::{Active, LevelReadings, Prepared},
 };
@@ -15,6 +15,7 @@ use std::{
 pub struct Session {
     loaded: Option<(PathBuf, AudioScene)>,
     active: Option<Active>,
+    live_effects: Vec<EffectSpec>,
     last_report: Instant,
     last_meter: Instant,
     pub levels: Option<LevelReadings>,
@@ -30,6 +31,7 @@ impl Default for Session {
         Self {
             loaded: None,
             active: None,
+            live_effects: Vec::new(),
             last_report: Instant::now(),
             last_meter: Instant::now(),
             levels: None,
@@ -53,6 +55,15 @@ impl Session {
 
     pub fn path(&self) -> Option<&Path> {
         self.loaded.as_ref().map(|(path, _)| path.as_path())
+    }
+
+    /// Display the current runtime order without changing the saved startup Scene.
+    pub fn effects(&self) -> &[EffectSpec] {
+        if self.running() {
+            &self.live_effects
+        } else {
+            self.scene().map_or(&[], |scene| scene.effects.as_slice())
+        }
     }
 
     pub fn controls(&self) -> Option<&LiveControls> {
@@ -146,6 +157,7 @@ impl Session {
             Ok((details, active)) => {
                 self.device_details = details;
                 self.timing = active.timing.clone();
+                self.live_effects = active.effects();
                 self.last_report = Instant::now();
                 self.last_meter = Instant::now();
                 self.active = Some(active);
@@ -168,6 +180,26 @@ impl Session {
 
     pub fn editor_is_open(&self, index: usize) -> bool {
         self.active.as_ref().is_some_and(|active| active.editor_is_open(index))
+    }
+
+    /// Prepare native effects and retire removed slots outside mutable GPUI updates.
+    pub fn edit_chain(&mut self, edit: ChainEdit) -> Result<(), String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 실행 중에만 체인을 변경할 수 있습니다.", "audio is not running");
+        };
+        let result = active.edit_chain(edit);
+        // A cleanup error can occur after the new order is already active. Always display
+        // the authoritative runtime order, never an optimistic edit of the loaded Scene.
+        self.live_effects = active.effects();
+        self.timing = active.timing.clone();
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.message = "VST3 체인 변경 적용 · 정지 후 새 Scene 저장으로 현재 순서와 상태를 보존할 수 있습니다.".into();
+                Ok(())
+            }
+            Err(error) => self.fail("VST3 체인 변경을 완료하지 못했습니다.", error),
+        }
     }
 
     /// Native controller access must stay outside App/entity update, like original editors.
@@ -252,6 +284,7 @@ impl Session {
         let Some(mut active) = self.active.take() else {
             return self.fail("실행 중인 Scene이 없습니다.", "audio is not running");
         };
+        self.live_effects.clear();
         let route = self.scene().expect("active session has a Scene").route.clone();
         let levels = active.take_levels();
         self.report = active.report(&levels);
@@ -270,6 +303,7 @@ impl Session {
         let Some(mut active) = self.active.take() else {
             return Ok(());
         };
+        self.live_effects.clear();
         let levels = active.take_levels();
         self.report = active.report(&levels);
         self.levels = None;
@@ -344,6 +378,9 @@ mod tests {
         assert!(session.controls().is_none());
         assert_eq!(session.path(), Some(path.as_path()));
         assert_eq!(session.scene().unwrap().effects.len(), 1);
+        assert_eq!(session.effects(), session.scene().unwrap().effects.as_slice());
+        assert!(session.edit_chain(ChainEdit::Remove { index: 0 }).is_err());
+        assert_eq!(session.effects().len(), 1);
         assert!(session.device_details.is_empty());
         assert!(session.report.is_empty());
         session.poll().unwrap();
@@ -373,6 +410,8 @@ mod tests {
         assert!(session.set_editor_open(0, true).is_err());
         assert!(session.effect_parameters(0).is_err());
         assert!(session.set_effect_parameter(0, 0, 0.5).is_err());
+        assert!(session.edit_chain(ChainEdit::Remove { index: 0 }).is_err());
+        assert!(session.effects().is_empty());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("no-live-scene.json");
         assert!(session.stop_and_save(path.clone()).is_err());

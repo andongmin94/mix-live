@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **실험적 음정 보정 · 라이브 EQ · VST3 파라미터 편집 main 병합**
+단계: **실행 중 VST3 슬롯 편집 구현 · Windows 통합 검증 준비**
 
 ## 현재 구현
 
@@ -39,7 +39,9 @@
 - 내장 pitch correction의 고정 latency와 최종 활성 VST3 체인의 신고 latency 합으로 통화·방송의
   AUX/앱 send를 정수 샘플 지연한다. VST3 없는 경로에도 pitch 지연 보상을 적용한다.
   모니터는 추가 보상하지 않는다. 지연 뒤에 소스 mute/route gain을 적용하며, 실제 보상이 필요할 때
-  2초 상한을 넘으면 시작을 거절한다. 준비 시 할당하며 지연 변경 restart는 기존대로 경로를 중단한다.
+  2초 상한을 넘으면 시작/추가를 거절한다. 체인 편집 시 새 저장소를 제어 스레드에서 준비하고
+  체인과 같은 블록 경계에서 교체한다. 총 지연이 같으면 이력을 유지하고, 마지막 VST3 삭제 후에도
+  활성 pitch correction 지연은 남는다. 플러그인 자체의 지연 변경 restart는 기존대로 경로를 중단한다.
   장치 timestamp/clock bridge/OS 지연을 실측·보상하는 것은 아니다.
 - 내장 EQ/다이내믹스 뒤에 선택적 8-line orthogonal FDN stereo 리버브를 적용한다.
   기존 biquad 고역 감쇠를 재사용한다. wet 비율(0은 off), 명목 잔향 시간, wet-only pre-delay를
@@ -65,6 +67,14 @@
   선택한 값 하나를 명시적 적용으로 전달한다. 숨김은 제외하고 읽기 전용은 조작하지 않는다.
   조회한 값은 새로고침으로 갱신하며, native editor/processor 피드백을 DSP에 재전송하지 않는다.
   조회·포맷·변경은 foreground에서 수행하고 기존 최종 state flush/Scene 저장을 재사용한다.
+- GPUI에서 실행 중 VST3 파일/폴더·설치 경로 후보 추가, 슬롯 삭제·위/아래 이동을 제공한다.
+  빈 체인도 하나의 worker를 사용하며 첫 슬롯 추가·전체 삭제를 지원한다. 유지 슬롯은 같은
+  native 인스턴스·파라미터·editor·dry 이력을 옮기고 새 플러그인만 제어 스레드에서 준비한다.
+  capacity-1 요청/반환 큐로 블록 경계에서 체인/PDC를 교체한 뒤 제거 슬롯과 이전 버퍼를
+  제어 스레드에서 해제한다. 준비 실패는 기존 체인에 영향을 주지 않는다.
+  실행 목록은 저장된 Scene과 분리하며, 일반 정지는 변경을 버리고 정지 후 저장은 현재 순서와
+  최종 상태를 저장한다. 공통 파라미터 패널은 체인 편집 때 닫아 이전 슬롯 index를 버린다.
+  지연 변경 시 새 보상 이력의 시작 무음과 효과 꼬리 단절이 가능하며 무중단 교차 전환은 아니다.
 - 정지 후 새 Scene 저장은 장치 중지 → 앱 capture thread join → VST3 worker join → 모든
   상태 수집 → 새 파일 게시를 사용한다. 실행 중 모든 소스/출력 mute·route·gain, 보컬 파라미터와 VST3 상태를
   다음 시작 전에 복원한다. 일반 정지/닫기/오류는 저장하지 않으며 파일 덮어쓰기 없음.
@@ -88,12 +98,14 @@
 
 ## 검증
 
+- 이번 슬롯 편집 변경의 로컬 core 지연 교체, capture 경로 18개 및 bypass 목록 재배치 검사는 통과했다.
+  Windows workspace/native VST3/Clippy/release/GPUI 통합 검사는 아직 실행 전이다.
 - [Audio #49](https://github.com/andongmin94/mix-live/actions/runs/45602634932) `25daa2d` 전체 성공:
   Windows workspace 검사 130개와 실제 native VST3 fixture 검사 11개, 총 **141개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
   PR #3의 병합 tree가 검증한 source tree와 동일함을 확인했다.
-- 이번 변경에서 라이브 EQ의 주파수 응답·전환 연속성·목표 재변경·처리 블록 독립성·
+- 직전 변경에서 라이브 EQ의 주파수 응답·전환 연속성·목표 재변경·처리 블록 독립성·
   32/48/192 kHz 유한 출력, 마이크 send 반영과 AUX/앱 격리, 반복 Scene snapshot/JSON
   저장을 검사했다. VST3 공통 편집은 실제 출력 변화·슬롯 독립성·이산값·읽기 전용 거절,
   controller-only 값 새로고침·processor 피드백 보존·마지막 편집 후 상태 저장/복원을 검사했다.
@@ -113,7 +125,7 @@
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
 - 탭 선택·ASIO·실행 중
-  소스/체인 삽입/삭제·고급 formant 보존과 음정 보정 품질 수용은 미완료다(실험적 자동 보정은 구현).
+  소스 삽입/삭제·고급 formant 보존과 음정 보정 품질 수용은 미완료다(실험적 자동 보정은 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
   실행 중 음정 설정/프리셋/pre-delay/에코 시간 변경은 미구현이다. 리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.

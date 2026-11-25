@@ -30,6 +30,108 @@ fn capture_queue_rejects_overflow_and_invalid_input_without_waiting() {
     assert!(health.failed());
 }
 
+fn assert_edited_chain_output(input: &mut QueuedInput, worker: &mut PluginWorker,
+    reader: &mut crate::bridge::OutputReader, health: &Health, voice: f32) {
+    let before = health.captured_frames.load(Ordering::Relaxed);
+    input.push(&[0.4; 1536], Some(&[[0.1, -0.2]; 1536]), &[&[[0.08, -0.04]; 1536]]);
+    wait_for(worker, health, before + 1536);
+    for _ in 0..1024 { reader.next_frame([1.0; 3]); }
+    // Both logical outputs receive exactly one processed mic plus unchanged AUX/app.
+    for (actual, expected) in reader.next_frame([1.0; 3]).into_iter()
+        .zip([voice + 0.18, voice - 0.24, voice + 0.18, voice - 0.24]) {
+        assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+    }
+    for _ in 0..4096 { reader.next_frame([1.0; 3]); }
+}
+
+#[test]
+#[ignore = "requires existing MIXLIVE_GAIN_VST3 and MIXLIVE_STATE_VST3 fixtures; no devices/windows"]
+fn native_live_chain_edits_preserve_instances_outputs_and_the_empty_worker() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 1, VocalConfig::default()).unwrap());
+    for command in ["route aux output on", "route aux send on", "route app1 output on", "route app1 send on"] {
+        controls.apply(command.parse().unwrap()).unwrap();
+    }
+    let (writer, mut reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
+    let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+    let (mut input, mut worker) = spawn(capture, vec![], 48000, 100, true, health.clone()).unwrap();
+    assert!(worker.effects().is_empty());
+    let spec = fixture("MIXLIVE_GAIN_VST3");
+    // No capture frames are needed for an empty-to-nonempty handoff.
+    worker.edit_chain(ChainEdit::Add(spec.clone())).unwrap();
+    worker.set_effect_parameter(0, 0, 0.5).unwrap();
+    let first = worker.slots[0].plugin.clone();
+    worker.edit_chain(ChainEdit::Add(spec.clone())).unwrap();
+    worker.set_effect_parameter(1, 0, 0.25).unwrap();
+    let second = worker.slots[1].plugin.clone();
+    assert_eq!(health.captured_frames.load(Ordering::Relaxed), 0);
+    assert_edited_chain_output(&mut input, &mut worker, &mut reader, &health, 0.05);
+
+    worker.edit_chain(ChainEdit::Move { from: 0, to: 1 }).unwrap();
+    assert!(Arc::ptr_eq(&worker.slots[0].plugin, &second));
+    assert!(Arc::ptr_eq(&worker.slots[1].plugin, &first));
+    assert_eq!(worker.effect_parameters(0).unwrap()[0].normalized, 0.25);
+    assert_eq!(worker.effect_parameters(1).unwrap()[0].normalized, 0.5);
+    controls.replace_effects(worker.effect_flags());
+    controls.apply("bypass 2 on".parse().unwrap()).unwrap();
+    assert!(!worker.effects()[0].bypassed && worker.effects()[1].bypassed);
+    controls.apply("bypass 2 off".parse().unwrap()).unwrap();
+
+    let missing = EffectSpec { plugin: spec.plugin.with_file_name("missing-mixlive-effect.vst3"), ..spec.clone() };
+    for edit in [ChainEdit::Remove { index: 2 }, ChainEdit::Move { from: 0, to: 2 },
+        ChainEdit::Add(missing), ChainEdit::Add(fixture("MIXLIVE_STATE_VST3"))] {
+        assert!(worker.edit_chain(edit).is_err());
+        assert!(!health.failed());
+        assert_eq!(worker.slots.len(), 2);
+        assert!(Arc::ptr_eq(&worker.slots[0].plugin, &second));
+        assert!(Arc::ptr_eq(&worker.slots[1].plugin, &first));
+    }
+    assert_edited_chain_output(&mut input, &mut worker, &mut reader, &health, 0.05);
+    worker.edit_chain(ChainEdit::Remove { index: 0 }).unwrap();
+    assert!(Arc::ptr_eq(&worker.slots[0].plugin, &first));
+    assert_edited_chain_output(&mut input, &mut worker, &mut reader, &health, 0.2);
+    worker.edit_chain(ChainEdit::Remove { index: 0 }).unwrap();
+    assert!(worker.effects().is_empty());
+    controls.replace_effects(worker.effect_flags());
+    assert!(controls.effect_bypassed(0).is_err());
+    assert!(worker.description.contains("Serial chain: 0 effects"));
+    assert_edited_chain_output(&mut input, &mut worker, &mut reader, &health, 0.4);
+    assert!(worker.snapshot().unwrap().effects.is_empty());
+    assert!(!health.failed());
+}
+
+#[test]
+#[ignore = "requires existing MIXLIVE_GAIN_VST3 fixture; no devices/windows"]
+fn native_live_chain_snapshot_keeps_the_edited_slot_order_and_bypass() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap());
+    let (writer, _reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
+    let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        vec![(writer, vec![0])], health.clone(), controls).unwrap();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, false, health.clone()).unwrap();
+    for (index, value) in [0.23, 0.61].into_iter().enumerate() {
+        let spec = EffectSpec { bypassed: index == 0, ..fixture("MIXLIVE_GAIN_VST3") };
+        worker.edit_chain(ChainEdit::Add(spec)).unwrap();
+        worker.set_effect_parameter(index, 0, value).unwrap();
+    }
+    worker.edit_chain(ChainEdit::Move { from: 1, to: 0 }).unwrap();
+    assert_eq!(worker.effect_parameters(0).unwrap()[0].normalized, 0.61);
+    assert_eq!(worker.effect_parameters(1).unwrap()[0].normalized, 0.23);
+    // The upstream gain fixture does not serialize parameters. Its state blob and
+    // reordered metadata still exercise this path; the existing state fixture below
+    // independently verifies last-edit parameter persistence and restoration.
+    let snapshot = worker.snapshot().unwrap();
+    assert_eq!(snapshot.effects.len(), 2);
+    assert!(!snapshot.effects[0].bypassed && snapshot.effects[1].bypassed);
+    for effect in &snapshot.effects {
+        assert!(effect.plugin.is_absolute());
+        assert!(effect.class_id.is_some());
+        assert!(effect.state.is_some());
+    }
+    assert!(!health.failed());
+}
+
 #[test]
 #[ignore = "requires existing MIXLIVE_GAIN_VST3 and MIXLIVE_STATE_VST3 fixtures; no devices/windows"]
 fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
@@ -200,10 +302,10 @@ fn native_editors_reopen_on_the_same_slots_and_detach_independently() {
         let _ = plugin.take_restart_flags();
         plugin.start_processing().unwrap();
         plugin.set_parameter(0, gain).unwrap();
-        Slot { plugin: Arc::new(Mutex::new(plugin)), editor: None, bypassed: Arc::new(AtomicBool::new(gain > 0.5)), parameters: None }
+        Slot::new(plugin, Arc::new(AtomicBool::new(gain > 0.5)), 0)
     }).collect();
     let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
-        stopped: false, health: health.clone(), description: String::new() };
+        stopped: false, health: health.clone(), chain: None, description: String::new() };
     // Upstream's documented Editor Attached instrumentation (read-only parameter 1000).
     let attached = |worker: &PluginWorker, index: usize| {
         worker.slots[index].plugin.lock().unwrap().get_parameter(1000).unwrap()
@@ -266,10 +368,10 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
             let mut plugin = load_effect(&spec, 48000).unwrap();
             let _ = plugin.take_restart_flags();
             plugin.start_processing().unwrap();
-            slots.push(Slot { plugin: Arc::new(Mutex::new(plugin)), editor: None, bypassed: Arc::new(AtomicBool::new(gain > 0.5)), parameters: None });
+            slots.push(Slot::new(plugin, Arc::new(AtomicBool::new(gain > 0.5)), 0));
         }
         let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
-            stopped: false, health: health.clone(), description: String::new() };
+            stopped: false, health: health.clone(), chain: None, description: String::new() };
         // A last generic-panel edit with no subsequent audio block must survive its snapshot.
         for (index, gain) in [0.23, 0.61].into_iter().enumerate() {
             let parameters = worker.set_effect_parameter(index, 0, gain).unwrap();

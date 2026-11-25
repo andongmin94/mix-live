@@ -82,9 +82,27 @@ struct CompiledSend {
     source: usize,
     mix: usize,
     gain: f32,
-    // Empty for an uncompensated send; zero-filled before rendering starts.
-    delay: Vec<[f32; 2]>,
+}
+
+struct SendDelay {
+    samples: Vec<[f32; 2]>,
     cursor: usize,
+}
+
+/// Integer-sample send histories prepared by the control thread. Entries follow
+/// ORIGINAL Scene::sends indices, including zero-delay entries for unused sends.
+pub struct SendDelays {
+    lines: Vec<SendDelay>,
+}
+
+impl SendDelays {
+    /// Allocate before submitting a plan to the processing thread. The host bounds
+    /// latency and supplies zero for sends which do not need compensation.
+    pub fn new(frames: &[usize]) -> Self {
+        Self { lines: frames.iter().map(|&frames| SendDelay {
+            samples: vec![[0.0; 2]; frames], cursor: 0,
+        }).collect() }
+    }
 }
 
 struct MixBuffer {
@@ -98,6 +116,7 @@ pub struct Engine {
     sources: Vec<CompiledSource>,
     sends: Vec<CompiledSend>,
     send_count: usize,
+    delays: SendDelays,
     mixes: Vec<MixBuffer>,
     max_frames: usize,
     rendered_frames: usize,
@@ -132,7 +151,7 @@ impl Engine {
             .map(|(index, send)| {
                 let gain = linear_gain(send.gain_db)
                     .ok_or(ConfigError::InvalidGain { section: "send", index })?;
-                Ok(CompiledSend { index, source: send.source, mix: send.mix, gain, delay: Vec::new(), cursor: 0 })
+                Ok(CompiledSend { index, source: send.source, mix: send.mix, gain })
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
         let mixes = scene
@@ -150,19 +169,16 @@ impl Engine {
                 })
             })
             .collect::<Result<Vec<_>, ConfigError>>()?;
-        Ok(Self { sources, sends, send_count: scene.sends.len(), mixes, max_frames, rendered_frames: 0 })
+        let delays = SendDelays::new(&vec![0; scene.sends.len()]);
+        Ok(Self { sources, sends, send_count: scene.sends.len(), delays, mixes, max_frames, rendered_frames: 0 })
     }
 
-    /// Prepare fixed integer-sample delays on the control thread, before rendering.
-    /// Delays follow ORIGINAL Scene::sends indices, like the gain envelopes.
-    /// Only enabled, compiled sends allocate storage. A host must bound its requested
-    /// latency before calling this; changing it requires a stopped/reprepared route.
-    pub fn prepare_send_delays(&mut self, frames: &[usize]) -> Result<(), ConfigError> {
-        if frames.len() != self.send_count { return Err(ConfigError::SendDelayCountMismatch); }
-        for send in &mut self.sends {
-            send.delay = vec![[0.0; 2]; frames[send.index]];
-            send.cursor = 0;
-        }
+    /// Install prepared delays at a block boundary without allocation or destruction.
+    /// The caller receives the previous histories and retires them on its control thread.
+    /// Invalid plans leave the active histories and last output unchanged.
+    pub fn swap_send_delays(&mut self, prepared: &mut SendDelays) -> Result<(), ConfigError> {
+        if prepared.lines.len() != self.send_count { return Err(ConfigError::SendDelayCountMismatch); }
+        std::mem::swap(&mut self.delays, prepared);
         self.rendered_frames = 0;
         Ok(())
     }
@@ -227,17 +243,18 @@ impl Engine {
                 continue;
             }
             let gain = source.gain * send.gain;
+            let delay = &mut self.delays.lines[send.index];
             let (left, right) = inputs[send.source].planes();
             for (frame, (out_left, out_right)) in mix.left[..frames].iter_mut().zip(&mut mix.right[..frames]).enumerate() {
                 let sample = [left[frame], right[frame]];
                 // Even a zero live envelope advances the history: re-enabling a
                 // route must not replay stale data. Apply live gains AFTER the delay.
-                let sample = if send.delay.is_empty() {
+                let sample = if delay.samples.is_empty() {
                     sample
                 } else {
-                    let delayed = std::mem::replace(&mut send.delay[send.cursor], sample);
-                    send.cursor += 1;
-                    if send.cursor == send.delay.len() { send.cursor = 0; }
+                    let delayed = std::mem::replace(&mut delay.samples[delay.cursor], sample);
+                    delay.cursor += 1;
+                    if delay.cursor == delay.samples.len() { delay.cursor = 0; }
                     delayed
                 };
                 let gain = gain * gains.map_or(1.0, |envelopes| envelopes[send.index][frame]);
@@ -324,16 +341,20 @@ mod send_gain_tests {
         spec.mixes[1].gain_db = 0.0;
         spec.sends[1].gain_db = 0.0;
         let mut engine = Engine::new(&spec, 4).unwrap();
-        assert_eq!(engine.prepare_send_delays(&[3]), Err(ConfigError::SendDelayCountMismatch));
-        engine.prepare_send_delays(&[11, 3]).unwrap();
+        assert_eq!(engine.swap_send_delays(&mut SendDelays::new(&[3])), Err(ConfigError::SendDelayCountMismatch));
+        engine.swap_send_delays(&mut SendDelays::new(&[0, 3])).unwrap();
         assert_eq!(engine.sends.len(), 1);
-        assert_eq!(engine.sends[0].delay.len(), 3);
+        assert_eq!(engine.delays.lines[1].samples.len(), 3);
 
         let inputs = [Input::Stereo { left: &[0.125, 0.25], right: &[-0.25, -0.5] }];
         engine.render_with_send_gains(2, &inputs, &[&[1.0; 2], &[0.0; 2]]).unwrap();
         assert_eq!(engine.output(1).unwrap().sample_peak(), 0.0);
         let inputs = [Input::Stereo { left: &[0.375, 0.5], right: &[-0.75, -1.0] }];
         engine.render_with_send_gains(2, &inputs, &[&[1.0; 2], &[0.0; 2]]).unwrap();
+        assert_eq!(engine.output(1).unwrap().sample_peak(), 0.0);
+
+        // A rejected topology must preserve both the history cursor and last output.
+        assert_eq!(engine.swap_send_delays(&mut SendDelays::new(&[0])), Err(ConfigError::SendDelayCountMismatch));
         assert_eq!(engine.output(1).unwrap().sample_peak(), 0.0);
 
         // The first sample arrived during mute and must not be replayed.
@@ -344,10 +365,14 @@ mod send_gain_tests {
         assert_eq!(output.left, &[0.25, 0.375]);
         assert_eq!(output.right, &[-0.5, -0.75]);
         assert_eq!(engine.output(0).unwrap().sample_peak(), 0.0);
-        engine.prepare_send_delays(&[0, 0]).unwrap();
+        let mut retired = SendDelays::new(&[0, 0]);
+        let history = engine.delays.lines[1].samples.as_ptr();
+        engine.swap_send_delays(&mut retired).unwrap();
+        assert_eq!(retired.lines[1].samples.as_ptr(), history);
+        assert_eq!(retired.lines[1].cursor, 0);
         assert!(engine.output(1).is_none());
-        engine.render(2, &silence).unwrap();
-        assert_eq!(engine.output(1).unwrap().sample_peak(), 0.0);
+        engine.render(2, &inputs).unwrap();
+        assert_eq!(engine.output(1).unwrap().left, &[0.375, 0.5]);
     }
 
     #[test]

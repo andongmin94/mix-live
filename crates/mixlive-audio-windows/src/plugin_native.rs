@@ -1,8 +1,8 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
-use super::{ChainFile, EffectSpec, LiveParameter, ResolvedPlugins};
-use crate::{bridge::{Fault, Health}, capture::{Capture, CAPTURE_BLOCK}, config::MAX_APPS, control::{GainRamp, LiveControls}};
+use super::{ChainEdit, ChainFile, EffectSpec, LiveParameter, ResolvedPlugins};
+use crate::{bridge::{Fault, Health}, capture::{Capture, PreparedVoiceDelay, VoiceDelayLayout, CAPTURE_BLOCK}, config::MAX_APPS, control::{GainRamp, LiveControls}};
 use mixlive_vst3::editor::flush_editor_changes;
-use rtrb::{Producer, RingBuffer};
+use rtrb::{Consumer, Producer, RingBuffer};
 use std::{path::Path, sync::{Arc, Mutex, TryLockError, atomic::{AtomicBool, Ordering}}, thread::{self, JoinHandle}, time::Duration};
 use vst3_host::{Parameter, Plugin, PluginWindow, Vst3Host, audio::BusAudioBuffers, plugin::ProcessMode};
 
@@ -42,10 +42,10 @@ impl QueuedInput {
     }
 }
 
-pub(crate) enum CaptureSink { Direct(Box<Capture>), Queued(QueuedInput) }
+pub(crate) struct CaptureSink(QueuedInput);
 impl CaptureSink {
     pub fn push(&mut self, mic: &[f32], aux: Option<&[[f32; 2]]>, apps: &[&[[f32; 2]]]) {
-        match self { Self::Direct(capture) => capture.push(mic, aux, apps), Self::Queued(input) => input.push(mic, aux, apps) }
+        self.0.push(mic, aux, apps);
     }
 }
 
@@ -55,6 +55,10 @@ struct Slot {
     bypassed: Arc<AtomicBool>,
     // Initialized only on explicit panel access. Feedback replaces values, never records history.
     parameters: Option<Vec<CachedParameter>>,
+    // Native metadata copied on the loading thread; never query it from UI render.
+    spec: EffectSpec,
+    name: String,
+    latency: u32,
 }
 
 struct CachedParameter {
@@ -87,6 +91,13 @@ fn parameter_snapshot(plugin: &Plugin, parameter: &Parameter) -> Result<LivePara
 }
 
 impl Slot {
+    fn new(plugin: Plugin, bypassed: Arc<AtomicBool>, latency: u32) -> Self {
+        let spec = EffectSpec { plugin: plugin.info().path.clone(), class_id: Some(plugin.info().uid.clone()),
+            state: None, bypassed: bypassed.load(Ordering::Relaxed) };
+        let name = plugin.info().name.clone();
+        Self { plugin: Arc::new(Mutex::new(plugin)), editor: None, bypassed, parameters: None, spec, name, latency }
+    }
+
     // Loading/control thread only, outside GPUI borrows. Native calls still share the
     // existing worker mutex; this is not a lock-free or hard-real-time host interface.
     fn parameter_snapshot(&mut self, edit: Option<(u32, f64)>) -> Result<Vec<LiveParameter>, String> {
@@ -173,14 +184,52 @@ impl Processor {
     }
 }
 
+// One prepared edit is in flight at a time. Both vectors and the replacement delay
+// bank are allocated on the loading thread. The worker only moves/swaps ownership.
+struct ChainChange {
+    processors: Vec<Option<Processor>>,
+    retained: Vec<(usize, usize)>,
+    delays: Option<PreparedVoiceDelay>,
+}
+impl ChainChange {
+    fn apply(&mut self, capture: &mut Capture, processors: &mut Vec<Option<Processor>>) {
+        for &(from, to) in &self.retained { self.processors[to] = processors[from].take(); }
+        std::mem::swap(&mut self.processors, processors);
+        if let Some(delays) = &mut self.delays { capture.swap_voice_delay(delays); }
+    }
+}
+
+struct ChainControl {
+    requests: Producer<ChainChange>,
+    retired: Consumer<ChainChange>,
+    layout: VoiceDelayLayout,
+    rate: u32,
+    capacity: usize,
+    latency: u64,
+    pitch_latency: usize,
+    compensation: usize,
+}
+
+// The join result returns every owned audio allocation to the loading thread,
+// including an unapplied request when the route stops before its boundary.
+struct ProcessingState {
+    capture: Capture,
+    processors: Vec<Option<Processor>>,
+    input: Consumer<CaptureFrame>,
+    requests: Consumer<ChainChange>,
+    retired: Producer<ChainChange>,
+    unreturned: Option<ChainChange>,
+}
+
 /// Loaded/polled/dropped on the main thread. Join ONE processing thread before native teardown.
 /// Native crashes/hangs are not isolated; editor/control calls still share the plugin mutexes.
 pub(crate) struct PluginWorker {
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<ProcessingState>>,
     stop: Arc<AtomicBool>,
     slots: Vec<Slot>,
     stopped: bool,
     health: Arc<Health>,
+    chain: Option<ChainControl>,
     pub description: String,
 }
 
@@ -202,19 +251,18 @@ fn load_effect(spec: &EffectSpec, rate: u32) -> Result<Plugin, String> {
 }
 
 pub fn connect(capture: Capture, setup: &ResolvedPlugins, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>, controls: &LiveControls)
-    -> Result<(CaptureSink, Option<PluginWorker>), String> {
+    -> Result<(CaptureSink, PluginWorker), String> {
     setup.validate()?;
-    if setup.effects.is_empty() { return Ok((CaptureSink::Direct(Box::new(capture)), None)); }
     // Selection was resolved once, from CLI/chain or an embedded scene. Native loading happens here.
     let plugins = setup.effects.iter().enumerate().map(|(index, spec)| {
         let plugin = load_effect(spec, rate).map_err(|e| format!("VST3 slot {}: {e}", index + 1))?;
-        Ok::<_, String>((plugin, controls.effect_flag(index)?.clone()))
+        Ok::<_, String>((plugin, controls.effect_flag(index)?))
     }).collect::<Result<Vec<_>, _>>()?;
     let (input, mut worker) = spawn(capture, plugins, rate, queue_ms, has_aux, health)?;
     for &index in &setup.editors {
         worker.set_editor_open(index as usize - 1, true)?;
     }
-    Ok((CaptureSink::Queued(input), Some(worker)))
+    Ok((CaptureSink(input), worker))
 }
 
 fn open_editor(plugin: Arc<Mutex<Plugin>>) -> Result<PluginWindow, String> {
@@ -227,7 +275,7 @@ fn open_editor(plugin: Arc<Mutex<Plugin>>) -> Result<PluginWindow, String> {
 }
 
 /// Stereo remains stereo between every stage. Scratch storage is allocated at preparation only.
-fn process_chain(processors: &mut [Processor], left: &mut [f32], right: &mut [f32]) -> bool {
+fn process_chain<'a>(processors: impl IntoIterator<Item = &'a mut Processor>, left: &mut [f32], right: &mut [f32]) -> bool {
     let frames = left.len();
     for processor in processors {
         let bypassed = processor.bypassed.load(Ordering::Relaxed);
@@ -249,66 +297,94 @@ fn process_chain(processors: &mut [Processor], left: &mut [f32], right: &mut [f3
     true
 }
 
+fn prepare_plugin(mut plugin: Plugin, bypassed: Arc<AtomicBool>, rate: u32, index: usize)
+    -> Result<(Slot, Processor), String> {
+    let layout = plugin.audio_bus_layout().map_err(|e| e.to_string())?;
+    for buses in [&layout.inputs, &layout.outputs] {
+        if buses.len() != 1 || !buses[0].active || buses[0].channel_count != 2 {
+            return Err(format!("VST3 slot {} requires exactly one active stereo input and output bus; sidechains/multibus are not omitted", index + 1));
+        }
+    }
+    let buffers = BusAudioBuffers::new(&layout, CAPTURE_BLOCK, f64::from(rate));
+    let _ = plugin.take_restart_flags();
+    let _ = plugin.take_host_notifications();
+    let _ = plugin.take_parameter_edits();
+    plugin.start_processing().map_err(|e| format!("VST3 slot {}: {e}", index + 1))?;
+    // Read the report only after the final rate, state and processing activation.
+    let latency = plugin.latency_samples();
+    if u64::from(latency) > u64::from(rate) * 2 {
+        let _ = plugin.stop_processing();
+        return Err("VST3 latency exceeds the supported 2-second live bypass/compensation bound".into());
+    }
+    let slot = Slot::new(plugin, bypassed.clone(), latency);
+    let processor = Processor::new(slot.plugin.clone(), buffers, bypassed, rate, latency);
+    Ok((slot, processor))
+}
+
 fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u32, queue_ms: u32, has_aux: bool, health: Arc<Health>)
     -> Result<(QueuedInput, PluginWorker), String> {
-    if plugins.is_empty() || !(8_000..=192_000).contains(&rate) || !(10..=100).contains(&queue_ms) {
-        return Err("invalid VST3 chain/rate/queue capacity".into());
+    if !(8_000..=192_000).contains(&rate) || !(10..=100).contains(&queue_ms) {
+        return Err("invalid VST3 rate/queue capacity".into());
     }
     let capacity = (rate as usize * queue_ms as usize / 1000).max(CAPTURE_BLOCK * 2);
     let app_count = capture.app_count();
-    let (writer, mut reader) = RingBuffer::<CaptureFrame>::new(capacity);
+    let (writer, reader) = RingBuffer::<CaptureFrame>::new(capacity);
+    let (requests, changes) = RingBuffer::new(1);
+    let (retired, acknowledgments) = RingBuffer::new(1);
+    let layout = capture.delay_layout();
     let mut owner = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots: Vec::new(),
-        stopped: false, health: health.clone(), description: String::new() };
+        stopped: false, health: health.clone(), chain: Some(ChainControl { requests, retired: acknowledgments,
+            layout, rate, capacity, latency: 0, pitch_latency: 0, compensation: 0 }), description: String::new() };
     let mut processors = Vec::new();
     let mut total_latency = 0_u64;
-    for (index, (mut plugin, bypassed)) in plugins.into_iter().enumerate() {
-        let layout = plugin.audio_bus_layout().map_err(|e| e.to_string())?;
-        for buses in [&layout.inputs, &layout.outputs] {
-            if buses.len() != 1 || !buses[0].active || buses[0].channel_count != 2 {
-                return Err(format!("VST3 slot {} requires exactly one active stereo input and output bus; sidechains/multibus are not omitted", index + 1));
-            }
-        }
-        let buffers = BusAudioBuffers::new(&layout, CAPTURE_BLOCK, f64::from(rate));
-        let _ = plugin.take_restart_flags();
-        let _ = plugin.take_host_notifications();
-        let _ = plugin.take_parameter_edits();
-        plugin.start_processing().map_err(|e| format!("VST3 slot {}: {e}", index + 1))?;
-        // Read the report only after the final rate, state and processing activation.
-        let latency = plugin.latency_samples();
-        total_latency += u64::from(latency);
-        // The same two-second live compensation bound applies to all aligned dry paths.
-        if total_latency > u64::from(rate) * 2 {
-            let _ = plugin.stop_processing();
-            return Err("VST3 chain latency exceeds the supported 2-second live bypass/compensation bound".into());
-        }
-        owner.description.push_str(&format!("VST3 slot {}: {} [{}]; reported latency {} samples.\n",
-            index + 1, plugin.info().name, plugin.info().uid, latency));
-        let plugin = Arc::new(Mutex::new(plugin));
-        processors.push(Processor::new(plugin.clone(), buffers, bypassed.clone(), rate, latency));
-        owner.slots.push(Slot { plugin, editor: None, bypassed, parameters: None });
+    for (index, (plugin, bypassed)) in plugins.into_iter().enumerate() {
+        let (slot, processor) = prepare_plugin(plugin, bypassed, rate, index)?;
+        total_latency += u64::from(slot.latency);
+        owner.slots.push(slot);
+        processors.push(Some(processor));
     }
-    let pitch_latency = capture.pitch_latency();
-    let compensation = capture.prepare_voice_delay(total_latency, rate)?;
-    owner.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOutgoing AUX/app send compensation: {compensation} samples ({:.2} ms); monitor adds no compensation. Includes {pitch_latency} samples of built-in pitch latency plus reported VST3 latency, not device or clock alignment.\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. Explicit slot bypass blends with latency-aligned dry audio; effects still process. No automatic dry fallback or crash isolation. Restart requests stop the route.",
-        processors.len(), total_latency, total_latency as f64 * 1000.0 / f64::from(rate),
-        compensation as f64 * 1000.0 / f64::from(rate), capacity as f64 * 1000.0 / f64::from(rate)));
+    let chain = owner.chain.as_mut().expect("prepared chain control");
+    let mut delays = chain.layout.prepare(total_latency, rate)?;
+    chain.latency = total_latency;
+    chain.pitch_latency = delays.latency() - total_latency as usize;
+    chain.compensation = delays.compensation();
+    capture.swap_voice_delay(&mut delays);
+    drop(delays);
+    owner.refresh_description();
     let stop = owner.stop.clone();
     let worker_health = health.clone();
+    let mut state = ProcessingState { capture, processors, input: reader, requests: changes, retired, unreturned: None };
     owner.thread = Some(thread::Builder::new().name("mixlive-vst3-audio".into()).spawn(move || {
         let mut mic = [0.0; CAPTURE_BLOCK];
         let mut aux = [[0.0; 2]; CAPTURE_BLOCK];
         let mut app_buffers = [[[0.0; 2]; CAPTURE_BLOCK]; MAX_APPS];
         while !stop.load(Ordering::Relaxed) && !worker_health.failed() {
-            let count = reader.slots().min(CAPTURE_BLOCK);
+            // An idle queue is still a valid boundary. Native loading and allocation
+            // are already complete, and the PDC bank changes with the processor order.
+            if let Ok(mut change) = state.requests.pop() {
+                change.apply(&mut state.capture, &mut state.processors);
+                if let Err(rtrb::PushError::Full(change)) = state.retired.push(change) {
+                    // One edit is in flight, so this is a broken handoff invariant.
+                    // Retain ownership for join instead of freeing buffers here.
+                    state.unreturned = Some(change);
+                    worker_health.fail(Fault::Routing);
+                    break;
+                }
+            }
+            let count = state.input.slots().min(CAPTURE_BLOCK);
             if count == 0 { thread::sleep(Duration::from_millis(1)); continue; }
             for i in 0..count {
-                let Ok(frame) = reader.pop() else { worker_health.fail(Fault::Routing); return; };
+                let Ok(frame) = state.input.pop() else { worker_health.fail(Fault::Routing); break; };
                 mic[i] = frame.mic; aux[i] = frame.aux;
                 for (buffer, sample) in app_buffers.iter_mut().zip(frame.apps).take(app_count) { buffer[i] = sample; }
             }
+            if worker_health.failed() { break; }
             let apps: [&[[f32; 2]]; MAX_APPS] = std::array::from_fn(|slot| &app_buffers[slot][..count]);
-            capture.push_with_effect(&mic[..count], has_aux.then_some(&aux[..count]), &apps[..app_count], &mut |left, right| process_chain(&mut processors, left, right));
+            state.capture.push_with_effect(&mic[..count], has_aux.then_some(&aux[..count]), &apps[..app_count], &mut |left, right| {
+                process_chain(state.processors.iter_mut().map(|processor| processor.as_mut().expect("prepared processor slot")), left, right)
+            });
         }
+        state
     }).map_err(|e| e.to_string())?);
     Ok((QueuedInput { writer, has_aux, app_count, health }, owner))
 }
@@ -327,7 +403,146 @@ fn stop_and_snapshot(plugin: &mut Plugin, save: bool, bypassed: bool) -> Result<
         state: Some(plugin.save_state().map_err(|e| e.to_string())?), bypassed }))
 }
 
+fn retire_slot(mut slot: Slot) -> Result<(), String> {
+    drop(slot.editor.take());
+    let mut plugin = slot.plugin.lock().map_err(|_| "VST3 processing state was poisoned")?;
+    stop_and_snapshot(&mut plugin, false, slot.bypassed.load(Ordering::Relaxed)).map(|_| ())
+}
+
+fn reject_added(added: Option<Slot>, error: String) -> String {
+    if let Some(slot) = added {
+        if let Err(cleanup) = retire_slot(slot) { return format!("{error}; new VST3 teardown failed: {cleanup}"); }
+    }
+    error
+}
+
 impl PluginWorker {
+    fn refresh_description(&mut self) {
+        let Some(chain) = &self.chain else { return; };
+        self.description = self.slots.iter().enumerate().map(|(index, slot)| {
+            format!("VST3 slot {}: {} [{}]; reported latency {} samples.\n", index + 1, slot.name,
+                slot.spec.class_id.as_deref().expect("loaded class ID"), slot.latency)
+        }).collect();
+        self.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOutgoing AUX/app send compensation: {} samples ({:.2} ms); monitor adds no compensation. Includes {} samples of built-in pitch latency plus reported VST3 latency, not device or clock alignment.\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. Chain edits and outgoing compensation change at one block boundary; new plugin/delay histories start empty and removed tails end. Explicit slot bypass blends with latency-aligned dry audio; effects still process. No automatic dry fallback or crash isolation. Restart requests stop the route.",
+            self.slots.len(), chain.latency, chain.latency as f64 * 1000.0 / f64::from(chain.rate),
+            chain.compensation, chain.compensation as f64 * 1000.0 / f64::from(chain.rate), chain.pitch_latency,
+            chain.capacity as f64 * 1000.0 / f64::from(chain.rate)));
+    }
+
+    pub fn effects(&self) -> Vec<EffectSpec> {
+        self.slots.iter().map(|slot| EffectSpec {
+            bypassed: slot.bypassed.load(Ordering::Relaxed), ..slot.spec.clone()
+        }).collect()
+    }
+
+    pub fn effect_flags(&self) -> Vec<Arc<AtomicBool>> {
+        self.slots.iter().map(|slot| slot.bypassed.clone()).collect()
+    }
+
+    /// Loading thread only. A rejected preparation leaves the active chain intact.
+    /// The acknowledged order remains authoritative if retiring a removed plugin fails.
+    pub fn edit_chain(&mut self, edit: ChainEdit) -> Result<(), String> {
+        if self.health.failed() || self.stopped { return Err("audio path has stopped; cannot edit the VST3 chain".into()); }
+        let chain = self.chain.as_ref().ok_or("no running audio processor")?;
+        if self.thread.is_none() { return Err("no running audio processor".into()); }
+        let mut order: Vec<_> = (0..self.slots.len()).collect();
+        let mut added = None;
+        let mut added_processor = None;
+        match &edit {
+            ChainEdit::Add(spec) => {
+                super::validate_effects(std::slice::from_ref(spec))?;
+                let plugin = load_effect(spec, chain.rate)?;
+                let (slot, processor) = prepare_plugin(plugin, Arc::new(AtomicBool::new(spec.bypassed)), chain.rate, self.slots.len())?;
+                added = Some(slot);
+                added_processor = Some(processor);
+            }
+            ChainEdit::Remove { index } => {
+                if *index >= order.len() { return Err("VST3 slot is outside the active chain".into()); }
+                order.remove(*index);
+            }
+            ChainEdit::Move { from, to } => {
+                if *from >= order.len() || *to >= order.len() { return Err("VST3 slot is outside the active chain".into()); }
+                if from == to { return Ok(()); }
+                let moved = order.remove(*from);
+                order.insert(*to, moved);
+            }
+        }
+        let latency = order.iter().map(|&index| u64::from(self.slots[index].latency)).sum::<u64>()
+            + added.as_ref().map_or(0, |slot| u64::from(slot.latency));
+        // A reorder or a zero-latency add/remove keeps the existing PDC history.
+        let delays = if latency == chain.latency { None } else {
+            match chain.layout.prepare(latency, chain.rate) {
+                Ok(delays) => Some(delays),
+                Err(error) => {
+                    drop(added_processor);
+                    return Err(reject_added(added, error));
+                }
+            }
+        };
+        let compensation = delays.as_ref().map_or(chain.compensation, PreparedVoiceDelay::compensation);
+        let mut processors: Vec<_> = std::iter::repeat_with(|| None).take(order.len()).collect();
+        if let Some(processor) = added_processor { processors.push(Some(processor)); }
+        let retained = order.into_iter().enumerate().map(|(to, from)| (from, to)).collect();
+        let change = ChainChange { processors, retained, delays };
+        let retired = match self.exchange_chain(change) {
+            Ok(retired) => retired,
+            Err(error) => return Err(reject_added(added, error)),
+        };
+        // Removed processors, old PDC banks and all staging vectors are freed here.
+        drop(retired);
+        let removed = match edit {
+            ChainEdit::Add(_) => { self.slots.push(added.expect("prepared added slot")); None }
+            ChainEdit::Remove { index } => Some(self.slots.remove(index)),
+            ChainEdit::Move { from, to } => { let slot = self.slots.remove(from); self.slots.insert(to, slot); None }
+        };
+        let chain = self.chain.as_mut().expect("prepared chain control");
+        chain.latency = latency;
+        chain.compensation = compensation;
+        self.refresh_description();
+        if let Some(slot) = removed {
+            if let Err(error) = retire_slot(slot) {
+                self.health.fail(Fault::Routing);
+                return Err(format!("VST3 chain changed, but removed plugin teardown failed: {error}"));
+            }
+        }
+        if let Some(error) = self.health.error() { return Err(error.into()); }
+        Ok(())
+    }
+
+    fn exchange_chain(&mut self, change: ChainChange) -> Result<ChainChange, String> {
+        if self.health.failed() { return Err("audio path failed before the chain change".into()); }
+        if self.chain.as_mut().expect("prepared chain control").requests.push(change).is_err() {
+            return Err("a VST3 chain change is already pending".into());
+        }
+        loop {
+            if let Ok(retired) = self.chain.as_mut().expect("prepared chain control").retired.pop() { return Ok(retired); }
+            if self.health.failed() || self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
+                if !self.health.failed() { self.health.fail(Fault::Routing); }
+                if let Some(retired) = self.join_processing() { return Ok(retired); }
+                return Err(self.health.error().unwrap_or("audio processor stopped before the chain change").into());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn join_processing(&mut self) -> Option<ChainChange> {
+        self.stop.store(true, Ordering::Relaxed);
+        let joined = self.thread.take().map(JoinHandle::join);
+        let acknowledged = self.chain.as_mut().and_then(|chain| chain.retired.pop().ok());
+        match joined {
+            Some(Ok(mut state)) => {
+                let unreturned = state.unreturned.take();
+                while let Ok(change) = state.requests.pop() { drop(change); }
+                // Capture, resident processors, queue storage and any unapplied edit
+                // leave the processing thread through this join result.
+                drop(state);
+                acknowledged.or(unreturned)
+            }
+            Some(Err(_)) => { self.health.fail(Fault::Routing); acknowledged }
+            None => acknowledged,
+        }
+    }
+
     pub fn effect_parameters(&mut self, index: usize) -> Result<Vec<LiveParameter>, String> {
         if self.health.failed() { return Err("audio path has failed; stop before editing parameters".into()); }
         self.slots.get_mut(index).ok_or("VST3 slot is outside the active chain")?.parameter_snapshot(None)
@@ -399,10 +614,7 @@ impl PluginWorker {
 
     fn shutdown(&mut self, save: bool) -> Result<Option<ChainFile>, String> {
         if self.stopped { return Ok(None); }
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(worker) = self.thread.take() {
-            if worker.join().is_err() { self.health.fail(Fault::Routing); }
-        }
+        drop(self.join_processing());
         for slot in &mut self.slots { drop(slot.editor.take()); }
         self.stopped = true;
         let mut effects = Vec::new();

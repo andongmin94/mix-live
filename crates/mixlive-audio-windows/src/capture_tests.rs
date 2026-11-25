@@ -409,6 +409,54 @@ fn reported_vst3_delay_aligns_stereo_sends_across_blocks_without_delaying_monito
 }
 
 #[test]
+fn live_chain_delay_swap_preserves_equal_latency_and_removes_the_last_delay() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, VocalConfig::default()).unwrap());
+    for command in ["route aux output on", "route aux broadcast on", "route app1 output on", "route app1 broadcast on"] {
+        controls.apply(command.parse().unwrap()).unwrap();
+    }
+    let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        vec![(writer, vec![0, 2])], health.clone(), controls).unwrap();
+    let layout = capture.delay_layout();
+    let mut prepared = layout.prepare(3, 48000).unwrap();
+    assert_eq!(prepared.latency(), 3);
+    assert_eq!(prepared.compensation(), 3);
+    capture.swap_voice_delay(&mut prepared);
+    assert_eq!(prepared.latency(), 0); // returned allocation belongs to the caller
+    capture.push(&[0.0; 2], Some(&[[0.125, -0.25]; 2]), &[&[[0.25, 0.125]; 2]]);
+    assert_eq!(capture.engine.output(1).unwrap().left, &[0.0; 2]);
+    assert_eq!(capture.engine.output(0).unwrap().left, &[0.375; 2]);
+
+    // Reordering a chain with the same latency keeps the first two queued samples.
+    capture.swap_voice_delay(&mut layout.prepare(3, 48000).unwrap());
+    assert!(layout.prepare(96_001, 48000).is_err());
+    assert!(layout.prepare(u64::MAX, 48000).is_err());
+    capture.push(&[0.0; 2], Some(&[[0.5, -0.5]; 2]), &[&[[0.25, 0.25]; 2]]);
+    assert_eq!(capture.engine.output(1).unwrap().left, &[0.0, 0.375]);
+    assert_eq!(capture.engine.output(1).unwrap().right, &[0.0, -0.125]);
+
+    // Removing the last latency-bearing effect immediately restores undelayed sends.
+    let mut zero = layout.prepare(0, 48000).unwrap();
+    capture.swap_voice_delay(&mut zero);
+    assert_eq!(zero.latency(), 3);
+    assert_eq!(zero.compensation(), 3);
+    capture.push(&[0.0; 2], Some(&[[0.5, -0.5]; 2]), &[&[[0.25, 0.25]; 2]]);
+    assert_eq!(capture.engine.output(1).unwrap().left, &[0.75; 2]);
+    assert_eq!(capture.engine.output(1).unwrap().right, &[-0.25; 2]);
+
+    let mut longer = layout.prepare(5, 48000).unwrap();
+    capture.swap_voice_delay(&mut longer);
+    assert_eq!(longer.latency(), 0);
+    capture.push(&[0.0; 5], Some(&[[0.125, -0.25]; 5]), &[&[[0.25, 0.125]; 5]]);
+    assert_eq!(capture.engine.output(1).unwrap().left, &[0.0; 5]);
+    assert_eq!(capture.engine.output(0).unwrap().left, &[0.375; 5]);
+    capture.push(&[0.0], Some(&[[0.0; 2]]), &[&[[0.0; 2]]]);
+    assert_eq!(capture.engine.output(1).unwrap().left, &[0.375]);
+    assert!(!health.failed());
+}
+
+#[test]
 fn source_mute_applies_after_compensation_and_route_reenable_keeps_current_history() {
     let health = Arc::new(Health::default());
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, VocalConfig::default()).unwrap());

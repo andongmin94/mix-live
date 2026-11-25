@@ -2,7 +2,7 @@
 use crate::config::{AuxDestination, RouteOptions, MAX_APPS, MAX_MIXES};
 use serde::{Deserialize, Serialize};
 use mixlive_effects::{VocalConfig, VocalParameter};
-use std::{str::FromStr, sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}}};
+use std::{str::FromStr, sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU32, Ordering}}};
 
 const MIC: u32 = 1;
 const AUX: u32 = 2;
@@ -207,7 +207,9 @@ pub struct LiveControls {
     routes_enabled: AtomicU32,
     route_levels: [AtomicU32; MAX_ROUTES],
     source_trims: [AtomicU32; MAX_SOURCES],
-    effect_bypasses: Vec<Arc<AtomicBool>>,
+    // Only foreground/CLI code accesses this list. Processing keeps each flag's
+    // Arc directly and never takes this lock when the slot order changes.
+    effect_bypasses: Mutex<Vec<Arc<AtomicBool>>>,
     vocal_start: VocalConfig,
     vocal_targets: [AtomicU32; VocalParameter::ALL.len()],
 }
@@ -230,7 +232,7 @@ impl LiveControls {
             routes_enabled: AtomicU32::new(mic_routes),
             route_levels: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
             source_trims: std::array::from_fn(|_| AtomicU32::new(1.0_f32.to_bits())),
-            effect_bypasses: Vec::new(),
+            effect_bypasses: Mutex::new(Vec::new()),
             vocal_start: vocal,
             vocal_targets: VocalParameter::ALL.map(|parameter| AtomicU32::new(vocal.parameter(parameter).to_bits())) })
     }
@@ -399,11 +401,18 @@ impl LiveControls {
     /// Called once before sharing the prepared controls with processing or UI threads.
     #[cfg(any(windows, test))]
     pub(crate) fn prepare_effects(&mut self, bypasses: impl Iterator<Item = bool>) {
-        self.effect_bypasses = bypasses.map(|bypassed| Arc::new(AtomicBool::new(bypassed))).collect();
+        *self.effect_bypasses.get_mut().expect("control bypass list") = bypasses.map(|bypassed| Arc::new(AtomicBool::new(bypassed))).collect();
     }
 
-    pub(crate) fn effect_flag(&self, index: usize) -> Result<&Arc<AtomicBool>, String> {
-        self.effect_bypasses.get(index).ok_or_else(|| "VST3 slot is outside the active chain".into())
+    /// Publish only after the processing worker has acknowledged the new order.
+    #[cfg(any(windows, test))]
+    pub(crate) fn replace_effects(&self, flags: Vec<Arc<AtomicBool>>) {
+        *self.effect_bypasses.lock().expect("control bypass list") = flags;
+    }
+
+    pub(crate) fn effect_flag(&self, index: usize) -> Result<Arc<AtomicBool>, String> {
+        self.effect_bypasses.lock().expect("control bypass list").get(index).cloned()
+            .ok_or_else(|| "VST3 slot is outside the active chain".into())
     }
 
     pub fn effect_bypassed(&self, index: usize) -> Result<bool, String> {
@@ -537,7 +546,7 @@ impl LiveControls {
         for parameter in self.vocal_parameters() {
             text.push_str(&format!(" vocal.{}={:.3}", parameter.name(), self.vocal_value(parameter)));
         }
-        for (index, flag) in self.effect_bypasses.iter().enumerate() {
+        for (index, flag) in self.effect_bypasses.lock().expect("control bypass list").iter().enumerate() {
             text.push_str(&format!(" vst3.{}.bypass={}", index + 1, flag.load(Ordering::Relaxed)));
         }
         let enabled = self.routes_enabled.load(Ordering::Relaxed);
@@ -706,7 +715,7 @@ mod tests {
         let mut controls = LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap();
         assert!(controls.apply("bypass 1 on".parse().unwrap()).is_err());
         controls.prepare_effects([false, true].into_iter());
-        let first = controls.effect_flag(0).unwrap().clone();
+        let first = controls.effect_flag(0).unwrap();
         assert!(!first.load(Ordering::Relaxed));
         assert!(controls.effect_bypassed(1).unwrap());
         controls.apply("bypass 1 on".parse().unwrap()).unwrap();
@@ -718,6 +727,14 @@ mod tests {
             assert!(invalid.parse::<LiveCommand>().is_err());
         }
         assert!(controls.describe().contains("vst3.1.bypass=true vst3.2.bypass=false"));
+        let second = controls.effect_flag(1).unwrap();
+        controls.replace_effects(vec![second.clone(), first.clone()]);
+        assert!(Arc::ptr_eq(&controls.effect_flag(0).unwrap(), &second));
+        controls.apply("bypass 2 off".parse().unwrap()).unwrap();
+        assert!(!first.load(Ordering::Relaxed));
+        controls.replace_effects(vec![]);
+        assert!(controls.effect_bypassed(0).is_err());
+        assert!(!controls.describe().contains("vst3."));
     }
 
     #[test]

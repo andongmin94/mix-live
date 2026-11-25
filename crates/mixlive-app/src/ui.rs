@@ -12,15 +12,15 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowOptions, div, px, relative, rgb, size,
 };
 use gpui_deck::{
-    Button, Root, ScrollArea, Slider, SliderEvent, SliderState, SliderThumb, StyledExt as _, Switch,
+    Button, Root, ScrollArea, SelectItem, SelectState, Slider, SliderEvent, SliderState, SliderThumb, StyledExt as _, Switch,
 };
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
-use mixlive_audio_windows::plugin::LiveParameter;
+use mixlive_audio_windows::plugin::{ChainEdit, EffectSpec, LiveParameter};
 use mixlive_audio_windows::windows::device_catalog;
 use mixlive_effects::VocalParameter;
 
 use crate::{
-    form::{FormEvent, SceneForm},
+    form::{FormEvent, SceneForm, select_control, selected},
     parameter_editor::{ParameterEditor, ParameterEvent},
     session::Session,
 };
@@ -86,6 +86,12 @@ struct Fader {
     state: Entity<SliderState>,
 }
 
+struct InstalledPlugins {
+    paths: Vec<PathBuf>,
+    picker: Entity<SelectState>,
+    _subscription: Subscription,
+}
+
 enum Operation {
     Devices,
     EditDevices,
@@ -95,6 +101,7 @@ enum Operation {
     Editor { index: usize, open: bool },
     Parameters { index: usize },
     SetParameter { index: usize, id: u32, normalized: f64 },
+    EditChain(ChainEdit),
     Close,
 }
 
@@ -110,6 +117,8 @@ pub struct MixLive {
     form_subscription: Option<Subscription>,
     parameter_editor: Option<Entity<ParameterEditor>>,
     parameter_subscription: Option<Subscription>,
+    installed_plugins: Option<InstalledPlugins>,
+    scanning_plugins: bool,
     workspace_scroll: ScrollHandle,
 }
 
@@ -193,6 +202,8 @@ impl MixLive {
             form_subscription: None,
             parameter_editor: None,
             parameter_subscription: None,
+            installed_plugins: None,
+            scanning_plugins: false,
             workspace_scroll: ScrollHandle::new(),
         }
     }
@@ -376,6 +387,87 @@ impl MixLive {
         .detach();
     }
 
+    fn choose_effect(&mut self, bundle: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.picking || self.scanning_plugins || !self.session.running() {
+            return;
+        }
+        self.picking = true;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: !bundle,
+            directories: bundle,
+            multiple: false,
+            prompt: Some(if bundle { "실행 중 VST3 폴더 추가" } else { "실행 중 VST3 파일 추가" }.into()),
+        });
+        cx.notify();
+        cx.spawn_in(window, async move |owner, cx| {
+            let result = paths.await;
+            let _ = cx.update(move |window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.picking = false;
+                    match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                this.add_effect(path, window, cx);
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        Ok(Err(error)) => this.session.error = Some(error.to_string()),
+                        Err(error) => this.session.error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                });
+            });
+        }).detach();
+    }
+
+    fn add_effect(&mut self, plugin: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        self.perform(Operation::EditChain(ChainEdit::Add(EffectSpec {
+            plugin, class_id: None, state: None, bypassed: false,
+        })), window, cx);
+    }
+
+    /// Reuse the CLI's filesystem-only candidate search. Native loading is an explicit add.
+    fn scan_plugins(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.picking || self.scanning_plugins || !self.session.running() {
+            return;
+        }
+        self.scanning_plugins = true;
+        self.installed_plugins = None;
+        self.session.error = None;
+        let scan = cx.background_executor().spawn(async {
+            mixlive_vst3::host::list(&[]).map_err(|error| error.to_string())
+        });
+        cx.notify();
+        cx.spawn_in(window, async move |owner, cx| {
+            let result = scan.await;
+            let _ = cx.update(move |_, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.scanning_plugins = false;
+                    match result {
+                        Ok(paths) => {
+                            let items = std::iter::once(SelectItem::new("", "추가할 VST3 선택"))
+                                .chain(paths.iter().enumerate().map(|(index, path)| {
+                                    SelectItem::new(index.to_string(), path.to_string_lossy().into_owned())
+                                })).collect::<Vec<_>>();
+                            let picker = cx.new(|cx| SelectState::new(items, cx).default_value(""));
+                            let subscription = cx.observe(&picker, |_, _, cx| cx.notify());
+                            this.installed_plugins = Some(InstalledPlugins { paths, picker, _subscription: subscription });
+                        }
+                        Err(error) => this.session.error = Some(error),
+                    }
+                    cx.notify();
+                });
+            });
+        }).detach();
+    }
+
+    fn add_installed_effect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(installed) = &self.installed_plugins else { return; };
+        let Some(index) = selected(&installed.picker, cx).and_then(|value| value.parse::<usize>().ok()) else { return; };
+        let Some(path) = installed.paths.get(index).cloned() else { return; };
+        self.add_effect(path, window, cx);
+    }
+
     fn install_parameters(&mut self, index: usize, parameters: Vec<LiveParameter>, window: &mut Window, cx: &mut Context<Self>) {
         let already_open = self.parameter_editor.as_ref().is_some_and(|editor| editor.read(cx).index == index);
         let selected = self.parameter_editor.as_ref().filter(|editor| editor.read(cx).index == index)
@@ -413,7 +505,7 @@ impl MixLive {
         {
             return;
         }
-        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. });
+        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_));
         if live_operation && (!self.session.running() || self.picking) {
             return;
         }
@@ -425,7 +517,13 @@ impl MixLive {
             Operation::Editor { .. } => "VST3 원본 창 변경 중",
             Operation::Parameters { .. } => "VST3 파라미터 조회 중",
             Operation::SetParameter { .. } => "VST3 파라미터 적용 중",
+            Operation::EditChain(_) => "VST3 체인 변경 중",
         });
+        if matches!(operation, Operation::EditChain(_)) {
+            // Parameter events capture a slot index. A topology change invalidates that selection.
+            self.parameter_editor = None;
+            self.parameter_subscription = None;
+        }
         if !live_operation {
             self.faders.clear();
             self.subscriptions.clear();
@@ -457,6 +555,10 @@ impl MixLive {
                 }
                 Operation::SetParameter { index, id, normalized } => {
                     parameters = Some((*index, session.set_effect_parameter(*index, *id, *normalized)));
+                    None
+                }
+                Operation::EditChain(edit) => {
+                    let _ = session.edit_chain(edit.clone());
                     None
                 }
                 Operation::StopAndSave(path) => {
@@ -770,7 +872,39 @@ impl MixLive {
             )
     }
 
-    fn scene_summary(&self, cx: &Context<Self>) -> gpui::AnyElement {
+    fn live_chain_picker(&self, window: &Window, cx: &Context<Self>) -> Div {
+        let disabled = self.busy.is_some() || self.picking || self.scanning_plugins;
+        let mut picker = div().flex().flex_col().gap_2()
+            .child(div().flex().flex_wrap().gap_2()
+                .child(button("live-vst3-scan", if self.installed_plugins.is_some() { "설치된 VST3 다시 검색" } else { "설치된 VST3 검색" }, false)
+                    .disabled(disabled)
+                    .on_click(cx.listener(|this, _, window, cx| this.scan_plugins(window, cx))))
+                .child(button("live-vst3-file", "VST3 파일 추가", false)
+                    .disabled(disabled)
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_effect(false, window, cx))))
+                .child(button("live-vst3-bundle", "VST3 폴더 추가", false)
+                    .disabled(disabled)
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_effect(true, window, cx)))))
+            .child(div().text_xs().text_color(rgb(MUTED))
+                .child("추가·삭제·순서 변경은 실행 중인 체인에 적용됩니다. 위에서 아래로 처리합니다."));
+        if self.scanning_plugins {
+            picker = picker.child(div().text_xs().text_color(rgb(ACCENT)).child("VST3 설치 경로 조회 중"));
+        }
+        if let Some(installed) = &self.installed_plugins {
+            let count = installed.paths.len();
+            picker = picker.child(div().text_xs().text_color(rgb(MUTED))
+                .child(format!("설치 경로 후보 {count}개 · 선택한 플러그인은 추가할 때 로딩합니다.")));
+            if count > 0 {
+                picker = picker.child(select_control("live-installed-vst3", "실행 중 추가할 VST3 선택", &installed.picker, None, window, cx))
+                    .child(button("live-add-installed-vst3", "선택한 VST3 추가", false)
+                        .disabled(disabled || selected(&installed.picker, cx).is_none())
+                        .on_click(cx.listener(|this, _, window, cx| this.add_installed_effect(window, cx))));
+            }
+        }
+        picker
+    }
+
+    fn scene_summary(&self, window: &Window, cx: &Context<Self>) -> gpui::AnyElement {
         let Some(scene) = self.session.scene() else {
             let (title, description) = if self.busy.is_some() {
                 (
@@ -848,7 +982,7 @@ impl MixLive {
                     .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
                         "보정 비율 {:.0}% · 이후 VST3 {}개",
                         vocal.strength * 100.0,
-                        scene.effects.len()
+                        self.session.effects().len()
                     )))
                     .children((vocal.preset != mixlive_effects::Preset::Off).then(|| div().text_xs().text_color(rgb(MUTED)).child(format!(
                         "HPF {:.0} Hz · EQ {:+.1}/{:+.1}/{:+.1} dB", vocal.eq.hpf_hz, vocal.eq.body_db, vocal.eq.presence_db, vocal.eq.air_db))))
@@ -864,7 +998,11 @@ impl MixLive {
                         format!("에코 {:.1}% · {:.1} ms · 피드백 {:.1}%", vocal.echo.mix * 100.0, vocal.echo.time_ms, vocal.echo.feedback * 100.0)
                     })),
             );
-        if scene.effects.is_empty() {
+        if self.session.running() {
+            sound = sound.child(self.live_chain_picker(window, cx));
+        }
+        let effects = self.session.effects();
+        if effects.is_empty() {
             sound = sound.child(
                 div()
                     .text_sm()
@@ -872,7 +1010,7 @@ impl MixLive {
                     .child("선택된 VST3 없음"),
             );
         }
-        for (index, effect) in scene.effects.iter().enumerate() {
+        for (index, effect) in effects.iter().enumerate() {
             let name = effect
                 .plugin
                 .file_name()
@@ -903,7 +1041,9 @@ impl MixLive {
                             .gap_1()
                             .child(div().truncate().text_sm().child(name))
                             .child(div().text_xs().text_color(rgb(MUTED)).child(
-                                if effect.state.is_some() {
+                                if self.session.running() {
+                                    "현재 실행 인스턴스"
+                                } else if effect.state.is_some() {
                                     "저장된 시작 상태"
                                 } else {
                                     "플러그인 기본 시작 상태"
@@ -939,6 +1079,28 @@ impl MixLive {
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.perform(Operation::Parameters { index }, window, cx);
                                     }))
+                            }))
+                            .children(self.session.running().then(|| {
+                                let disabled = self.busy.is_some() || self.picking;
+                                div().flex().flex_wrap().gap_2()
+                                    .child(button(("live-vst3-up", index), "위로", false)
+                                        .accessibility_label(format!("VST3 {} 위로", index + 1))
+                                        .disabled(disabled || index == 0)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.perform(Operation::EditChain(ChainEdit::Move { from: index, to: index.saturating_sub(1) }), window, cx);
+                                        })))
+                                    .child(button(("live-vst3-down", index), "아래로", false)
+                                        .accessibility_label(format!("VST3 {} 아래로", index + 1))
+                                        .disabled(disabled || index + 1 == effects.len())
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.perform(Operation::EditChain(ChainEdit::Move { from: index, to: index + 1 }), window, cx);
+                                        })))
+                                    .child(button(("live-vst3-remove", index), "삭제", false)
+                                        .accessibility_label(format!("VST3 {} 삭제", index + 1))
+                                        .disabled(disabled)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.perform(Operation::EditChain(ChainEdit::Remove { index }), window, cx);
+                                        })))
                             })),
                     ),
             );
@@ -1386,7 +1548,7 @@ impl MixLive {
 }
 
 impl Render for MixLive {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut body = ScrollArea::new("workspace", &self.workspace_scroll)
             .accessibility_label("Scene 작업 영역")
             .flex_1()
@@ -1417,7 +1579,7 @@ impl Render for MixLive {
             {
                 body = body.child(editor.clone());
             }
-            body = body.child(self.scene_summary(cx));
+            body = body.child(self.scene_summary(window, cx));
             if self.session.running() {
                 body = body.child(self.mixer(cx));
             }

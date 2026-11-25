@@ -1,9 +1,43 @@
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
-use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, Source};
+use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, SendDelays, Source};
 use mixlive_effects::{Meters, VocalChain};
 use crate::{bridge::{Fault, Health, OutputWriter}, config::{MAX_APPS, MAX_MIXES, PitchConfig}, pitch_correction::PitchCorrector, control::{GainRamp, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
 
 pub const CAPTURE_BLOCK: usize = 256;
+
+/// Immutable routing information copied before Capture moves to the worker.
+/// Preparing a replacement only allocates on the control thread.
+#[cfg(any(windows, test))]
+#[derive(Clone)]
+pub(crate) struct VoiceDelayLayout {
+    compensated: Vec<bool>,
+    pitch_latency: usize,
+}
+
+#[cfg(any(windows, test))]
+pub(crate) struct PreparedVoiceDelay {
+    delays: SendDelays,
+    latency: usize,
+    compensation: usize,
+}
+
+#[cfg(any(windows, test))]
+impl PreparedVoiceDelay {
+    pub(crate) fn latency(&self) -> usize { self.latency }
+    pub(crate) fn compensation(&self) -> usize { self.compensation }
+}
+
+#[cfg(any(windows, test))]
+impl VoiceDelayLayout {
+    pub(crate) fn prepare(&self, vst3_latency: u64, rate: u32) -> Result<PreparedVoiceDelay, String> {
+        let latency = vst3_latency.checked_add(self.pitch_latency as u64)
+            .filter(|&latency| latency <= u64::from(rate) * 2)
+            .ok_or("voice chain latency exceeds the supported 2-second outgoing compensation")? as usize;
+        let frames: Vec<_> = self.compensated.iter().map(|&enabled| if enabled { latency } else { 0 }).collect();
+        let compensation = if self.compensated.contains(&true) { latency } else { 0 };
+        Ok(PreparedVoiceDelay { delays: SendDelays::new(&frames), latency, compensation })
+    }
+}
 
 #[derive(Default)]
 pub struct VocalStats {
@@ -28,6 +62,8 @@ impl VocalStats {
 /// Process the voice once, then render independent destination mixes on the input timeline.
 pub struct Capture {
     engine: Engine,
+    voice_latency: usize,
+    compensation: usize,
     vocal: VocalChain,
     pitch: Option<PitchCorrector>,
     corrected_mic: [f32; CAPTURE_BLOCK],
@@ -95,7 +131,7 @@ impl Capture {
             if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
         let source_mutes = controls.source_targets().map(|gain| GainRamp::new(sample_rate, gain));
         let source_trims = controls.trim_targets().map(|gain| GainRamp::new(sample_rate, gain));
-        Ok(Self { engine, vocal, pitch: None, corrected_mic: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
+        Ok(Self { engine, voice_latency: 0, compensation: 0, vocal, pitch: None, corrected_mic: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
             aux_enabled: controls.has_aux(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
             app_count: controls.app_count(), app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
             controls, source_slots, mix_slots, source_mutes, source_trims, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
@@ -114,29 +150,36 @@ impl Capture {
         self.pitch.as_ref().map_or(0, PitchCorrector::latency)
     }
 
-    /// Add the built-in pitch delay to the final VST3 latency on the mic clock.
-    /// Only outgoing supplemental sources are delayed; never delay them twice.
     #[cfg(any(windows, test))]
-    pub(crate) fn prepare_voice_delay(&mut self, vst3_latency: u64, rate: u32) -> Result<usize, String> {
-        let latency = vst3_latency + self.pitch_latency() as u64;
-        // At the maximum rate and source count the two-second cap bounds storage
-        // for all compensated stereo sends to about 53 MiB.
-        if latency > u64::from(rate) * 2 {
-            return Err("voice chain latency exceeds the supported 2-second outgoing compensation; remove high-latency effects and start again".into());
-        }
-        if latency == 0 || self.source_slots.len() == 1 || self.mix_slots.len() == 1 { return Ok(0); }
-        let frames = latency as usize;
+    pub(crate) fn delay_layout(&self) -> VoiceDelayLayout {
         let mix_count = self.mix_slots.len();
-        let delays: Vec<_> = (0..self.route_count).map(|index| {
-            if self.source_slots[index / mix_count] != 0 && self.mix_slots[index % mix_count] != 0 {
-                frames
-            } else { 0 }
+        let compensated = (0..self.route_count).map(|index| {
+            self.source_slots[index / mix_count] != 0 && self.mix_slots[index % mix_count] != 0
         }).collect();
-        self.engine.prepare_send_delays(&delays).map_err(|error| error.to_string())?;
-        Ok(frames)
+        VoiceDelayLayout { compensated, pitch_latency: self.pitch_latency() }
     }
 
-    /// Built-in-only route. All supplemental sources are converted to the mic clock.
+    /// Swap together with the VST3 chain at a block boundary. The caller takes the
+    /// old allocation back to the control thread. Equal latency retains its history.
+    #[cfg(any(windows, test))]
+    pub(crate) fn swap_voice_delay(&mut self, prepared: &mut PreparedVoiceDelay) {
+        if self.voice_latency == prepared.latency { return; }
+        self.engine.swap_send_delays(&mut prepared.delays).expect("prepared capture routing layout");
+        std::mem::swap(&mut self.voice_latency, &mut prepared.latency);
+        std::mem::swap(&mut self.compensation, &mut prepared.compensation);
+    }
+
+    /// Test setup uses the same control preparation and worker swap as a live edit.
+    #[cfg(test)]
+    pub(crate) fn prepare_voice_delay(&mut self, vst3_latency: u64, rate: u32) -> Result<usize, String> {
+        let mut prepared = self.delay_layout().prepare(vst3_latency, rate)?;
+        let compensation = prepared.compensation();
+        self.swap_voice_delay(&mut prepared);
+        Ok(compensation)
+    }
+
+    /// Device-free fixture input. Production uses the single worker's effect seam.
+    #[cfg(test)]
     pub fn push(&mut self, samples: &[f32], aux: Option<&[[f32; 2]]>, apps: &[&[[f32; 2]]]) {
         self.push_with_effect(samples, aux, apps, &mut |_, _| true);
     }
