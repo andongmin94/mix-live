@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use mixlive_audio_windows::{
-    config::{PitchScale, RouteOptions},
+    config::{PitchConfig, PitchScale, RouteOptions},
     plugin::{EffectSpec, PluginArgs},
     scene::AudioScene,
 };
@@ -14,6 +14,8 @@ pub struct SoundDraft {
     pub preset: String,
     pub pitch_key: String,
     pub pitch_scale: String,
+    pub pitch_correction: String,
+    pub pitch_retune_ms: String,
     pub input_gain_db: String,
     pub strength: String,
     pub compressor_threshold_db: String,
@@ -46,6 +48,8 @@ impl SoundDraft {
         let mut draft = Self::from_config(scene.route.vocal_config(), scene.effects.clone());
         draft.pitch_key = scene.route.pitch_key.to_string();
         draft.pitch_scale = scene.route.pitch_scale.name().into();
+        draft.pitch_correction = scene.route.pitch_correction.to_string();
+        draft.pitch_retune_ms = scene.route.pitch_retune_ms.to_string();
         draft
     }
 
@@ -54,6 +58,8 @@ impl SoundDraft {
             preset: config.preset.to_string(),
             pitch_key: "0".into(),
             pitch_scale: "chromatic".into(),
+            pitch_correction: "0".into(),
+            pitch_retune_ms: "20".into(),
             input_gain_db: config.input_gain_db.to_string(),
             strength: config.strength.to_string(),
             compressor_threshold_db: config.compressor_threshold_db.to_string(),
@@ -76,10 +82,13 @@ impl SoundDraft {
         }
     }
 
-    pub fn pitch_reference(&self) -> Result<(u8, PitchScale), String> {
+    pub fn pitch_config(&self) -> Result<PitchConfig, String> {
         let key = self.pitch_key.parse::<u8>().ok().filter(|key| *key < 12).ok_or("음정 기준 조성을 선택하세요.")?;
         let scale = <PitchScale as clap::ValueEnum>::from_str(&self.pitch_scale, false).map_err(|_| "음정 기준 스케일을 선택하세요.")?;
-        Ok((key, scale))
+        let config = PitchConfig { key, scale, strength: number(&self.pitch_correction, "음정 보정 강도")?,
+            retune_ms: number(&self.pitch_retune_ms, "음정 보정 속도")? };
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn vocal_config(&self) -> Result<VocalConfig, String> {
@@ -126,7 +135,7 @@ impl SoundDraft {
         let config = self.vocal_config()?;
         let mut route = route.clone();
         route.set_vocal_config(config);
-        (route.pitch_key, route.pitch_scale) = self.pitch_reference()?;
+        route.set_pitch_config(self.pitch_config()?);
         AudioScene::new(route, self.effects.clone()).map_err(|error| error.to_string())
     }
 
@@ -217,7 +226,7 @@ mod tests {
             "-25.25",
             "--vocal",
             "warm",
-            "--pitch-key", "9", "--pitch-scale", "minor",
+            "--pitch-key", "9", "--pitch-scale", "minor", "--pitch-correction", "0.25", "--pitch-retune-ms", "45",
             "--vocal-strength",
             "0.625",
             "--vocal-threshold-db",
@@ -265,6 +274,8 @@ mod tests {
         draft.preset = "bright".into();
         draft.pitch_key = "2".into();
         draft.pitch_scale = "major".into();
+        draft.pitch_correction = "0.75".into();
+        draft.pitch_retune_ms = "30".into();
         draft.input_gain_db = " -3.25 ".into();
         draft.strength = "0.375".into();
         draft.compressor_threshold_db = "-18.5".into();
@@ -288,6 +299,8 @@ mod tests {
         expected.vocal = Preset::Bright;
         expected.pitch_key = 2;
         expected.pitch_scale = PitchScale::Major;
+        expected.pitch_correction = 0.75;
+        expected.pitch_retune_ms = 30.0;
         expected.input_gain_db = -3.25;
         expected.vocal_strength = 0.375;
         expected.vocal_threshold_db = -18.5;
@@ -404,6 +417,14 @@ mod tests {
         draft.pitch_scale = "invalid".into();
         assert!(draft.apply_to(&original.route).is_err());
         draft.pitch_scale = "chromatic".into();
+        for value in ["NaN", "1.1", "-0.1"] {
+            draft.pitch_correction = value.into();
+            assert!(draft.apply_to(&original.route).is_err());
+        }
+        draft.pitch_correction = "0.5".into();
+        draft.pitch_retune_ms = "4".into();
+        assert!(draft.apply_to(&original.route).is_err());
+        draft.pitch_retune_ms = "20".into();
         draft.preset = "unknown".into();
         assert!(draft.vocal_config().is_err());
         draft.preset = "off".into();

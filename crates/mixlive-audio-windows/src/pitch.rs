@@ -1,9 +1,11 @@
 //! Non-intrusive microphone pitch observation. The audio callback publishes complete
-//! contiguous windows into a bounded SPSC queue; estimation stays on the control thread.
+//! contiguous windows into a bounded SPSC queue for the display estimator.
+//! The optional correction processor also reuses the preallocated Estimator on its audio path.
 //! No voice modification, note correction, file output or additional audio-path latency.
 //! Normalized square difference: McLeod & Wyvill, "A Smarter Way to Find Pitch" (2005).
 //! Use FFT autocorrelation and exact overlapping energies, not an FFT-scaled denominator.
 use crate::config::PitchScale;
+#[cfg(any(windows, test))]
 use rtrb::{Consumer, Producer, RingBuffer};
 use rustfft::{Fft, FftPlanner, num_complex::Complex64};
 use std::sync::Arc;
@@ -34,7 +36,7 @@ fn note_name(note: u8) -> String {
 
 /// All FFT plans and buffers are prepared once; never select a pitch beyond the
 /// supported lag window or compare FFT-scaled correlation with unscaled energy.
-struct Estimator {
+pub(crate) struct Estimator {
     rate: usize,
     fft: Arc<dyn Fft<f64>>,
     inverse: Arc<dyn Fft<f64>>,
@@ -44,7 +46,7 @@ struct Estimator {
     nsdf: Vec<f64>,
 }
 impl Estimator {
-    fn new(rate: usize, size: usize) -> Self {
+    pub(crate) fn new(rate: usize, size: usize) -> Self {
         let fft_len = size * 2;
         let mut planner = FftPlanner::<f64>::new();
         let fft = planner.plan_fft_forward(fft_len);
@@ -56,7 +58,7 @@ impl Estimator {
             nsdf: vec![0.0; (rate as f64 / MIN_HZ).ceil() as usize + 2] }
     }
 
-    fn estimate(&mut self, signal: &[f64]) -> Option<(f64, f64)> {
+    pub(crate) fn estimate(&mut self, signal: &[f64]) -> Option<(f64, f64)> {
         if signal.iter().any(|sample| !sample.is_finite()) { return None; }
         let n = signal.len();
         let mean = signal.iter().sum::<f64>() / n as f64;
@@ -98,11 +100,15 @@ impl Estimator {
     }
 }
 
+pub(crate) fn analysis_size(rate: usize) -> usize { (rate / 25).next_power_of_two() }
+
+#[cfg(any(windows, test))]
 pub(crate) struct PitchTap {
     writer: Producer<f32>,
     window: Vec<f32>,
     filled: usize,
 }
+#[cfg(any(windows, test))]
 pub(crate) struct PitchMonitor {
     reader: Consumer<f32>,
     signal: Vec<f64>,
@@ -111,18 +117,20 @@ pub(crate) struct PitchMonitor {
     scale: PitchScale,
 }
 
+#[cfg(any(windows, test))]
 pub(crate) fn channel(rate: u32, key: u8, scale: PitchScale) -> Result<(PitchTap, PitchMonitor), String> {
     if !(8000..=192_000).contains(&rate) { return Err("unsupported pitch monitor sample rate".into()); }
     if key > 11 { return Err("invalid pitch reference key".into()); }
     let rate = rate as usize;
     // 40–80 ms, at the actual microphone sample rate; not an audio delay.
-    let size = (rate / 25).next_power_of_two();
+    let size = analysis_size(rate);
     let capacity = size * (rate * 2 / size);
     let (writer, reader) = RingBuffer::new(capacity);
     Ok((PitchTap { writer, window: vec![0.0; size], filled: 0 },
         PitchMonitor { reader, signal: vec![0.0; size], detector: Estimator::new(rate, size), key, scale }))
 }
 
+#[cfg(any(windows, test))]
 impl PitchTap {
     pub(crate) fn push(&mut self, mut samples: &[f32]) {
         while !samples.is_empty() {
@@ -144,6 +152,7 @@ impl PitchTap {
     }
 }
 
+#[cfg(any(windows, test))]
 impl PitchMonitor {
     /// Consume only complete windows; analyze the newest available one, not every queued frame.
     /// No new observation or no sufficiently clear pitch means None, never a held old note.

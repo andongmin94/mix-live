@@ -179,7 +179,10 @@ WASAPI endpoint가 저절로 결합된다고 가정하지 않는다. DAW 반환/
 
 `Input trim → HPF/EQ → gentle dynamics → de-esser → reverb/delay → output protection`
 
-음정 보정은 사용자 VST3로 먼저 제공하고, 자체 알고리즘은 독립 품질 검증 뒤 추가한다.
+음정 보정은 사용자 VST3와 독립된 선택적 내장 실험 경로로 제공한다. 마이크 원신호의
+단일 음높이를 검출해 scale 목표를 선택하고, RustFFT 기반 고정 지연 resynthesis를 사용한다.
+강도 0은 추가 지연 없이 끄며 활성 경로의 지연은 통화·방송 PDC에 포함한다.
+내장 알고리즘은 독립 음질·CPU·실장비 지연 검증 전에는 제품 품질 수용을 주장하지 않는다.
 Gate는 배경잡음 제거와 다르다. 노래에 speech-only noise suppression을 자동 적용하지 않는다.
 사운드가 끊기거나 원음이 파괴되는 강한 설정을 쉬운 UI 뒤에 숨기지 않는다.
 

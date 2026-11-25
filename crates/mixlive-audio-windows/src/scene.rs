@@ -23,7 +23,7 @@ impl AudioScene {
         // CLI paths refer to the current working directory, not a future scene directory.
         // absolute() does not require the plugin to be present or execute its native code.
         for effect in &mut effects { effect.plugin = std::path::absolute(&effect.plugin)?; }
-        Ok(Self { schema: 12, route, effects })
+        Ok(Self { schema: 13, route, effects })
     }
 
     /// Relative paths in a hand-authored scene are anchored to that scene, never the caller's cwd.
@@ -39,7 +39,7 @@ impl AudioScene {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != 12 { return Err("unsupported MixLive scene schema; create a schema 12 scene".into()); }
+        if self.schema != 13 { return Err("unsupported MixLive scene schema; create a schema 13 scene".into()); }
         self.route.validate()?;
         validate_effects(&self.effects)?;
         Ok(())
@@ -73,7 +73,7 @@ mod tests {
             "--output", "test-phones", "--output-channels", "3,4",
             "--send", "test-cable", "--send-channels", "1", "--send-gain-db", "-6",
             "--input-gain-db", "3", "--output-gain-db", "-12", "--vocal", "warm",
-            "--vocal-strength", "0.75", "--vocal-threshold-db", "-20", "--pitch-key", "9", "--pitch-scale", "minor",
+            "--vocal-strength", "0.75", "--vocal-threshold-db", "-20", "--pitch-key", "9", "--pitch-scale", "minor", "--pitch-correction", "0.65", "--pitch-retune-ms", "35",
             "--deess-threshold-db", "-28",
             "--eq-hpf-hz", "95", "--eq-body-db", "1.5", "--eq-presence-db", "-2", "--eq-air-db", "2.5", "--compressor-ratio", "3.5", "--compressor-attack-ms", "5", "--compressor-release-ms", "220", "--deess-max-db", "7",
             "--reverb-mix", "0.18", "--reverb-decay-secs", "1.75",
@@ -205,7 +205,7 @@ mod tests {
         let path = directory.path().join("invalid.mixlive-scene.json");
         let original = serde_json::to_value(AudioScene::new(route(), vec![]).unwrap()).unwrap();
         let mut cases = Vec::new();
-        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("schema", json!(7)), ("schema", json!(8)), ("schema", json!(9)), ("schema", json!(10)), ("schema", json!(11)), ("unknown", json!(true))] {
+        for (key, value) in [("schema", json!(2)), ("schema", json!(3)), ("schema", json!(4)), ("schema", json!(5)), ("schema", json!(6)), ("schema", json!(7)), ("schema", json!(8)), ("schema", json!(9)), ("schema", json!(10)), ("schema", json!(11)), ("schema", json!(12)), ("unknown", json!(true))] {
             let mut document = original.clone();
             document[key] = value;
             cases.push(document);
@@ -216,7 +216,7 @@ mod tests {
             ("output_channels", json!([])), ("output_channels", json!([1, 1])),
             ("send_channels", json!([0])), ("broadcast_channels", json!([0])), ("queue_ms", json!(0)),
             ("input_gain_db", json!(100)), ("output_gain_db", json!(1)),
-            ("vocal_strength", json!(2)), ("vocal", json!("magic")), ("pitch_key", json!(12)), ("pitch_scale", json!("dorian")),
+            ("vocal_strength", json!(2)), ("vocal", json!("magic")), ("pitch_key", json!(12)), ("pitch_scale", json!("dorian")), ("pitch_correction", json!(1.1)), ("pitch_retune_ms", json!(4)),
             ("vocal_threshold_db", json!(-100)), ("deess_threshold_db", json!(1)),
             ("eq_hpf_hz", json!(201)), ("eq_body_db", json!(6.1)), ("eq_presence_db", json!(-6.1)), ("eq_air_db", json!(6.1)), ("compressor_ratio", json!(0.9)), ("compressor_attack_ms", json!(0)), ("compressor_release_ms", json!(501)), ("deess_max_db", json!(12.1)),
             ("reverb_mix", json!(1.1)), ("reverb_decay_secs", json!(0.1)), ("reverb_predelay_ms", json!(81)),
@@ -239,7 +239,7 @@ mod tests {
         let mut missing_reverb = original.clone();
         missing_reverb["route"].as_object_mut().unwrap().remove("reverb_mix");
         cases.push(missing_reverb);
-        for key in ["pitch_key", "pitch_scale", "echo_mix", "echo_time_ms", "echo_feedback", "eq_hpf_hz", "eq_body_db", "eq_presence_db", "eq_air_db", "compressor_ratio", "compressor_attack_ms", "compressor_release_ms", "deess_max_db"] {
+        for key in ["pitch_key", "pitch_scale", "pitch_correction", "pitch_retune_ms", "echo_mix", "echo_time_ms", "echo_feedback", "eq_hpf_hz", "eq_body_db", "eq_presence_db", "eq_air_db", "compressor_ratio", "compressor_attack_ms", "compressor_release_ms", "deess_max_db"] {
             let mut missing = original.clone();
             missing["route"].as_object_mut().unwrap().remove(key);
             cases.push(missing);

@@ -33,6 +33,8 @@ pub struct SoundEditor {
     preset: Entity<SelectState>,
     pitch_key: Entity<SelectState>,
     pitch_scale: Entity<SelectState>,
+    pitch_correction: Entity<InputState>,
+    pitch_retune: Entity<InputState>,
     input_gain: Entity<InputState>,
     strength: Entity<InputState>,
     compressor: Entity<InputState>,
@@ -81,6 +83,8 @@ impl SoundEditor {
             SelectState::new([SelectItem::new("chromatic", "Chromatic · 반음계"), SelectItem::new("major", "Major · 장조"), SelectItem::new("minor", "Minor · 자연단음계")], cx)
                 .default_value(&draft.pitch_scale)
         });
+        let pitch_correction = text_input("음정 보정 강도", &draft.pitch_correction, window, cx);
+        let pitch_retune = text_input("음정 보정 속도", &draft.pitch_retune_ms, window, cx);
         let input_gain = text_input("마이크 입력 trim", &draft.input_gain_db, window, cx);
         let strength = text_input("보컬 보정 비율", &draft.strength, window, cx);
         let compressor = text_input(
@@ -106,7 +110,7 @@ impl SoundEditor {
         let echo_feedback = text_input("에코 피드백", &draft.echo_feedback, window, cx);
         let mut subscriptions = vec![cx.observe(&preset, |_, _, cx| cx.notify()),
             cx.observe(&pitch_key, |_, _, cx| cx.notify()), cx.observe(&pitch_scale, |_, _, cx| cx.notify())];
-        for input in [&input_gain, &strength, &compressor, &deesser, &eq_hpf_hz, &eq_body_db, &eq_presence_db, &eq_air_db, &compressor_ratio, &compressor_attack_ms, &compressor_release_ms, &deess_max_db, &reverb_mix, &reverb_decay, &reverb_predelay, &echo_mix, &echo_time, &echo_feedback] {
+        for input in [&pitch_correction, &pitch_retune, &input_gain, &strength, &compressor, &deesser, &eq_hpf_hz, &eq_body_db, &eq_presence_db, &eq_air_db, &compressor_ratio, &compressor_attack_ms, &compressor_release_ms, &deess_max_db, &reverb_mix, &reverb_decay, &reverb_predelay, &echo_mix, &echo_time, &echo_feedback] {
             subscriptions.push(cx.observe(input, |_, _, cx| cx.notify()));
         }
         Self {
@@ -114,6 +118,8 @@ impl SoundEditor {
             preset,
             pitch_key,
             pitch_scale,
+            pitch_correction,
+            pitch_retune,
             input_gain,
             strength,
             compressor,
@@ -146,6 +152,8 @@ impl SoundEditor {
             preset: selected(&self.preset, cx).unwrap_or_default(),
             pitch_key: selected(&self.pitch_key, cx).unwrap_or_default(),
             pitch_scale: selected(&self.pitch_scale, cx).unwrap_or_default(),
+            pitch_correction: self.pitch_correction.read(cx).value().to_string(),
+            pitch_retune_ms: self.pitch_retune.read(cx).value().to_string(),
             input_gain_db: self.input_gain.read(cx).value().to_string(),
             strength: self.strength.read(cx).value().to_string(),
             compressor_threshold_db: self.compressor.read(cx).value().to_string(),
@@ -188,6 +196,8 @@ impl SoundEditor {
             installed.picker.update(cx, |state, cx| state.set_disabled(disabled, window, cx));
         }
         for input in [
+            &self.pitch_correction,
+            &self.pitch_retune,
             &self.input_gain,
             &self.strength,
             &self.compressor,
@@ -483,7 +493,7 @@ impl Render for SoundEditor {
                 .child(div().text_xs().text_color(rgb(MUTED))
                     .child("저장한 값은 다음 오디오 시작부터 적용됩니다. 보정 비율은 음량 일치 기능이 아니며, 자동 makeup gain은 없습니다.")))
             .child(panel().gap_4()
-                .child(section_title("PITCH", "음정 기준"))
+                .child(section_title("PITCH", "음정 기준 · 실험적 자동 보정"))
                 .child(div().flex().flex_wrap().gap_5()
                     .child(div().flex_1().min_w(px(180.)).flex().flex_col().gap_2()
                         .child(div().text_sm().font_semibold().child("조성"))
@@ -491,8 +501,11 @@ impl Render for SoundEditor {
                     .child(div().flex_1().min_w(px(220.)).flex().flex_col().gap_2()
                         .child(div().text_sm().font_semibold().child("스케일"))
                         .child(select_control("pitch-scale", "음정 기준 스케일", &self.pitch_scale, None, window, cx))))
+                .child(div().flex().flex_wrap().gap_5()
+                    .child(field("pitch-correction", "음정 보정 강도", "0~1 · 0은 지연 없는 끄기", &self.pitch_correction, window, cx))
+                    .child(field("pitch-retune-ms", "음정 보정 속도", "5~200 ms · 목표값 smoothing", &self.pitch_retune, window, cx)))
                 .child(div().text_xs().text_color(rgb(MUTED))
-                    .child("A4=440 Hz. 반음계 또는 선택한 장조·자연단음계의 가장 가까운 목표 음을 표시합니다. 반음계에서는 조성에 영향을 받지 않으며 음성을 자동 보정하지 않습니다.")))
+                    .child("A4=440 Hz. 선택한 스케일의 가장 가까운 음으로 보정합니다. 0에서는 원본 경로 유지, 0보다 크면 약 40~80 ms 알고리즘 지연이 추가됩니다. 음질·formant·실제 장비 CPU는 미검증이며 모든 설정은 정지 상태에서 변경합니다.")))
             .child(panel().gap_4()
                 .child(section_title("EQ", "보컬 EQ 세부 설정"))
                 .child(div().flex().flex_wrap().gap_5()

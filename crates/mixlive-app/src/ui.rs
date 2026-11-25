@@ -1067,7 +1067,7 @@ impl MixLive {
                 .child(div().font_semibold().child("소스별 보내기"))
                 .child(source_mutes)
                 .child(peak_meter("마이크 입력 · trim 전", levels.map(|l| l.mic_input)))
-                .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child(format!("마이크 음정 · A4 = 440 Hz · {} {} · 검출 전용", mixlive_audio_windows::config::PitchScale::NAMES[usize::from(scene.route.pitch_key)], scene.route.pitch_scale.name())))
+                .child(div().flex().flex_col().gap_1().child(div().text_xs().text_color(rgb(MUTED)).child(format!("마이크 원신호 음정 · A4 = 440 Hz · {} {} · {}", mixlive_audio_windows::config::PitchScale::NAMES[usize::from(scene.route.pitch_key)], scene.route.pitch_scale.name(), if scene.route.pitch_correction > 0.0 { "보정 사용" } else { "검출 전용" })))
                     .child(match levels.and_then(|l| l.pitch) {
                         Some(pitch) => div().flex().items_center().gap_3()
                             .child(div().font_semibold().text_color(rgb(ACCENT)).child(pitch.note_name()))
@@ -1075,7 +1075,8 @@ impl MixLive {
                             .child(div().text_xs().text_color(rgb(MUTED)).child(format!("명료도 {:.0}%", pitch.clarity * 100.0))),
                         None => div().text_sm().text_color(rgb(MUTED)).child("명확한 음정 없음"),
                     })
-                    .children(levels.and_then(|l| l.pitch).map(|pitch| div().text_sm().child(format!("스케일 목표 {} · 편차 {:+.1} cent", pitch.target_note_name(), pitch.target_cents)))))
+                    .children(levels.and_then(|l| l.pitch).map(|pitch| div().text_sm().child(format!("스케일 목표 {} · 편차 {:+.1} cent", pitch.target_note_name(), pitch.target_cents))))
+                    .children((scene.route.pitch_correction > 0.0).then(|| div().text_xs().text_color(rgb(MUTED)).child(format!("보정 설정 {:.0}% · retune {:.1} ms · 원신호 기준 계측, 보정 후 주파수 측정 아님", scene.route.pitch_correction * 100.0, scene.route.pitch_retune_ms)))))
                 .child(peak_meter("내장 보정 후 · VST3 전", levels.map(|l| l.vocal.output_peak)))
                 .child(peak_meter("보컬 체인 후 · mute 전", levels.map(|l| l.voice)))
                 .children(controls.has_aux().then(|| {

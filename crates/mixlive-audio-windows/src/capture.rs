@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, Source};
 use mixlive_effects::{Meters, VocalChain};
-use crate::{bridge::{Fault, Health, OutputWriter}, config::{MAX_APPS, MAX_MIXES}, control::{GainRamp, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
+use crate::{bridge::{Fault, Health, OutputWriter}, config::{MAX_APPS, MAX_MIXES, PitchConfig}, pitch_correction::PitchCorrector, control::{GainRamp, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
 
 pub const CAPTURE_BLOCK: usize = 256;
 
@@ -29,6 +29,8 @@ impl VocalStats {
 pub struct Capture {
     engine: Engine,
     vocal: VocalChain,
+    pitch: Option<PitchCorrector>,
+    corrected_mic: [f32; CAPTURE_BLOCK],
     voice_left: [f32; CAPTURE_BLOCK],
     voice_right: [f32; CAPTURE_BLOCK],
     aux_enabled: bool,
@@ -93,7 +95,7 @@ impl Capture {
             if index < route_count { targets[source_slots[index / mix_count] * MAX_MIXES + mix_slots[index % mix_count]] } else { 0.0 }));
         let source_mutes = controls.source_targets().map(|gain| GainRamp::new(sample_rate, gain));
         let source_trims = controls.trim_targets().map(|gain| GainRamp::new(sample_rate, gain));
-        Ok(Self { engine, vocal, voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
+        Ok(Self { engine, vocal, pitch: None, corrected_mic: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
             aux_enabled: controls.has_aux(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
             app_count: controls.app_count(), app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
             controls, source_slots, mix_slots, source_mutes, source_trims, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
@@ -102,20 +104,27 @@ impl Capture {
     #[cfg(windows)]
     pub(crate) fn app_count(&self) -> usize { self.app_count }
 
-    /// VST3 reports latency on the mic clock after the final chain is initialized.
-    /// Align supplemental sources in the outgoing mixes only; preserve the short
-    /// monitor path. Keep delay constant throughout a run, even for disabled sends.
+    /// Prepare the opt-in pitch stage before opening the microphone stream.
+    pub fn prepare_pitch(&mut self, rate: u32, config: PitchConfig) -> Result<usize, String> {
+        self.pitch = PitchCorrector::new(rate, config)?;
+        Ok(self.pitch_latency())
+    }
+
+    pub fn pitch_latency(&self) -> usize {
+        self.pitch.as_ref().map_or(0, PitchCorrector::latency)
+    }
+
+    /// Add the built-in pitch delay to the final VST3 latency on the mic clock.
+    /// Only outgoing supplemental sources are delayed; never delay them twice.
     #[cfg(any(windows, test))]
-    pub(crate) fn prepare_vst3_delay(&mut self, latency: u64, rate: u32) -> Result<usize, String> {
-        if latency == 0 || self.source_slots.len() == 1 || self.mix_slots.len() == 1 {
-            return Ok(0);
-        }
-        // This is a live product, not an unbounded plugin/host delay buffer.
+    pub(crate) fn prepare_voice_delay(&mut self, vst3_latency: u64, rate: u32) -> Result<usize, String> {
+        let latency = vst3_latency + self.pitch_latency() as u64;
         // At the maximum rate and source count the two-second cap bounds storage
         // for all compensated stereo sends to about 53 MiB.
         if latency > u64::from(rate) * 2 {
-            return Err("VST3 chain latency exceeds the supported 2-second outgoing compensation; remove high-latency effects and start again".into());
+            return Err("voice chain latency exceeds the supported 2-second outgoing compensation; remove high-latency effects and start again".into());
         }
+        if latency == 0 || self.source_slots.len() == 1 || self.mix_slots.len() == 1 { return Ok(0); }
         let frames = latency as usize;
         let mix_count = self.mix_slots.len();
         let delays: Vec<_> = (0..self.route_count).map(|index| {
@@ -170,11 +179,16 @@ impl Capture {
             let envelopes = &envelopes[..self.route_count];
             let left = &mut self.voice_left[..block.len()];
             let right = &mut self.voice_right[..block.len()];
-            let Ok(meters) = self.vocal.process(block, left, right) else { self.health.fail(Fault::Input); return; };
+            let mic = if let Some(pitch) = &mut self.pitch {
+                let corrected = &mut self.corrected_mic[..block.len()];
+                if !pitch.process(block, corrected) { self.health.fail(Fault::Input); return; }
+                &*corrected
+            } else { block };
+            let Ok(meters) = self.vocal.process(mic, left, right) else { self.health.fail(Fault::Input); return; };
             if !effect(left, right) || left.iter().chain(right.iter()).any(|s| !s.is_finite()) {
                 self.health.fail(Fault::Routing); return;
             }
-            // Keep both DSP stages running while source-muted, including their tail/history.
+            // Keep pitch and both DSP stages running while source-muted, including tail/history.
             let voice_peak = left.iter().chain(right.iter()).fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
             self.health.voice_peak.fetch_max(voice_peak.to_bits(), Ordering::Relaxed);
             let mut inputs = [Input::Mono(&[]); MAX_SOURCES];

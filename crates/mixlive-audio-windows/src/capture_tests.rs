@@ -358,8 +358,8 @@ fn reported_vst3_delay_aligns_stereo_sends_across_blocks_without_delaying_monito
         }
         let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
             vec![(writer, bindings.clone())], health.clone(), controls).unwrap();
-        assert!(capture.prepare_vst3_delay(96_001, 48000).is_err());
-        assert_eq!(capture.prepare_vst3_delay(LATENCY as u64, 48000).unwrap(), LATENCY);
+        assert!(capture.prepare_voice_delay(96_001, 48000).is_err());
+        assert_eq!(capture.prepare_voice_delay(LATENCY as u64, 48000).unwrap(), LATENCY);
 
         let mut mic = [0.0; 640];
         let mut aux = [[0.0; 2]; 640];
@@ -417,7 +417,7 @@ fn source_mute_applies_after_compensation_and_route_reenable_keeps_current_histo
     controls.apply("route aux broadcast on".parse().unwrap()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
         vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
-    assert_eq!(capture.prepare_vst3_delay(512, 48000).unwrap(), 512);
+    assert_eq!(capture.prepare_voice_delay(512, 48000).unwrap(), 512);
     let silence = [0.0; 256];
     let aux = [[0.125, -0.25]; 256];
     let first_app = [[0.5, 0.25]; 256];
@@ -521,7 +521,7 @@ fn supplemental_trim_ramps_once_before_send_delay_and_keeps_input_meters_raw() {
     let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
         vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
-    assert_eq!(capture.prepare_vst3_delay(256, 48000).unwrap(), 256);
+    assert_eq!(capture.prepare_voice_delay(256, 48000).unwrap(), 256);
     let mic = [0.0; 256];
     let aux = [[0.25, -0.125]; 256];
     let app1 = [[0.125, 0.25]; 256];
@@ -591,4 +591,62 @@ fn live_echo_reaches_voice_chain_only_and_mute_covers_its_tail() {
     let broadcast = capture.engine.output(1).unwrap();
     assert_eq!([broadcast.left[239], broadcast.right[239]], [0.0625, -0.125]);
     assert!(!health.failed());
+}
+
+#[test]
+fn pitch_delay_and_reported_vst3_delay_align_outgoing_aux_and_apps_once() {
+    const PLUGIN_DELAY: usize = 71;
+    for plugin_delay in [0, PLUGIN_DELAY] {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, VocalConfig::default()).unwrap());
+        for command in ["route aux output on", "route aux broadcast on", "route app1 output on", "route app1 broadcast on"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        let (writer, _reader) = channel(48000, 48000, 100, 2, health.clone()).unwrap();
+        let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+            vec![(writer, vec![0, 2])], health.clone(), controls).unwrap();
+        let pitch = capture.prepare_pitch(48000, PitchConfig { strength: 1.0, ..PitchConfig::default() }).unwrap();
+        assert_eq!(pitch, 2048);
+        let total = pitch + plugin_delay;
+        assert!(capture.prepare_voice_delay(96000, 48000).is_err());
+        assert_eq!(capture.prepare_voice_delay(plugin_delay as u64, 48000).unwrap(), total);
+        let mut history = [0.0; PLUGIN_DELAY];
+        let mut cursor = 0;
+        let count = total + 384;
+        let mut mic = vec![0.0; count];
+        let mut aux = vec![[0.0; 2]; count];
+        let mut app = aux.clone();
+        mic[17] = 0.5;
+        aux[17] = [0.125, -0.25];
+        app[17] = [-0.0625, 0.125];
+        let mut start = 0;
+        for block in mic.chunks(137) {
+            let end = start + block.len();
+            capture.push_with_effect(block, Some(&aux[start..end]), &[&app[start..end]], &mut |left, right| {
+                if plugin_delay != 0 {
+                    for (l, r) in left.iter_mut().zip(right) {
+                        let delayed = std::mem::replace(&mut history[cursor], *l);
+                        cursor = (cursor + 1) % PLUGIN_DELAY;
+                        *l = delayed; *r = delayed;
+                    }
+                }
+                true
+            });
+            for mix in [0, 1] {
+                let output = capture.engine.output(mix).unwrap();
+                for (i, (&l, &r)) in output.left.iter().zip(output.right).enumerate() {
+                    let expected = match (mix, start + i) {
+                        (0, 17) => [0.0625, -0.125],
+                        (0, frame) if frame == 17 + total => [0.5, 0.5],
+                        (1, frame) if frame == 17 + total => [0.5625, 0.375],
+                        _ => [0.0; 2],
+                    };
+                    assert_eq!([l, r], expected, "mix {mix}, frame {}", start + i);
+                }
+            }
+            start = end;
+        }
+        assert_eq!(f32::from_bits(health.input_peak.load(Ordering::Relaxed)), 0.5);
+        assert!(!health.failed());
+    }
 }

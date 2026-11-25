@@ -66,7 +66,7 @@ pub enum SceneCommand {
     },
 }
 
-/// Reference scale for the microphone tuner; does not alter audio.
+/// Reference scale shared by the microphone tuner and optional pitch correction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum PitchScale {
@@ -93,6 +93,27 @@ impl PitchScale {
         (0..=127_u8).filter(|note| allowed.contains(&((note % 12 + 12 - root) % 12)))
             .min_by(|a, b| (f64::from(*a) - midi).abs().total_cmp(&(f64::from(*b) - midi).abs()))
             .expect("every valid scale contains MIDI notes")
+    }
+}
+
+/// Fixed per-session pitch settings. Zero strength leaves the original audio path
+/// unchanged, including its algorithmic latency.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PitchConfig {
+    pub key: u8,
+    pub scale: PitchScale,
+    pub strength: f32,
+    pub retune_ms: f32,
+}
+impl Default for PitchConfig {
+    fn default() -> Self { Self { key: 0, scale: PitchScale::Chromatic, strength: 0.0, retune_ms: 20.0 } }
+}
+impl PitchConfig {
+    pub fn validate(self) -> Result<(), String> {
+        if self.key > 11 { return Err("pitch-key must be in 0..=11 (C..B)".into()); }
+        if !(0.0..=1.0).contains(&self.strength) { return Err("pitch-correction must be finite and in 0..=1".into()); }
+        if !(5.0..=200.0).contains(&self.retune_ms) { return Err("pitch-retune-ms must be finite and in 5..=200".into()); }
+        Ok(())
     }
 }
 
@@ -244,9 +265,15 @@ pub struct RouteOptions {
     /// Root pitch class (0=C, 1=C#, ..., 11=B) for major/minor tuning reference.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=11))]
     pub pitch_key: u8,
-    /// Microphone tuner reference scale; no automatic pitch shift.
+    /// Reference scale for the tuner and optional pitch correction.
     #[arg(long, value_enum, default_value = "chromatic")]
     pub pitch_scale: PitchScale,
+    /// Experimental monophonic pitch correction strength (0..1); zero adds no delay.
+    #[arg(long, default_value = "0")]
+    pub pitch_correction: f32,
+    /// Pitch correction target smoothing time (5..200 ms); fixed for the session.
+    #[arg(long, default_value = "20")]
+    pub pitch_retune_ms: f32,
     /// Dry/processed blend (0..1), not loudness matching.
     #[arg(long, default_value = "1")]
     pub vocal_strength: f32,
@@ -317,6 +344,17 @@ impl RouteOptions {
             .into_iter().enumerate().filter_map(|(index, (id, channels))| id.map(|id| (index, id, channels)))
     }
 
+    pub fn pitch_config(&self) -> PitchConfig {
+        PitchConfig { key: self.pitch_key, scale: self.pitch_scale, strength: self.pitch_correction, retune_ms: self.pitch_retune_ms }
+    }
+
+    pub fn set_pitch_config(&mut self, config: PitchConfig) {
+        self.pitch_key = config.key;
+        self.pitch_scale = config.scale;
+        self.pitch_correction = config.strength;
+        self.pitch_retune_ms = config.retune_ms;
+    }
+
     pub fn vocal_config(&self) -> VocalConfig {
         VocalConfig { preset: self.vocal, input_gain_db: self.input_gain_db, strength: self.vocal_strength,
             compressor_threshold_db: self.vocal_threshold_db, deess_threshold_db: self.deess_threshold_db,
@@ -348,7 +386,7 @@ impl RouteOptions {
         self.echo_feedback = config.echo.feedback;
     }
     pub fn validate(&self) -> Result<(), String> {
-        if self.pitch_key > 11 { return Err("pitch-key must be in 0..=11 (C..B)".into()); }
+        self.pitch_config().validate()?;
         if self.input.trim().is_empty() || self.output.trim().is_empty() || self.input_channel == 0 {
             return Err("explicit endpoint IDs and a one-based input channel are required".into());
         }
