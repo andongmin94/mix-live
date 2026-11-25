@@ -142,21 +142,24 @@ fn spawn(mut capture: Capture, plugins: Vec<Plugin>, rate: u32, queue_ms: u32, h
                 return Err(format!("VST3 slot {} requires exactly one active stereo input and output bus; sidechains/multibus are not omitted", index + 1));
             }
         }
-        let latency = plugin.latency_samples();
-        total_latency += u64::from(latency);
-        owner.description.push_str(&format!("VST3 slot {}: {} [{}]; reported latency {} samples.\n",
-            index + 1, plugin.info().name, plugin.info().uid, latency));
         let buffers = BusAudioBuffers::new(&layout, CAPTURE_BLOCK, f64::from(rate));
         let _ = plugin.take_restart_flags();
         let _ = plugin.take_host_notifications();
         let _ = plugin.take_parameter_edits();
         plugin.start_processing().map_err(|e| format!("VST3 slot {}: {e}", index + 1))?;
+        // Read the report only after the final rate, state and processing activation.
+        let latency = plugin.latency_samples();
+        total_latency += u64::from(latency);
+        owner.description.push_str(&format!("VST3 slot {}: {} [{}]; reported latency {} samples.\n",
+            index + 1, plugin.info().name, plugin.info().uid, latency));
         let plugin = Arc::new(Mutex::new(plugin));
         processors.push(Processor { plugin: plugin.clone(), buffers });
         owner.slots.push(Slot { plugin, editor: None });
     }
-    owner.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. No dry fallback, delay compensation or crash isolation. Restart requests stop the route.",
-        processors.len(), total_latency, total_latency as f64 * 1000.0 / f64::from(rate), capacity as f64 * 1000.0 / f64::from(rate)));
+    let compensation = capture.prepare_vst3_delay(total_latency, rate)?;
+    owner.description.push_str(&format!("Serial chain: {} effects, total reported latency {} samples ({:.2} ms).\nOutgoing AUX/app send compensation: {compensation} samples ({:.2} ms); monitor adds no compensation. Only reported VST3 latency, not device or clock alignment.\nOne processing thread/queue, input queue CAPACITY {:.2} ms (not a target delay). Scheduling delay is unmeasured. No dry fallback or crash isolation. Restart requests stop the route.",
+        processors.len(), total_latency, total_latency as f64 * 1000.0 / f64::from(rate),
+        compensation as f64 * 1000.0 / f64::from(rate), capacity as f64 * 1000.0 / f64::from(rate)));
     let stop = owner.stop.clone();
     let worker_health = health.clone();
     owner.thread = Some(thread::Builder::new().name("mixlive-vst3-audio".into()).spawn(move || {

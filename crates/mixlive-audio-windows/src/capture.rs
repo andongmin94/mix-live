@@ -107,6 +107,31 @@ impl Capture {
     #[cfg(windows)]
     pub(crate) fn app_count(&self) -> usize { self.app_count }
 
+    /// VST3 reports latency on the mic clock after the final chain is initialized.
+    /// Align supplemental sources in the outgoing mixes only; preserve the short
+    /// monitor path. Keep delay constant throughout a run, even for disabled sends.
+    #[cfg(any(windows, test))]
+    pub(crate) fn prepare_vst3_delay(&mut self, latency: u64, rate: u32) -> Result<usize, String> {
+        if latency == 0 || self.source_slots.len() == 1 || self.mix_slots.len() == 1 {
+            return Ok(0);
+        }
+        // This is a live product, not an unbounded plugin/host delay buffer.
+        // At the maximum rate and source count the two-second cap bounds storage
+        // for all compensated stereo sends to about 53 MiB.
+        if latency > u64::from(rate) * 2 {
+            return Err("VST3 chain latency exceeds the supported 2-second outgoing compensation; remove high-latency effects and start again".into());
+        }
+        let frames = latency as usize;
+        let mix_count = self.mix_slots.len();
+        let delays: Vec<_> = (0..self.route_count).map(|index| {
+            if self.source_slots[index / mix_count] != 0 && self.mix_slots[index % mix_count] != 0 {
+                frames
+            } else { 0 }
+        }).collect();
+        self.engine.prepare_send_delays(&delays).map_err(|error| error.to_string())?;
+        Ok(frames)
+    }
+
     /// Built-in-only route. All supplemental sources are converted to the mic clock.
     pub fn push(&mut self, samples: &[f32], aux: Option<&[[f32; 2]]>, apps: &[&[[f32; 2]]]) {
         self.push_with_effect(samples, aux, apps, &mut |voice, left, right| {
@@ -130,6 +155,18 @@ impl Capture {
                 ramp.set(targets[self.source_slots[index / mix_count] * MAX_MIXES + self.mix_slots[index % mix_count]]);
                 for gain in &mut self.route_envelopes[index][..block.len()] { *gain = ramp.next_gain(); }
             }
+            // Source mute is shared by all of its sends, and acts on the
+            // rendered timeline after each prepared send delay. Advance once per
+            // source sample, not once per destination.
+            for (source_index, &slot) in self.source_slots.iter().enumerate() {
+                let first = source_index * mix_count;
+                for frame in 0..block.len() {
+                    let gain = self.source_mutes[slot].next_gain();
+                    for envelope in &mut self.route_envelopes[first..first + mix_count] {
+                        envelope[frame] *= gain;
+                    }
+                }
+            }
             let envelopes: [&[f32]; MAX_ROUTES] = std::array::from_fn(|index| &self.route_envelopes[index][..block.len()]);
             let envelopes = &envelopes[..self.route_count];
             let processed = &mut self.scratch[..block.len()];
@@ -142,11 +179,7 @@ impl Capture {
                 self.health.fail(Fault::Routing); return;
             }
             // Keep both DSP stages running while source-muted, including their tail/history.
-            let mut voice_peak = 0.0_f32;
-            for (left, right) in left.iter_mut().zip(right.iter_mut()) {
-                voice_peak = voice_peak.max(left.abs()).max(right.abs());
-                let gain = self.source_mutes[0].next_gain(); *left *= gain; *right *= gain;
-            }
+            let voice_peak = left.iter().chain(right.iter()).fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
             self.health.voice_peak.fetch_max(voice_peak.to_bits(), Ordering::Relaxed);
             let mut inputs = [Input::Mono(&[]); MAX_SOURCES];
             inputs[0] = Input::Stereo { left, right };
@@ -155,9 +188,8 @@ impl Capture {
             if let Some(aux) = aux {
                 let mut peak = 0.0_f32;
                 for (index, frame) in aux[start..start + block.len()].iter().enumerate() {
-                    let gain = self.source_mutes[1].next_gain();
-                    self.aux_left[index] = frame[0] * gain;
-                    self.aux_right[index] = frame[1] * gain;
+                    self.aux_left[index] = frame[0];
+                    self.aux_right[index] = frame[1];
                     peak = peak.max(frame[0].abs()).max(frame[1].abs());
                 }
                 self.health.aux_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
@@ -169,9 +201,8 @@ impl Capture {
             for (slot, (buffer, app)) in self.app_buffers.iter_mut().zip(apps).enumerate() {
                 let mut peak = 0.0_f32;
                 for (index, frame) in app[start..start + block.len()].iter().enumerate() {
-                    let gain = self.source_mutes[slot + 2].next_gain();
-                    buffer[0][index] = frame[0] * gain;
-                    buffer[1][index] = frame[1] * gain;
+                    buffer[0][index] = frame[0];
+                    buffer[1][index] = frame[1];
                     peak = peak.max(frame[0].abs()).max(frame[1].abs());
                 }
                 self.health.app_peaks[slot].fetch_max(peak.to_bits(), Ordering::Relaxed);

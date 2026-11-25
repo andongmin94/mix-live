@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-25
-단계: **모니터·통화·방송 독립 믹스 및 Scene schema 7 구현 · Windows 통합 검증 대기**
+단계: **송출 믹스 VST3 신고 지연 보상 구현 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -21,6 +21,10 @@
 - 정지 상태의 장치·출력 설정은 기존 장치/앱·채널·보컬·플러그인 설정과 모든 앱의 mixer 값을
   보존한다. 누락/지원 불가 장치와 앱을 명시하며 저장/시작을 거절하고 임의로 대체하지 않는다.
   보컬 설정은 장치 조회 없이 preset·trim·strength·threshold·VST3 순서와 상태를 편집한다.
+- 최종 활성화된 VST3 체인의 신고 latency 합으로 통화·방송의 AUX/앱 send를 정수 샘플 지연한다.
+  모니터는 추가 보상하지 않는다. 지연 뒤에 소스 mute/route gain을 적용하며, 실제 보상이 필요할 때
+  2초 상한을 넘으면 시작을 거절한다. 준비 시 할당하며 지연 변경 restart는 기존대로 경로를 중단한다.
+  장치 timestamp/clock bridge/OS 지연을 실측·보상하는 것은 아니다. Scene 형식은 schema 7 그대로다.
 - 실행 중 VST3 원본 창은 슬롯별 열기/닫기/재열기. 같은 실제 인스턴스를 유지하며, GPUI가
   메시지 루프를 소유한다. 창 조작과 native poll은 GPUI 변경 참조 밖에서 수행한다.
 - 정지 후 새 Scene 저장은 장치 중지 → 앱 capture thread join → VST3 worker join → 모든
@@ -38,20 +42,22 @@ Windows 테스트 94개(원본 VST3 창 재열기 fixture 포함), Clippy, locke
 앱 목록 CLI와 실제 GPUI Scene 생성·편집·저장 검사를 통과했다.
 이전 #30 컴파일 오류 및 #31 Clippy 모듈 배치 오류도 해당 실행에서 해결됐다.
 
-[Audio #33](https://github.com/andongmin94/mix-live/actions/runs/45559585204)은 다중 앱
-코드 컴파일 후 GPUI 모델 검사에서 중단됐다. 합성 mono 장치에 stereo 채널을 지정한 테스트의
-입력을 채널 1로 바로잡았다. 제품의 검증 규칙은 변경하지 않았다.
-이번 묶음은 논리 방송 슬롯을 추가하고, call이 없는 monitor+broadcast 경로도 확인하도록
-검사를 작성했다. 기존 shared resampling 및 native VST3 fixture를 세 stereo lane으로
-확장하고, 독립 gain/mute·Scene 저장/복원·GUI 설정 보존 검사를 추가했다.
-새 코드의 Windows 통합 검증은 대기 중이다. 별도 의존성 추가 없음. 자동 검사는 실제 오디오 장치를 열지 않는다.
+[Audio #33](https://github.com/andongmin94/mix-live/actions/runs/45559585204)은 합성 mono
+장치의 stereo 테스트 입력 오류로 중단됐고, `a90fae8`에서 mono 채널 1로 수정했다.
+[Audio #34](https://github.com/andongmin94/mix-live/actions/runs/45561046164)는
+세 믹스 변경의 Windows 검사 100개, native VST3 fixture, Clippy, locked release 빌드,
+CLI 및 실제 GPUI Scene 생성·편집·저장 검사를 모두 통과했다.
+이번 PDC 변경은 core의 준비된 send delay, 실제 VST3 초기화 후 신고값 합산, 소스 mute 위치와
+진단만 변경한다. 지연이 없는 native gain fixture와 합성 비영 지연 임펄스(블록 경계 및
+통화 없는 방송), 지연 후 mute/route 이력 검사를 추가했다. Windows 통합 검증은 대기 중이다.
+새 의존성·Scene 스키마 변경 없음. 실제 지연이 있는 상용 VST3와 오디오 장치는 미검증이다.
 
 ## 남은 작업과 제한
 
 - 실제 MiniFuse/가상 케이블/복수 앱 process loopback/상용 VST3 및 장치+UI 전체 실행은
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
-- 탭 선택·자체 가상 장치·ASIO·PDC·실행 중
+- 탭 선택·자체 가상 장치·ASIO·실행 중
   소스/체인 삽입/삭제·내장 리버브/음정 보정·CLI 전체 Scene snapshot 출력은 미구현이다.
 - 모든 VST3 restart 요청은 경로 중단 사유다. 각 VST3는 단일 active stereo 입출력만 지원한다.
   in-process crash/hang과 control/worker mutex 위험이 남으며 hard-real-time 보장은 없다.

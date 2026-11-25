@@ -51,6 +51,8 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
         Some((0.0, AuxDestination::Send)), &[0.0, 0.0], vec![(writer, vec![0, 1, 2])], health.clone(), controls).unwrap();
     let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, true, health.clone()).unwrap();
     assert!(worker.description.contains("Serial chain: 2 effects"));
+    // The existing native gain fixture reports zero latency; it must not acquire an artificial delay.
+    assert!(worker.description.contains("Outgoing AUX/app send compensation: 0 samples"));
     assert!(worker.set_editor_open(0, true).unwrap_err().contains("no native editor"));
     assert!(!worker.editor_is_open(0));
     assert!(worker.set_editor_open(2, true).is_err());

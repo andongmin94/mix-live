@@ -324,3 +324,98 @@ fn broadcast_and_monitor_route_independently_with_or_without_call() {
         assert!(!health.failed());
     }
 }
+
+#[test]
+fn reported_vst3_delay_aligns_stereo_sends_across_blocks_without_delaying_monitor() {
+    const LATENCY: usize = 301;
+    const IMPULSE: usize = 7;
+    for call in [false, true] {
+        let health = Arc::new(Health::default());
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), call.then_some(0.0), Some(0.0)], true, 2).unwrap());
+        for command in ["route app1 output on", "route app1 broadcast on", "route app2 output on"] {
+            controls.apply(command.parse().unwrap()).unwrap();
+        }
+        if call { controls.apply("route app1 send on".parse().unwrap()).unwrap(); }
+        let bindings: Vec<_> = controls.mixes().map(RouteMix::index).collect();
+        let (writer, _reader) = channel(48000, 48000, 30, bindings.len(), health.clone()).unwrap();
+        let aux_to = if call { AuxDestination::All } else { AuxDestination::OutputBroadcast };
+        let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+            Some((0.0, aux_to)), &[0.0, 0.0], vec![(writer, bindings.clone())], health.clone(), controls).unwrap();
+        assert!(capture.prepare_vst3_delay(96_001, 48000).is_err());
+        assert_eq!(capture.prepare_vst3_delay(LATENCY as u64, 48000).unwrap(), LATENCY);
+
+        let mut mic = [0.0; 640];
+        let mut aux = [[0.0; 2]; 640];
+        let mut app1 = [[0.0; 2]; 640];
+        let mut app2 = [[0.0; 2]; 640];
+        mic[IMPULSE] = 0.5;
+        aux[IMPULSE] = [0.125, -0.0625];
+        app1[IMPULSE] = [0.25, 0.125];
+        app2[IMPULSE] = [-0.0625, 0.25];
+
+        // Synthetic delayed stereo effect: the same reported integer latency as the host's PDC.
+        let mut history = [0.0; LATENCY];
+        let mut cursor = 0;
+        let mut position = 0;
+        for count in [13, 113, 256, 129, 129] {
+            let end = position + count;
+            capture.push_with_effect(&mic[position..end], Some(&aux[position..end]),
+                &[&app1[position..end], &app2[position..end]], &mut |voice, left, right| {
+                    for ((left, right), sample) in left.iter_mut().zip(right).zip(voice) {
+                        let delayed = std::mem::replace(&mut history[cursor], *sample);
+                        cursor = (cursor + 1) % LATENCY;
+                        *left = delayed;
+                        *right = -0.5 * delayed;
+                    }
+                    true
+                });
+            for (core_mix, &logical_mix) in bindings.iter().enumerate() {
+                let output = capture.engine.output(core_mix).unwrap();
+                for (index, (&left, &right)) in output.left.iter().zip(output.right).enumerate() {
+                    let frame = position + index;
+                    let expected = match (logical_mix, frame) {
+                        (0, IMPULSE) => [0.3125, 0.3125], // monitor keeps the original supplemental signals
+                        (0, frame) if frame == IMPULSE + LATENCY => [0.5, -0.25],
+                        (_, frame) if logical_mix != 0 && frame == IMPULSE + LATENCY => [0.875, -0.1875],
+                        _ => [0.0; 2],
+                    };
+                    assert_eq!([left, right], expected, "mix {logical_mix}, sample {frame}");
+                }
+            }
+            position = end;
+        }
+        assert_eq!(position, mic.len());
+        assert_eq!(f32::from_bits(health.aux_peak.load(Ordering::Relaxed)), 0.125);
+        assert_eq!(f32::from_bits(health.app_peaks[0].load(Ordering::Relaxed)), 0.25);
+        assert!(!health.failed());
+    }
+}
+
+#[test]
+fn source_mute_applies_after_compensation_and_route_reenable_keeps_current_history() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1).unwrap());
+    controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
+    let (writer, _reader) = channel(48000, 48000, 30, 2, health.clone()).unwrap();
+    let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        Some((0.0, AuxDestination::Broadcast)), &[0.0], vec![(writer, vec![0, 2])], health.clone(), controls.clone()).unwrap();
+    assert_eq!(capture.prepare_vst3_delay(512, 48000).unwrap(), 512);
+    let silence = [0.0; 256];
+    let aux = [[0.125, -0.25]; 256];
+    let first_app = [[0.5, 0.25]; 256];
+    let next_app = [[0.25, -0.125]; 256];
+    capture.push(&silence, Some(&aux), &[&first_app]);
+    assert_eq!(capture.engine.output(1).unwrap().sample_peak(), 0.0);
+    controls.apply("mute aux".parse().unwrap()).unwrap();
+    controls.apply("route app1 broadcast off".parse().unwrap()).unwrap();
+    capture.push(&silence, Some(&aux), &[&next_app]);
+    // At frame 512 both original sources arrive, but their ramps already reached zero.
+    capture.push(&silence, Some(&aux), &[&next_app]);
+    assert_eq!(capture.engine.output(1).unwrap().sample_peak(), 0.0);
+    controls.apply("route app1 broadcast on".parse().unwrap()).unwrap();
+    capture.push(&silence, Some(&aux), &[&next_app]);
+    let broadcast = capture.engine.output(1).unwrap();
+    assert_eq!([broadcast.left[255], broadcast.right[255]], [0.25, -0.125]);
+    assert_eq!(capture.engine.output(0).unwrap().sample_peak(), 0.0);
+    assert!(!health.failed());
+}

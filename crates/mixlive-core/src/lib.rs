@@ -1,8 +1,9 @@
 //! Device-independent, in-memory audio routing. This crate opens no devices.
 //!
 //! Current scope: mono/stereo sources, per-source and per-send gains, independent stereo mixes,
-//! mix-minus exclusions, mute, and sample-peak metering. No effects, resampling or latency
-//! compensation are implemented yet. Render calls use buffers allocated at construction.
+//! mix-minus exclusions, mute, sample-peak metering and prepared integer-sample send delays.
+//! No effects or resampling; device/plugin latency policy belongs to the host.
+//! Render calls use buffers allocated before processing.
 //!
 //! Float headroom is preserved: outputs are NOT clipped or limited. A device adapter must not
 //! present this foundation as a finished live sound processor.

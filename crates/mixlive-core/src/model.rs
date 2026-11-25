@@ -48,6 +48,7 @@ pub enum ConfigError {
     EmptySources,
     EmptyMixes,
     ZeroBlockCapacity,
+    SendDelayCountMismatch,
     InvalidGain { section: &'static str, index: usize },
     InvalidSource { index: usize },
     InvalidMix { index: usize },
@@ -61,6 +62,7 @@ impl fmt::Display for ConfigError {
             Self::EmptySources => write!(f, "a scene needs at least one source"),
             Self::EmptyMixes => write!(f, "a scene needs at least one mix"),
             Self::ZeroBlockCapacity => write!(f, "maximum block size must be greater than zero"),
+            Self::SendDelayCountMismatch => write!(f, "delay count must match the original scene sends"),
             Self::InvalidGain { section, index } => {
                 write!(f, "{section} {index}: gain must be finite and between -96 and +24 dB")
             }
