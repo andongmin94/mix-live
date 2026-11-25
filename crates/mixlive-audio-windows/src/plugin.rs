@@ -131,6 +131,14 @@ pub struct EffectSpec {
     pub bypassed: bool,
 }
 
+/// One explicit edit of the current running chain; indices refer to its latest order.
+#[derive(Clone, Debug)]
+pub enum ChainEdit {
+    Add(EffectSpec),
+    Remove { index: usize },
+    Move { from: usize, to: usize },
+}
+
 pub(crate) fn validate_effects(effects: &[EffectSpec]) -> Result<(), String> {
     for (index, effect) in effects.iter().enumerate() {
         if effect.plugin.as_os_str().is_empty() {

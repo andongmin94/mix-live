@@ -11,7 +11,7 @@
 mod engine;
 mod model;
 
-pub use engine::{Engine, Input, Output, ProcessError};
+pub use engine::{Engine, Input, Output, ProcessError, SendDelays};
 pub use model::{ChannelLayout, ConfigError, Mix, Scene, Send, Source};
 
 #[cfg(test)]

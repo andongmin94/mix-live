@@ -258,15 +258,10 @@ impl Prepared {
         if pitch_latency > 0 {
             timing.push(format!("Built-in pitch correction: {pitch_latency} samples ({:.2} ms) nominal algorithmic delay; not round-trip latency", pitch_latency as f64 * 1000.0 / f64::from(rate)));
         }
-        if plugin.effects.is_empty() {
-            let compensation = capture.prepare_voice_delay(0, rate)?;
-            if pitch_latency > 0 {
-                timing.push(format!("Outgoing AUX/app send compensation: {compensation} samples; monitor adds no compensation."));
-            }
-        }
         let vocal_stats = capture.vocal_stats.clone();
         let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, controls.has_aux(), health.clone(), &controls)?;
-        if let Some(worker) = &plugin_worker { timing.push(worker.description.clone()); }
+        let plugin_timing = timing.len();
+        timing.push(plugin_worker.description.clone());
         let format = self.input_config.sample_format();
         let config = self.input_config.config();
         let (pitch_tap, pitch_monitor) = pitch::channel(self.input_config.sample_rate(), self.pitch.key, self.pitch.scale)?;
@@ -287,7 +282,7 @@ impl Prepared {
         if let Some(stream) = &aux_stream { stream.play()?; }
         input_stream.play()?;
         Ok(Active { _input: input_stream, _aux_input: aux_stream, _outputs: streams, _app_captures: app_captures, plugin_worker, health, outputs: stats,
-            aux_enabled: controls.has_aux(), controls, aux_clock_stats, app_clock_stats, vocal_stats, pitch_monitor, timing })
+            aux_enabled: controls.has_aux(), controls, aux_clock_stats, app_clock_stats, vocal_stats, pitch_monitor, plugin_timing, timing })
     }
 }
 
@@ -315,7 +310,7 @@ pub struct Active {
     _aux_input: Option<Stream>,
     _outputs: Vec<Stream>,
     _app_captures: Vec<ProcessCapture>,
-    plugin_worker: Option<PluginWorker>,
+    plugin_worker: PluginWorker,
     pub health: Arc<Health>,
     pub controls: Arc<LiveControls>,
     /// One set per physical playback endpoint, shared by its channel routes.
@@ -325,6 +320,7 @@ pub struct Active {
     app_clock_stats: Vec<Arc<OutputStats>>,
     pub vocal_stats: Arc<VocalStats>,
     pitch_monitor: PitchMonitor,
+    plugin_timing: usize,
     pub timing: Vec<String>,
 }
 
@@ -403,40 +399,47 @@ impl Active {
     /// Service plugin/editor requests on the loading/control thread, outside UI borrows.
     /// The caller owns message dispatch. Return whether any editor was dismissed.
     pub fn poll_plugin(&mut self) -> Result<bool> {
-        match &mut self.plugin_worker {
-            Some(worker) => Ok(worker.poll()?),
-            None => Ok(false),
-        }
+        Ok(self.plugin_worker.poll()?)
     }
 
     pub fn editor_is_open(&self, index: usize) -> bool {
-        self.plugin_worker.as_ref().is_some_and(|worker| worker.editor_is_open(index))
+        self.plugin_worker.editor_is_open(index)
     }
 
     /// Use the existing live instance, never open a separate inspection/edit copy.
     pub fn set_editor_open(&mut self, index: usize, open: bool) -> Result<()> {
-        let worker = self.plugin_worker.as_mut().ok_or("no active VST3 chain")?;
-        Ok(worker.set_editor_open(index, open)?)
+        Ok(self.plugin_worker.set_editor_open(index, open)?)
     }
 
     /// Explicit foreground query; never call native metadata/formatting from a UI render.
     pub fn effect_parameters(&mut self, index: usize) -> Result<Vec<crate::plugin::LiveParameter>> {
-        let worker = self.plugin_worker.as_mut().ok_or("no active VST3 chain")?;
-        Ok(worker.effect_parameters(index)?)
+        Ok(self.plugin_worker.effect_parameters(index)?)
     }
 
     /// Edit the running instance; the next audio block consumes the normalized parameter.
     pub fn set_effect_parameter(&mut self, index: usize, id: u32, normalized: f64) -> Result<Vec<crate::plugin::LiveParameter>> {
-        let worker = self.plugin_worker.as_mut().ok_or("no active VST3 chain")?;
-        Ok(worker.set_effect_parameter(index, id, normalized)?)
+        Ok(self.plugin_worker.set_effect_parameter(index, id, normalized)?)
+    }
+
+    /// Resolved identity and bypass of the current slots, without native state reads.
+    pub fn effects(&self) -> Vec<crate::plugin::EffectSpec> {
+        self.plugin_worker.effects()
+    }
+
+    /// Prepare and commit one running-chain edit outside any mutable UI borrow.
+    /// Publish the acknowledged order even if later native retirement reports an error.
+    pub fn edit_chain(&mut self, edit: crate::plugin::ChainEdit) -> Result<()> {
+        let result = self.plugin_worker.edit_chain(edit);
+        self.controls.replace_effects(self.plugin_worker.effect_flags());
+        self.timing[self.plugin_timing] = self.plugin_worker.description.clone();
+        Ok(result?)
     }
 
     /// Explicit normal completion. Stop all devices before joining/snapshotting the plugin.
     /// Errors and implicit Drop still tear down everything, but never save plugin state.
     pub fn finish(self, state_out: Option<&std::path::Path>) -> Result<()> {
         let (worker, health) = self.stop_devices();
-        if let Some(worker) = worker { worker.finish(state_out)?; }
-        else if state_out.is_some() { return Err("no live VST3 instance to save".into()); }
+        worker.finish(state_out)?;
         if let Some(error) = health.error() { return Err(error.into()); }
         Ok(())
     }
@@ -448,15 +451,12 @@ impl Active {
         let (worker, health) = self.stop_devices();
         settings?;
         if let Some(error) = health.error() { return Err(error.into()); }
-        let effects = match worker {
-            Some(worker) => worker.snapshot()?.effects,
-            None => Vec::new(),
-        };
+        let effects = worker.snapshot()?.effects;
         if let Some(error) = health.error() { return Err(error.into()); }
         crate::scene::AudioScene::new(route, effects)
     }
 
-    fn stop_devices(self) -> (Option<PluginWorker>, Arc<Health>) {
+    fn stop_devices(self) -> (PluginWorker, Arc<Health>) {
         let Self { _input, _aux_input, _outputs, _app_captures, plugin_worker, health, .. } = self;
         drop(_input);
         drop(_aux_input);
