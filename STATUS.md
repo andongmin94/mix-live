@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-26
-단계: **실행 중 출력 장치·채널 교체 구현 · Windows 통합 검증 대기**
+단계: **실행 중 출력 장치·채널 교체 검증 완료 · main 병합**
 
 ## 현재 구현
 
@@ -143,16 +143,19 @@
 
 ## 검증
 
-- 이번 출력 교체 변경: portable 설정 7개·출력 draft 2개·Capture 28개·최초 출력 gain 1개,
-  총 38개 관련 검사 통과. 유지 출력의 queue/gain/limiter·보컬 이력, shared split/join·희소
-  mix 매핑, 준비 거절·현재/제거 출력 Health를 확인했다. Windows worker·callback·native
-  VST3 fixture 검사를 추가했다. Linux all-target strict Clippy는 Windows 전용 경로의
-  dead-code 경고로 중단됐으며, 필수 Windows CI·release·GPUI 결과는 아직 확정하지 않았다.
-- [Audio #63](https://github.com/andongmin94/mix-live/actions/runs/45652215464) `6b971b0` 전체 성공:
-  Windows workspace 검사 161개와 실제 native VST3 fixture 검사 14개, 총 **175개 성공**.
+- [Audio #66](https://github.com/andongmin94/mix-live/actions/runs/45736112579) `d0e29ff` 전체 성공:
+  Windows workspace 검사 174개와 실제 native VST3 fixture 검사 15개, 총 **189개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
   CLI 및 실제 GPUI Scene 생성·편집·취소·저장·재열기 검사 모두 통과했다.
-  PR #8의 실제 병합 tree가 검증한 source tree와 동일함을 확인했다.
+  PR #9의 실제 병합 tree가 검증한 source tree와 동일함을 확인했다.
+- 출력 교체 중 유지 그룹의 실제 sample을 기준 경로와 비교하여 queue·gain ramp·limiter와
+  mic pitch·AUX/app PDC 이력을 확인했다. shared split/join과 sparse logical 0/2 매핑,
+  새 queue의 초기 무음, 전체 mix partition·retention 검증, 준비 거절, retired/disabled/current
+  Health와 완료 카운터를 검사했다. Windows callback의 닫힌 gate 무소비·첫 활성 최신 mute·
+  채널 반전·전체 경로 오류 무음, 입력 없는 worker의 현재 출력 오류 전달도 통과했다.
+  실제 gain VST3의 동일 인스턴스·0.5 파라미터와 app control을 유지하고 새 broadcast writer의
+  mic·AUX·app 합산 sample `[0.16, 0.05]`를 확인했다. UI 입력 및 새로고침 선택 보존,
+  비활성 Scene 설정 보존도 확인했다. 실장비/실행 중 출력 GUI 전환과 청취 품질은 미검증이다.
 - 물리 AUX 추가·삭제 중 app의 진행 중 음량 ramp·PDC와 실제 mic pitch impulse 이력을
   기준 출력과 비교했다. AUX 교체의 이전 지연 샘플 폐기·mixer/ramp 유지, 새 AUX 기본값,
   승인 후 게시, 현재/비활성 mixer snapshot과 후속 pitch/VST delay 준비를 확인했다.
@@ -180,7 +183,7 @@
   파라미터의 인스턴스 동일성·순서 유지, 잘못된 경로/레이아웃/인덱스 거절, 전체 삭제 후
   오디오 처리·AUX/앱 격리·빈 체인 snapshot 및 편집한 순서/bypass의 snapshot을 확인했다.
   기존 state fixture의 파라미터 저장/복원과 라이브 EQ·limiter·Scene 13 검사도 통과했다.
-- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45652215464/artifacts/15040153954):
+- [Windows 개발 빌드](https://github.com/andongmin94/mix-live/actions/runs/45736112579/artifacts/15079786635):
   `mixlive.exe`, `mixlive-audio.exe`, `mixlive-plugins.exe`와 의존성/라이선스 고지.
   실장비의 실행 중 UI 조작·상용 VST3 호환성·실제 보컬 청취·지연/CPU는 검증하지 않았다.
 - [Virtual Audio #4](https://github.com/andongmin94/mix-live/actions/runs/45569677959) `08d0007` 성공:
