@@ -1,7 +1,7 @@
 # 현재 상태
 
 기준일: 2026-11-26
-단계: **실행 중 물리 AUX 추가·교체·삭제 검증 완료 · main 병합**
+단계: **실행 중 출력 장치·채널 교체 구현 · Windows 통합 검증 대기**
 
 ## 현재 구현
 
@@ -35,6 +35,15 @@
   이전 AUX PDC 이력을 버리며, 추가는 −12 dB/unmuted/all sends off로 시작한다.
   현재 binding·fader·계측·진단과 Scene snapshot을 갱신하며 명시적 저장에만 반영한다.
   새 bridge priming과 선택 전환의 AUX 무음은 가능하다. 실장비/실행 UI 전환은 미검증이다.
+- 실행 중 현재 활성 모니터·통화·방송의 exact playback endpoint와 mono/stereo 채널을
+  한 번에 교체한다. 공유 장치의 채널 변경·분리·결합을 지원하며 활성 믹스 집합은 유지한다.
+  실제 장치와 순서 있는 믹스·채널이 같은 그룹은 stream·config·queue·gain ramp·limiter·stats를
+  유지한다. 바뀐 그룹만 자체 Health와 닫힌 gate로 준비·시작한 뒤 기존 worker 경계에서
+  writer/gate를 바꾸며, 이전 저장소와 stream은 제어 스레드에서 해제한다. 준비 실패는
+  현재 출력을 유지하고, 현재 출력의 오류만 입력 없는 동안에도 전체 경로에 전달한다.
+  마이크·AUX·앱·Engine·PDC·pitch·VST3와 믹서 값은 유지한다. GPUI의 선택 초안과 다른
+  편집 패널을 보존하며 현재 장치·채널·진단과 명시적 Scene snapshot을 갱신한다.
+  새 출력 queue의 priming 무음은 가능하다. 실제 장치 전환·청취 품질은 미검증이다.
 - 실행 중 mic/AUX/앱별 mute 및 각 목적지로의 send·gain, master/믹스별 감쇠·출력 mute를 조절한다.
   AUX/앱 공통 trim은 기존 Scene 필드에서 시작하고 GUI/CLI에서 실시간 조절한다.
   입력 clock에서 5 ms ramp를 한 번 적용하고 PDC 이후 mute/send gain을 유지한다.
@@ -134,6 +143,11 @@
 
 ## 검증
 
+- 이번 출력 교체 변경: portable 설정 7개·출력 draft 2개·Capture 28개·최초 출력 gain 1개,
+  총 38개 관련 검사 통과. 유지 출력의 queue/gain/limiter·보컬 이력, shared split/join·희소
+  mix 매핑, 준비 거절·현재/제거 출력 Health를 확인했다. Windows worker·callback·native
+  VST3 fixture 검사를 추가했다. Linux all-target strict Clippy는 Windows 전용 경로의
+  dead-code 경고로 중단됐으며, 필수 Windows CI·release·GPUI 결과는 아직 확정하지 않았다.
 - [Audio #63](https://github.com/andongmin94/mix-live/actions/runs/45652215464) `6b971b0` 전체 성공:
   Windows workspace 검사 161개와 실제 native VST3 fixture 검사 14개, 총 **175개 성공**.
   Clippy `--workspace --all-targets --locked -- -D warnings`, locked Windows release 빌드,
@@ -178,7 +192,7 @@
 - 실제 MiniFuse/가상 케이블/복수 앱 process loopback/상용 VST3 및 장치+UI 전체 실행은
   미검증이다. queue·plugin 신고값은 실측 왕복 지연이 아니며 sample peak는 LUFS/true peak가 아니다.
   다중 앱 캡처·음질·장시간 안정성을 검증 완료라고 부르지 않는다.
-- 탭 선택·ASIO·실행 중 마이크/출력 장치 교체·고급 formant 보존과 음정 보정 품질 수용은
+- 탭 선택·ASIO·실행 중 마이크 장치 교체·통화/방송 믹스 추가·삭제·고급 formant 보존과 음정 보정 품질 수용은
   미완료다(실험적 자동 보정은 구현).
   CLI 전체 Scene snapshot의 실제 장치 실행은 미검증이다. 실제 로딩·장치 등록/제거·전원 상태·HVCI·HLK·서명·Discord/OBS 및 DAW Return 수신은 미검증이다.
   음정 설정/프리셋/리버브/에코/라이브 파라미터의 청취·CPU·실제 상용 VST3 경로는 미검증이다.

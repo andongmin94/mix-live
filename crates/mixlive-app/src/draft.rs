@@ -1,8 +1,8 @@
 //! Editable startup devices and sound in the existing schema. This layer has no device I/O.
 
 use mixlive_audio_windows::{
-    config::{AppSource, AuxDestination, AuxSource, InputMap, OutputMap, RouteOptions},
-    control::MixSettings,
+    config::{AppSource, AuxDestination, AuxSource, InputMap, OutputBinding, OutputMap, RouteOptions, MAX_MIXES, validate_output_bindings},
+    control::{MixSettings, RouteMix},
     devices::{DeviceCatalog, DeviceConfig, DeviceInfo, resolve_apps},
     scene::AudioScene,
 };
@@ -266,6 +266,23 @@ pub(crate) fn auxiliary_source(
     Ok(AuxSource { input: input.to_owned(), channels })
 }
 
+/// Resolve all active output choices together, including shared-endpoint channel
+/// overlap. Runtime preparation rechecks the actual device and configuration.
+pub(crate) fn output_bindings(
+    drafts: &[(RouteMix, Option<String>, String)], devices: &[DeviceInfo], enabled: [bool; MAX_MIXES],
+) -> Result<Vec<OutputBinding>, String> {
+    let mut bindings = Vec::with_capacity(drafts.len());
+    for (mix, id, channel_text) in drafts {
+        let label = match mix { RouteMix::Output => "모니터 출력", RouteMix::Send => "통화 출력", RouteMix::Broadcast => "방송 출력" };
+        let device = selected(id, devices, label)?;
+        let channels = channels(channel_text)?;
+        OutputMap::new(&channels, configuration(device)?.channels)?;
+        bindings.push(OutputBinding { mix: *mix, output: device.id.clone(), channels });
+    }
+    validate_output_bindings(&bindings, enabled)?;
+    Ok(bindings)
+}
+
 pub(crate) fn number(value: &str, label: &str) -> Result<f32, String> {
     value
         .trim()
@@ -312,6 +329,58 @@ mod tests {
         assert!(auxiliary_source(Some("mic"), "2,1", &inputs, microphone).unwrap_err().contains("마이크"));
         assert!(auxiliary_source(Some("unavailable"), "1,2", &inputs, microphone).unwrap_err()
             .contains("device configuration is unavailable"));
+    }
+
+    #[test]
+    fn live_output_selection_preserves_mixes_and_ordered_channels_across_shared_devices() {
+        let devices = vec![device("shared", 6), device("separate", 2)];
+        let mut drafts = vec![
+            (RouteMix::Output, Some("shared".into()), " 2, 1 ".into()),
+            (RouteMix::Send, Some("shared".into()), "3".into()),
+            (RouteMix::Broadcast, Some("shared".into()), "6,5".into()),
+        ];
+        assert_eq!(output_bindings(&drafts, &devices, [true; MAX_MIXES]).unwrap(), vec![
+            OutputBinding { mix: RouteMix::Output, output: "shared".into(), channels: vec![2, 1] },
+            OutputBinding { mix: RouteMix::Send, output: "shared".into(), channels: vec![3] },
+            OutputBinding { mix: RouteMix::Broadcast, output: "shared".into(), channels: vec![6, 5] },
+        ]);
+        drafts[1] = (RouteMix::Send, Some("separate".into()), "1,2".into());
+        assert_eq!(output_bindings(&drafts, &devices, [true; MAX_MIXES]).unwrap()[1],
+            OutputBinding { mix: RouteMix::Send, output: "separate".into(), channels: vec![1, 2] });
+        drafts.remove(1);
+        let bindings = output_bindings(&drafts, &devices, [true, false, true]).unwrap();
+        assert_eq!(bindings.iter().map(|binding| binding.mix).collect::<Vec<_>>(), [RouteMix::Output, RouteMix::Broadcast]);
+        assert!(output_bindings(&drafts, &devices, [true; MAX_MIXES]).is_err());
+    }
+
+    #[test]
+    fn live_output_selection_rejects_overlap_and_unavailable_or_invalid_choices() {
+        let mut unavailable = device("unavailable", 2);
+        unavailable.config = Err("unsupported output format".into());
+        let devices = vec![device("shared", 4), unavailable];
+        for channels in ["1", "2,3", "4,2"] {
+            let drafts = [
+                (RouteMix::Output, Some("shared".into()), "1,2".into()),
+                (RouteMix::Send, Some("shared".into()), channels.into()),
+            ];
+            assert!(output_bindings(&drafts, &devices, [true, true, false]).is_err());
+        }
+        let enabled = [true, false, false];
+        for id in [None, Some(""), Some("missing"), Some("Same display name")] {
+            let drafts = [(RouteMix::Output, id.map(str::to_owned), "1,2".into())];
+            assert!(output_bindings(&drafts, &devices, enabled).is_err());
+        }
+        for channels in ["", "abc", "0", "5", "1,1", "1,2,3", "-1"] {
+            let drafts = [(RouteMix::Output, Some("shared".into()), channels.into())];
+            assert!(output_bindings(&drafts, &devices, enabled).is_err());
+        }
+        let drafts = [(RouteMix::Output, Some("unavailable".into()), "1,2".into())];
+        assert!(output_bindings(&drafts, &devices, enabled).unwrap_err().contains("unsupported output format"));
+        let duplicates = [
+            (RouteMix::Output, Some("shared".into()), "1".into()),
+            (RouteMix::Output, Some("shared".into()), "2".into()),
+        ];
+        assert!(output_bindings(&duplicates, &devices, enabled).is_err());
     }
 
     fn catalog() -> DeviceCatalog {

@@ -5,7 +5,7 @@ use mixlive_effects::{VocalChain, VocalSettings};
 use crate::devices::{AppInfo, DeviceCatalog, DeviceConfig, DeviceInfo, ProcessTarget, resolve_apps};
 use crate::process_capture::{self, ProcessCapture};
 use crate::pitch::{self, PitchMonitor, PitchReading, PitchTap};
-use crate::{bridge::{self, Fault, Health, LimiterReading, OutputReader, OutputStats, OutputWriter}, capture::{Capture, VocalStats, CAPTURE_BLOCK}, config::{AppSource, AuxSource, InputMap, OutputMap, PitchConfig, PitchScale, RouteOptions, MAX_APPS, MAX_MIXES, output_sample}, control::{AppControls, LiveControls, PlaybackGains, RouteMix, RouteSource}, plugin::{ResolvedPlugins, native::{self, AuxFeed, CaptureSink, PluginWorker, SourceFeeds}}};
+use crate::{bridge::{self, Fault, Health, LimiterReading, OutputReader, OutputStats, OutputWriter}, capture::{Capture, CaptureOutput, VocalStats, CAPTURE_BLOCK}, config::{AppSource, AuxSource, InputMap, OutputBinding, OutputMap, PitchConfig, PitchScale, RouteOptions, MAX_APPS, MAX_MIXES, output_sample, validate_output_bindings}, control::{AppControls, LiveControls, PlaybackGains, RouteMix, RouteSource}, plugin::{ResolvedPlugins, native::{self, AuxFeed, CaptureSink, PluginWorker, SourceFeeds}}};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -61,6 +61,18 @@ pub fn list_devices() -> Result<Vec<String>> {
 // Each entry owns exactly one device stream/clock bridge; routes index the independent mixes.
 struct OutputEndpoint { device: Device, config: SupportedStreamConfig, routes: Vec<(usize, OutputMap)> }
 
+struct ActiveOutput {
+    endpoint: OutputEndpoint,
+    stream: Stream,
+    enabled: Arc<AtomicBool>,
+    stats: Arc<OutputStats>,
+    queue_ms: f64,
+    resampler_delay_ms: f64,
+}
+impl Drop for ActiveOutput {
+    fn drop(&mut self) { self.enabled.store(false, Ordering::Release); }
+}
+
 struct AuxiliaryEndpoint { source: AuxSource, device: Device, config: SupportedStreamConfig, map: InputMap }
 
 struct AuxiliaryStream { stream: Stream, enabled: Arc<AtomicBool>, stats: Arc<OutputStats> }
@@ -83,6 +95,7 @@ pub struct Prepared {
     queue_ms: u32,
     controls: LiveControls,
     outputs: Vec<OutputEndpoint>,
+    output_bindings: Vec<OutputBinding>,
 }
 
 fn find(host: &Host, id: &str) -> Result<Device> {
@@ -98,6 +111,66 @@ fn validate_config(config: &SupportedStreamConfig) -> Result<()> {
         return Err(format!("unsupported endpoint sample format: {}", config.sample_format()).into());
     }
     Ok(())
+}
+
+fn resolve_outputs(host: &Host, bindings: &[OutputBinding], current: &[ActiveOutput]) -> Result<Vec<OutputEndpoint>> {
+    let mut groups: Vec<(Device, Vec<(usize, OutputMap)>)> = Vec::new();
+    for binding in bindings {
+        let device = find(host, &binding.output)?;
+        let map = OutputMap::new(&binding.channels, 256)?;
+        if let Some((_, routes)) = groups.iter_mut().find(|(candidate, _)| *candidate == device) {
+            if routes.iter().any(|(_, existing)| existing.overlaps(map)) {
+                return Err("output mix channels must not overlap on the same endpoint".into());
+            }
+            routes.push((binding.mix.index(), map));
+        } else {
+            if !host.output_devices()?.any(|candidate| candidate == device) {
+                return Err("output must be a playback endpoint listed under OUTPUT".into());
+            }
+            groups.push((device, vec![(binding.mix.index(), map)]));
+        }
+    }
+    groups.into_iter().map(|(device, routes)| {
+        // The running format belongs to an unchanged group. An unrelated edit
+        // must not reopen it merely because Windows changed its default format.
+        let config = match current.iter().find(|output| output.endpoint.device == device && output.endpoint.routes == routes) {
+            Some(output) => output.endpoint.config,
+            None => device.default_output_config()?,
+        };
+        validate_config(&config)?;
+        for (_, map) in &routes {
+            let last = match *map { OutputMap::Mono(one) => one, OutputMap::Stereo(left, right) => left.max(right) };
+            if last >= usize::from(config.channels()) {
+                return Err(format!("output channels must be in 1..={}", config.channels()).into());
+            }
+        }
+        Ok(OutputEndpoint { device, config, routes })
+    }).collect()
+}
+
+fn prepare_output(endpoint: OutputEndpoint, rate: u32, queue_ms: u32, controls: Arc<LiveControls>, route_health: Arc<Health>)
+    -> Result<(ActiveOutput, CaptureOutput)> {
+    let health = Arc::new(Health::default());
+    let enabled = Arc::new(AtomicBool::new(false));
+    let (writer, reader) = bridge::channel(rate, endpoint.config.sample_rate(), queue_ms, endpoint.routes.len(), health.clone())?;
+    let stats = reader.stats.clone();
+    let queue_ms = reader.queue_ms;
+    let resampler_delay_ms = reader.resampler_delay_ms;
+    let mixes = endpoint.routes.iter().map(|(mix, _)| *mix).collect::<Vec<_>>();
+    let gains = PlaybackGains::new(endpoint.config.sample_rate(), &mixes, controls)?;
+    let capture = CaptureOutput::new(writer, mixes, health.clone(), enabled.clone());
+    let playback = OutputPlayback { maps: endpoint.routes.iter().map(|(_, map)| *map).collect(),
+        reader, gains, health, route_health, enabled: enabled.clone(), activated: false };
+    let config = endpoint.config.config();
+    let stream = match endpoint.config.sample_format() {
+        SampleFormat::F32 => output::<f32>(&endpoint.device, config, playback)?,
+        SampleFormat::F64 => output::<f64>(&endpoint.device, config, playback)?,
+        SampleFormat::I16 => output::<i16>(&endpoint.device, config, playback)?,
+        SampleFormat::I32 => output::<i32>(&endpoint.device, config, playback)?,
+        SampleFormat::U16 => output::<u16>(&endpoint.device, config, playback)?,
+        _ => return Err("output sample format changed after validation".into()),
+    };
+    Ok((ActiveOutput { endpoint, stream, enabled, stats, queue_ms, resampler_delay_ms }, capture))
 }
 
 fn resolve_aux(host: &Host, source: AuxSource, input: &Device, input_config: SupportedStreamConfig,
@@ -178,40 +251,20 @@ impl Prepared {
             }).collect::<Result<Vec<_>>>()?
         };
         let vocal = VocalChain::new(input_config.sample_rate(), options.vocal_config())?;
-        let mut outputs: Vec<OutputEndpoint> = Vec::new();
-        let mut add = |id: &str, channels: &[u16], mix: usize| -> Result<()> {
-            let device = find(&host, id)?;
-            // Group the resolved device identity, not just the user-supplied ID spelling.
-            if let Some(endpoint) = outputs.iter_mut().find(|endpoint| endpoint.device == device) {
-                let map = OutputMap::new(channels, endpoint.config.channels())?;
-                if endpoint.routes.iter().any(|(_, existing)| existing.overlaps(map)) {
-                    return Err("output and send channels must not overlap on the same endpoint".into());
-                }
-                endpoint.routes.push((mix, map));
-                return Ok(());
-            }
-            if !host.output_devices()?.any(|candidate| candidate == device) {
-                return Err("output must be a playback endpoint listed under OUTPUT".into());
-            }
-            let config = device.default_output_config()?;
-            validate_config(&config)?;
-            let map = OutputMap::new(channels, config.channels())?;
-            outputs.push(OutputEndpoint { device, config, routes: vec![(mix, map)] });
-            Ok(())
-        };
-        for (mix, id, channels) in options.playback_bindings() { add(id, channels, mix)?; }
+        let output_bindings = options.output_bindings();
+        let outputs = resolve_outputs(&host, &output_bindings, &[])?;
         Ok(Self { input, input_config, input_channel: usize::from(options.input_channel - 1), vocal,
             pitch: options.pitch_config(),
             auxiliary, apps,
             output_gain_db: options.output_gain_db, mix_gains_db: [options.monitor_gain_db, options.send_gain_db, options.broadcast_gain_db],
-            queue_ms: options.queue_ms, controls: LiveControls::from_route(options)?, outputs })
+            queue_ms: options.queue_ms, controls: LiveControls::from_route(options)?, outputs, output_bindings })
     }
 
     pub fn describe(&self) -> String {
-        let mut text = format!("WASAPI input: {}\n  {:?}; channel {}\nvocal: {:?}\ninitial master attenuation: {} dB\nplayback streams: {}\n", self.input, self.input_config, self.input_channel + 1, self.vocal.config(), self.output_gain_db, self.outputs.len());
+        let mut text = format!("WASAPI input: {}\n  {:?}; channel {}\nvocal: {:?}\ninitial master attenuation: {} dB\ninitial playback streams: {}\n", self.input, self.input_config, self.input_channel + 1, self.vocal.config(), self.output_gain_db, self.outputs.len());
         text.push_str(&format!("Initial pitch reference: {} {}; correction {:.0}%; retune {:.1} ms\n", PitchScale::NAMES[usize::from(self.pitch.key)], self.pitch.scale.name(), self.pitch.strength * 100.0, self.pitch.retune_ms));
         for (index, endpoint) in self.outputs.iter().enumerate() {
-            text.push_str(&format!("stream {index}: {}\n  {:?}; one queue/resampler for {} mix(es)\n", endpoint.device, endpoint.config, endpoint.routes.len()));
+            text.push_str(&format!("Initial stream {index}: {}\n  {:?}; one queue/resampler for {} mix(es)\n", endpoint.device, endpoint.config, endpoint.routes.len()));
             for (mix, map) in &endpoint.routes {
                 let gain = self.mix_gains_db[*mix];
                 text.push_str(&format!("  mix {mix}: map {map:?} (zero-based); initial mix attenuation {gain} dB\n"));
@@ -230,7 +283,7 @@ impl Prepared {
                 index + 1, app.path, target.pid, map.left + 1, map.right + 1));
         }
         text.push_str(&format!("Initial mixer: {}\n", self.controls.describe()));
-        text.push_str("Microphone and output device bindings are fixed for this run. GPUI can add, replace or remove physical AUX; its new capture/PDC history starts empty and changed shared selections briefly silence AUX. Live vocal preset, reverb pre-delay, echo time and pitch settings are also available. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
+        text.push_str("Microphone binding is fixed for this run. GPUI can replace endpoint/channel bindings of the current output mixes; changed endpoint groups start new queues and may briefly silence while priming. GPUI can also add, replace or remove physical AUX; its new capture/PDC history starts empty and changed shared selections briefly silence AUX. Live vocal preset, reverb pre-delay, echo time and pitch settings are also available. --interactive enables live mixer controls (5 ms ramps) and vocal trim/strength/EQ/dynamics/reverb blend/decay/echo blend/feedback targets (10 ms ramps). Output mute acts after MixLive queues, not on audio already sent to the OS or on hardware direct monitoring.\nNo automatic makeup gain; optional pitch correction adds one analysis window of latency, and IIR phase/group delay still exists. Check validates configuration, not device operation or sound quality. --vst3 is an optional in-process development path; ASIO and driver installation are not implemented.\n");
         text
     }
 
@@ -240,30 +293,14 @@ impl Prepared {
         let mut controls = self.controls;
         controls.prepare_effects(plugin.effects.iter().map(|effect| effect.bypassed));
         let controls = Arc::new(controls);
-        let mut streams = Vec::new();
+        let mut outputs = Vec::new();
         let mut writers = Vec::new();
-        let mut stats = Vec::new();
-        let mut timing = Vec::new();
-        for (index, endpoint) in self.outputs.into_iter().enumerate() {
-            let (writer, reader) = bridge::channel(self.input_config.sample_rate(), endpoint.config.sample_rate(), self.queue_ms, endpoint.routes.len(), health.clone())?;
-            timing.push(format!("stream {index}: {} mix(es), shared queue target {:.2} ms + resampler delay {:.2} ms (excludes hardware and OS; NOT round-trip latency)", endpoint.routes.len(), reader.queue_ms, reader.resampler_delay_ms));
-            let mixes: Vec<usize> = endpoint.routes.iter().map(|(mix, _)| *mix).collect();
-            stats.push(PlaybackStats { mixes: mixes.clone(), stats: reader.stats.clone() });
-            let gains = PlaybackGains::new(endpoint.config.sample_rate(), &mixes, controls.clone())?;
-            writers.push((writer, mixes));
-            let maps: Vec<OutputMap> = endpoint.routes.iter().map(|(_, map)| *map).collect();
-            let format = endpoint.config.sample_format();
-            let config = endpoint.config.config();
-            let stream = match format {
-                SampleFormat::F32 => output::<f32>(&endpoint.device, config, maps, reader, gains, health.clone())?,
-                SampleFormat::F64 => output::<f64>(&endpoint.device, config, maps, reader, gains, health.clone())?,
-                SampleFormat::I16 => output::<i16>(&endpoint.device, config, maps, reader, gains, health.clone())?,
-                SampleFormat::I32 => output::<i32>(&endpoint.device, config, maps, reader, gains, health.clone())?,
-                SampleFormat::U16 => output::<u16>(&endpoint.device, config, maps, reader, gains, health.clone())?,
-                _ => return Err("sample format changed after validation".into()),
-            };
-            timing.push(format!("output driver buffer query: {:?} frames", stream.buffer_size()));
-            streams.push(stream);
+        let output_timing = 0;
+        let mut timing = vec![String::new()];
+        for endpoint in self.outputs {
+            let (output, writer) = prepare_output(endpoint, self.input_config.sample_rate(), self.queue_ms, controls.clone(), health.clone())?;
+            outputs.push(output);
+            writers.push(writer);
         }
         let aux_source = self.auxiliary.as_ref().map(|aux| aux.source.clone());
         let aux_generation = u64::from(self.auxiliary.as_ref().is_some_and(|aux| aux.device == self.input));
@@ -293,7 +330,7 @@ impl Prepared {
         capture.prepare_pitch(rate, self.pitch)?;
         let vocal_stats = capture.vocal_stats.clone();
         let (capture, plugin_worker) = native::connect(capture, plugin, self.input_config.sample_rate(), self.queue_ms, health.clone(), &controls,
-            SourceFeeds { aux: prepared_aux.feed, aux_source, apps: app_readers })?;
+            SourceFeeds { aux: prepared_aux.feed, aux_source, apps: app_readers, output_bindings: self.output_bindings })?;
         let plugin_timing = timing.len();
         timing.push(plugin_worker.description.clone());
         let format = self.input_config.sample_format();
@@ -313,21 +350,17 @@ impl Prepared {
         for app in &mut app_captures { app.capture.start()?; }
         for app in &mut app_captures { app.capture.attach()?; }
         // Output emits silence until each queue is primed. Any startup error drops every stream.
-        for stream in &streams { stream.play()?; }
+        for output in &outputs { output.stream.play()?; }
         if let Some(stream) = &aux_stream { stream.stream.play()?; }
         input_stream.play()?;
-        let mut active = Active { _input: input_stream, aux_input: aux_stream, _outputs: streams, app_captures, apps,
+        let mut active = Active { _input: input_stream, aux_input: aux_stream, outputs, app_captures, apps,
             input_device: self.input, input_config: self.input_config, input_channel: self.input_channel,
-            shared_aux, aux_generation, queue_ms: self.queue_ms, plugin_worker, health, outputs: stats,
-            controls, vocal_stats, pitch_monitor, plugin_timing, aux_timing, app_timing, timing };
+            shared_aux, aux_generation, queue_ms: self.queue_ms, plugin_worker, health,
+            controls, vocal_stats, pitch_monitor, plugin_timing, aux_timing, app_timing, output_timing, timing };
         active.refresh_app_timing();
+        active.refresh_output_timing();
         Ok(active)
     }
-}
-
-struct PlaybackStats {
-    mixes: Vec<usize>,
-    stats: Arc<OutputStats>,
 }
 
 struct ActiveAppCapture {
@@ -355,7 +388,7 @@ pub struct Active {
     // Drop devices, then join processing and release native plugin state on the loading thread.
     _input: Stream,
     aux_input: Option<AuxiliaryStream>,
-    _outputs: Vec<Stream>,
+    outputs: Vec<ActiveOutput>,
     app_captures: Vec<ActiveAppCapture>,
     apps: Vec<AppSource>,
     input_device: Device,
@@ -367,13 +400,12 @@ pub struct Active {
     plugin_worker: PluginWorker,
     pub health: Arc<Health>,
     pub controls: Arc<LiveControls>,
-    /// One set per physical playback endpoint, shared by its channel routes.
-    outputs: Vec<PlaybackStats>,
     pub vocal_stats: Arc<VocalStats>,
     pitch_monitor: PitchMonitor,
     plugin_timing: usize,
     aux_timing: usize,
     app_timing: usize,
+    output_timing: usize,
     pub timing: Vec<String>,
 }
 
@@ -421,25 +453,98 @@ where T: SizedSample + Send + 'static, f32: cpal::FromSample<T> {
     }, move |_| error_health.fail(Fault::Device), None)?)
 }
 
-fn output<T>(device: &Device, config: StreamConfig, maps: Vec<OutputMap>, mut reader: OutputReader, mut gains: PlaybackGains, health: Arc<Health>) -> Result<Stream>
+struct OutputPlayback {
+    maps: Vec<OutputMap>,
+    reader: OutputReader,
+    gains: PlaybackGains,
+    health: Arc<Health>,
+    route_health: Arc<Health>,
+    enabled: Arc<AtomicBool>,
+    activated: bool,
+}
+impl OutputPlayback {
+    fn render<T: Sample + cpal::FromSample<f32>>(&mut self, data: &mut [T], channels: usize) {
+        data.fill(T::EQUILIBRIUM);
+        if !self.enabled.load(Ordering::Acquire) || self.route_health.failed() || self.health.failed() { return; }
+        if data.len() % channels != 0 { self.health.fail(Fault::Routing); return; }
+        if !self.activated {
+            // Controls may have changed while the prepared stream emitted silence.
+            self.gains.snap_to_targets();
+            self.activated = true;
+        } else { self.gains.update(); }
+        for frame in data.chunks_exact_mut(channels) {
+            if !self.enabled.load(Ordering::Acquire) { break; }
+            // Consume even while muted. An output toggle must not replay a stale queue on unmute.
+            let packed = self.reader.next_frame(self.gains.next_gains());
+            for (channel, sample) in frame.iter_mut().enumerate() { *sample = T::from_sample(output_sample(&self.maps, channel, &packed)); }
+        }
+        if !self.enabled.load(Ordering::Acquire) || self.route_health.failed() || self.health.failed() { data.fill(T::EQUILIBRIUM); }
+    }
+}
+
+fn output<T>(device: &Device, config: StreamConfig, mut playback: OutputPlayback) -> Result<Stream>
 where T: SizedSample + cpal::FromSample<f32> + Send + 'static {
     let channels = usize::from(config.channels);
-    let error_health = health.clone();
-    Ok(device.build_output_stream::<T, _, _>(config, move |data, _| {
-        data.fill(T::EQUILIBRIUM);
-        if health.failed() { return; }
-        if data.len() % channels != 0 { health.fail(Fault::Routing); return; }
-        gains.update();
-        for frame in data.chunks_exact_mut(channels) {
-            // Consume even while muted. An output toggle must not replay a stale queue on unmute.
-            let packed = reader.next_frame(gains.next_gains());
-            for (channel, sample) in frame.iter_mut().enumerate() { *sample = T::from_sample(output_sample(&maps, channel, &packed)); }
-        }
-        if health.failed() { data.fill(T::EQUILIBRIUM); }
-    }, move |_| error_health.fail(Fault::Device), None)?)
+    let error_health = playback.health.clone();
+    Ok(device.build_output_stream::<T, _, _>(config, move |data, _| playback.render(data, channels),
+        move |_| error_health.fail(Fault::Device), None)?)
 }
 
 impl Active {
+    pub fn output_bindings(&self) -> &[OutputBinding] { self.plugin_worker.output_bindings() }
+
+    pub fn set_output_bindings(&mut self, mut next: Vec<OutputBinding>) -> Result<()> {
+        next.sort_by_key(|binding| binding.mix.index());
+        validate_output_bindings(&next, RouteMix::ALL.map(|mix| self.controls.has_mix(mix)))?;
+        if self.output_bindings() == next.as_slice() { return Ok(()); }
+        if self.health.failed() { return Err("audio path has failed; stop before editing outputs".into()); }
+        let host = cpal::host_from_id(cpal::HostId::Wasapi)?;
+        let endpoints = resolve_outputs(&host, &next, &self.outputs)?;
+        let mut streams = Vec::with_capacity(endpoints.len());
+        let mut writers = Vec::with_capacity(endpoints.len());
+        let mut retained = Vec::with_capacity(endpoints.len());
+        for (to, endpoint) in endpoints.into_iter().enumerate() {
+            if let Some(from) = self.outputs.iter().position(|output|
+                output.endpoint.device == endpoint.device && output.endpoint.routes == endpoint.routes) {
+                streams.push(None);
+                writers.push(None);
+                retained.push((from, to));
+            } else {
+                let (output, writer) = prepare_output(endpoint, self.input_config.sample_rate(), self.queue_ms,
+                    self.controls.clone(), self.health.clone())?;
+                // Prepared callbacks stay silent and leave their queues untouched.
+                output.stream.play()?;
+                streams.push(Some(output));
+                writers.push(Some(writer));
+            }
+        }
+        let result = self.plugin_worker.set_output_bindings(next.clone(), writers, retained.clone(), &self.controls);
+        if self.output_bindings() == next.as_slice() {
+            let mut old = std::mem::take(&mut self.outputs).into_iter().map(Some).collect::<Vec<_>>();
+            for (from, to) in retained { streams[to] = old[from].take(); }
+            self.outputs = streams.into_iter().map(|output| output.expect("committed playback group")).collect();
+            self.refresh_output_timing();
+            drop(old); // gates already closed by the worker; stop devices on this thread
+        }
+        result?;
+        if let Some(error) = self.health.error() { return Err(error.into()); }
+        Ok(())
+    }
+
+    fn refresh_output_timing(&mut self) {
+        let mut text = format!("Current playback streams: {}.\n", self.outputs.len());
+        for (index, output) in self.outputs.iter().enumerate() {
+            let endpoint = &output.endpoint;
+            text.push_str(&format!("Stream {index}: {}\n  {:?}; {} mix(es), shared queue target {:.2} ms + resampler delay {:.2} ms (excludes hardware and OS; NOT round-trip latency).\n  Driver buffer query: {:?} frames.\n",
+                endpoint.device, endpoint.config, endpoint.routes.len(), output.queue_ms, output.resampler_delay_ms, output.stream.buffer_size()));
+            for &(mix, map) in &endpoint.routes {
+                let binding = self.output_bindings().iter().find(|binding| binding.mix.index() == mix).expect("active output binding");
+                text.push_str(&format!("  Mix {mix}: {}; channels {:?}; map {map:?} (zero-based).\n", binding.output, binding.channels));
+            }
+        }
+        self.timing[self.output_timing] = text;
+    }
+
     pub fn aux_source(&self) -> Option<&AuxSource> { self.plugin_worker.aux_source() }
 
     pub fn set_aux_source(&mut self, next: Option<AuxSource>) -> Result<()> {
@@ -618,7 +723,8 @@ impl Active {
         route.apps = self.apps.clone();
         route.aux_input = self.aux_source().map(|source| source.input.clone());
         if let Some(source) = self.aux_source() { route.aux_channels.clone_from(&source.channels); }
-        let settings = self.controls.snapshot_into(&mut route);
+        let settings = route.set_output_bindings(self.output_bindings())
+            .and_then(|()| self.controls.snapshot_into(&mut route));
         let (worker, health) = self.stop_devices();
         settings?;
         if let Some(error) = health.error() { return Err(error.into()); }
@@ -628,10 +734,10 @@ impl Active {
     }
 
     fn stop_devices(self) -> (PluginWorker, Arc<Health>) {
-        let Self { _input, aux_input, _outputs, app_captures, plugin_worker, health, .. } = self;
+        let Self { _input, aux_input, outputs, app_captures, plugin_worker, health, .. } = self;
         drop(_input);
         drop(aux_input);
-        drop(_outputs);
+        drop(outputs);
         drop(app_captures);
         (plugin_worker, health)
     }
@@ -643,7 +749,8 @@ impl Active {
         let mut outputs = [None; MAX_MIXES];
         let mut limiters = [None; MAX_MIXES];
         for endpoint in &self.outputs {
-            for ((&mix, peak), limiter) in endpoint.mixes.iter().zip(endpoint.stats.take_peaks()).zip(endpoint.stats.take_limiters()) {
+            for (((mix, _), peak), limiter) in endpoint.endpoint.routes.iter().zip(endpoint.stats.take_peaks()).zip(endpoint.stats.take_limiters()) {
+                let mix = *mix;
                 outputs[mix] = Some(peak);
                 limiters[mix] = Some(limiter);
             }
@@ -682,9 +789,9 @@ impl Active {
         }
         for (index, endpoint) in self.outputs.iter().enumerate() {
             let stats = &endpoint.stats;
-            let peak = endpoint.mixes.iter().filter_map(|&mix| levels.outputs[mix]).fold(0.0_f32, f32::max);
+            let peak = endpoint.endpoint.routes.iter().filter_map(|&(mix, _)| levels.outputs[mix]).fold(0.0_f32, f32::max);
             text.push_str(&format!(" | stream{index}: peak={peak:.3} queue={} frames correction={}ppm underruns={} limited={}", stats.queue_frames.load(Ordering::Relaxed), stats.correction_ppm.load(Ordering::Relaxed), stats.underruns.load(Ordering::Relaxed), stats.limited_frames.load(Ordering::Relaxed)));
-            for &mix in &endpoint.mixes {
+            for &(mix, _) in &endpoint.endpoint.routes {
                 if let Some(limiter) = levels.limiters[mix] {
                     text.push_str(&format!(" mix{mix}_pre_limit={:.3} limiter_gr={:.1}dB", limiter.input_peak, limiter.reduction_db));
                 }
@@ -697,6 +804,63 @@ impl Active {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_output_waits_for_commit_and_snaps_the_latest_mute() {
+        let health = Arc::new(Health::default());
+        let route_health = Arc::new(Health::default());
+        let enabled = Arc::new(AtomicBool::new(false));
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0,
+            mixlive_effects::VocalConfig::default()).unwrap());
+        let (mut writer, reader) = bridge::channel(48000, 48000, 10, 1, health.clone()).unwrap();
+        let gains = PlaybackGains::new(48000, &[0], controls.clone()).unwrap();
+        let mut playback = OutputPlayback { maps: vec![OutputMap::Stereo(1, 0)], reader, gains,
+            health: health.clone(), route_health: route_health.clone(), enabled: enabled.clone(), activated: false };
+        for _ in 0..1536 { writer.push([0.25, 0.5, 0.0, 0.0, 0.0, 0.0]); }
+        let mut silent = [7.0_f32; 3072];
+        playback.render(&mut silent, 2);
+        assert_eq!(silent, [0.0; 3072]);
+        assert!(!playback.activated);
+        assert_eq!(playback.reader.stats.queue_frames.load(Ordering::Relaxed), 0);
+        controls.apply("mute output".parse().unwrap()).unwrap();
+        enabled.store(true, Ordering::Release);
+        playback.render(&mut silent, 2);
+        assert_eq!(silent, [0.0; 3072]);
+        assert!(playback.activated);
+        controls.apply("unmute output".parse().unwrap()).unwrap();
+        for _ in 0..1536 { writer.push([0.25, 0.5, 0.0, 0.0, 0.0, 0.0]); }
+        let mut audible = [7.0_f32; 2048];
+        playback.render(&mut audible, 2);
+        assert!((audible[2046] - 0.5).abs() < 0.001);
+        assert!((audible[2047] - 0.25).abs() < 0.001);
+        assert!(!health.failed() && !route_health.failed());
+        route_health.fail(Fault::Input);
+        audible.fill(7.0);
+        playback.render(&mut audible, 2);
+        assert_eq!(audible, [0.0; 2048]);
+        assert!(!health.failed());
+    }
+
+    #[test]
+    fn output_callback_keeps_unattached_and_retired_faults_private() {
+        let health = Arc::new(Health::default());
+        let route_health = Arc::new(Health::default());
+        let enabled = Arc::new(AtomicBool::new(false));
+        let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0,
+            mixlive_effects::VocalConfig::default()).unwrap());
+        let (_writer, reader) = bridge::channel(48000, 48000, 10, 1, health.clone()).unwrap();
+        let gains = PlaybackGains::new(48000, &[0], controls).unwrap();
+        let mut playback = OutputPlayback { maps: vec![OutputMap::Stereo(0, 1)], reader, gains,
+            health: health.clone(), route_health: route_health.clone(), enabled: enabled.clone(), activated: false };
+        health.fail(Fault::Device);
+        for active in [false, true] {
+            enabled.store(active, Ordering::Release);
+            let mut data = [7.0_f32; 128];
+            playback.render(&mut data, 2);
+            assert_eq!(data, [0.0; 128]);
+            assert!(!route_health.failed() && !playback.activated);
+        }
+    }
 
     #[test]
     fn shared_aux_tag_carries_one_channel_pair_and_a_distinct_generation() {

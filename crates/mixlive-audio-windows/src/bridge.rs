@@ -61,8 +61,7 @@ impl Health {
         let _ = self.fault.compare_exchange(0, fault as u8, Ordering::Relaxed, Ordering::Relaxed);
     }
     pub fn failed(&self) -> bool { self.fault.load(Ordering::Relaxed) != 0 }
-    /// Only the currently attached input forwards its first fault to route health.
-    #[cfg(any(windows, test))]
+    /// Only a currently attached source or output forwards its first fault to route health.
     pub(crate) fn propagate_to(&self, target: &Health) {
         let fault = self.fault.load(Ordering::Relaxed);
         if fault != 0 { let _ = target.fault.compare_exchange(0, fault, Ordering::Relaxed, Ordering::Relaxed); }

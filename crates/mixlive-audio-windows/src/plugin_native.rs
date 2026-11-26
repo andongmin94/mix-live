@@ -1,6 +1,6 @@
 //! One worker for the ordered vocal chain; no native plugin calls in device callbacks.
 use super::{ChainEdit, ChainFile, EffectSpec, LiveParameter, ResolvedPlugins};
-use crate::{bridge::{Fault, Health, OutputReader}, capture::{Capture, PreparedSourceChange, PreparedPitchChange, PreparedVoiceDelay, VoiceDelayLayout, CAPTURE_BLOCK}, config::{AuxSource, PitchConfig, PitchScale, MAX_APPS}, control::{AppControls, GainRamp, LiveControls}};
+use crate::{bridge::{Fault, Health, OutputReader}, capture::{Capture, CaptureOutput, PreparedOutputChange, PreparedSourceChange, PreparedPitchChange, PreparedVoiceDelay, VoiceDelayLayout, CAPTURE_BLOCK}, config::{AuxSource, OutputBinding, PitchConfig, PitchScale, MAX_APPS, validate_output_bindings}, control::{AppControls, GainRamp, LiveControls, RouteMix}};
 use mixlive_effects::{PreparedVocalChange, VocalConfig, VocalSettings};
 use mixlive_vst3::editor::flush_editor_changes;
 use rtrb::{Consumer, Producer, RingBuffer};
@@ -80,6 +80,7 @@ pub(crate) struct SourceFeeds {
     pub aux: AuxFeed,
     pub aux_source: Option<AuxSource>,
     pub apps: Vec<OutputReader>,
+    pub output_bindings: Vec<OutputBinding>,
 }
 
 struct Slot {
@@ -274,6 +275,7 @@ enum ProcessingChange {
     Vocal(Box<PreparedVocalChange>),
     Apps(AppChange),
     Aux(AuxChange),
+    Outputs(PreparedOutputChange),
 }
 impl ProcessingChange {
     fn apply(&mut self, capture: &mut Capture, processors: &mut Vec<Option<Processor>>, apps: &mut Vec<Option<OutputReader>>, aux: &mut AuxFeed) {
@@ -286,6 +288,7 @@ impl ProcessingChange {
             Self::Vocal(change) => capture.apply_vocal_change(change),
             Self::Apps(change) => change.apply(capture, apps),
             Self::Aux(change) => change.apply(capture, aux),
+            Self::Outputs(change) => capture.apply_output_change(change),
         }
     }
 }
@@ -327,6 +330,8 @@ pub(crate) struct PluginWorker {
     vocal_settings: VocalSettings,
     apps: Vec<Arc<AppControls>>,
     aux_source: Option<AuxSource>,
+    output_bindings: Vec<OutputBinding>,
+    output_groups: Vec<Vec<usize>>,
     pub description: String,
 }
 
@@ -437,10 +442,14 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
     let pitch_latency = capture.pitch_latency();
     let vocal_settings = capture.vocal_config().settings();
     let app_controls = capture.app_controls();
+    let output_groups = capture.output_groups();
+    validate_output_bindings(&feeds.output_bindings,
+        RouteMix::ALL.map(|mix| output_groups.iter().any(|group| group.contains(&mix.index()))))?;
     let mut owner = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots: Vec::new(),
         stopped: false, health: health.clone(), chain: Some(ChainControl { requests, retired: acknowledgments,
             layout, rate, capacity, latency: 0, pitch_latency, compensation: 0 }), pitch_config, vocal_settings,
-        apps: app_controls, aux_source: feeds.aux_source, description: String::new() };
+        apps: app_controls, aux_source: feeds.aux_source, output_bindings: feeds.output_bindings,
+        output_groups, description: String::new() };
     let mut processors = Vec::new();
     let mut total_latency = 0_u64;
     for (index, (plugin, bypassed)) in plugins.into_iter().enumerate() {
@@ -458,6 +467,12 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
     owner.refresh_description();
     let stop = owner.stop.clone();
     let worker_health = health.clone();
+    capture.set_outputs_enabled(true);
+    capture.propagate_output_health();
+    if let Some(error) = health.error() {
+        capture.set_outputs_enabled(false);
+        return Err(error.into());
+    }
     feeds.aux.enable(true);
     let mut state = ProcessingState { capture, processors, apps: feeds.apps.into_iter().map(Some).collect(),
         aux: feeds.aux, input: reader, requests: changes, retired, unreturned: None };
@@ -467,6 +482,7 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
         let mut app_buffers = [[[0.0; 2]; CAPTURE_BLOCK]; MAX_APPS];
         while !stop.load(Ordering::Relaxed) && !worker_health.failed() {
             state.aux.propagate_health(&worker_health);
+            state.capture.propagate_output_health();
             if worker_health.failed() { break; }
             // An idle queue is still a valid boundary. Native loading and allocation
             // are already complete, and the PDC bank changes with the processor order.
@@ -497,6 +513,7 @@ fn spawn(mut capture: Capture, plugins: Vec<(Plugin, Arc<AtomicBool>)>, rate: u3
             });
         }
         state.aux.enable(false);
+        state.capture.set_outputs_enabled(false);
         state
     }).map_err(|e| e.to_string())?);
     Ok((QueuedInput { writer, health }, owner))
@@ -562,6 +579,32 @@ impl PluginWorker {
     pub fn app_count(&self) -> usize { self.apps.len() }
 
     pub fn aux_source(&self) -> Option<&AuxSource> { self.aux_source.as_ref() }
+
+    pub fn output_bindings(&self) -> &[OutputBinding] { &self.output_bindings }
+
+    /// Prepare only endpoint producers. Source, mix, voice and native processing
+    /// retain their current storage and histories through this same worker boundary.
+    pub fn set_output_bindings(&mut self, next: Vec<OutputBinding>, outputs: Vec<Option<CaptureOutput>>,
+        retained: Vec<(usize, usize)>, controls: &LiveControls) -> Result<(), String> {
+        if self.health.failed() || self.stopped { return Err("audio path has stopped; cannot edit outputs".into()); }
+        validate_output_bindings(&next, RouteMix::ALL.map(|mix| controls.has_mix(mix)))?;
+        if self.thread.is_none() || self.chain.is_none() { return Err("no running audio processor".into()); }
+        let change = PreparedOutputChange::new(controls, &self.output_groups, outputs, retained)?;
+        let groups = change.output_groups();
+        let ProcessingChange::Outputs(retired) = self.exchange_change(ProcessingChange::Outputs(change))? else {
+            unreachable!("serialized output change acknowledgment");
+        };
+        if !retired.applied() {
+            return Err(format!("new output failed before attachment: {}",
+                retired.error().unwrap_or("output change was not applied")));
+        }
+        drop(retired);
+        // A runtime fault after application still leaves these as the actual bindings.
+        self.output_bindings = next;
+        self.output_groups = groups;
+        if let Some(error) = self.health.error() { return Err(error.into()); }
+        Ok(())
+    }
 
     /// Publish binding metadata only when the worker accepted both the new feed
     /// and its prepared routing plan. A later runtime error does not undo a commit.
