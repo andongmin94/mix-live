@@ -2,7 +2,7 @@
 //! Scene reads/writes do not resolve endpoints or load plugins. Existing files are never replaced.
 
 use mixlive_audio_windows::{
-    config::{AppSource, AuxSource, PitchConfig},
+    config::{AppSource, AuxSource, OutputBinding, PitchConfig},
     control::{LiveCommand, LiveControls},
     plugin::{ChainEdit, EffectSpec, LiveParameter, PluginArgs},
     scene::AudioScene,
@@ -84,6 +84,14 @@ impl Session {
             self.scene().and_then(|scene| scene.route.aux_input.as_ref().map(|input| AuxSource {
                 input: input.clone(), channels: scene.route.aux_channels.clone(),
             }))
+        }
+    }
+
+    pub fn output_bindings(&self) -> Vec<OutputBinding> {
+        if let Some(active) = &self.active {
+            active.output_bindings().to_vec()
+        } else {
+            self.scene().map_or_else(Vec::new, |scene| scene.route.output_bindings())
         }
     }
 
@@ -192,7 +200,7 @@ impl Session {
                 self.last_report = Instant::now();
                 self.last_meter = Instant::now();
                 self.active = Some(active);
-                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 AUX·앱 소스·믹서·보컬 설정과 VST3 상태를 저장할 수 있습니다.".into();
+                self.message = "실행 중 · 정지 후 새 Scene 저장으로 현재 AUX·앱 소스·출력·믹서·보컬 설정과 VST3 상태를 저장할 수 있습니다.".into();
                 Ok(())
             }
             Err(error) => self.fail("시작하지 못했습니다. 설정과 장치를 확인하세요.", error),
@@ -306,6 +314,33 @@ impl Session {
                 Ok(())
             }
             Err(error) => self.fail("AUX 변경을 완료하지 못했습니다.", error),
+        }
+    }
+
+    /// Prepare and retire playback streams outside mutable GPUI updates.
+    pub fn set_output_bindings(&mut self, bindings: Vec<OutputBinding>) -> Result<(), String> {
+        let Some(active) = &mut self.active else {
+            return self.fail("오디오 실행 중에만 출력을 변경할 수 있습니다.", "audio is not running");
+        };
+        let previous = active.output_bindings().to_vec();
+        let result = active.set_output_bindings(bindings);
+        self.timing = active.timing.clone();
+        if active.output_bindings() != previous {
+            // Shared endpoint regrouping can also replace a stream whose own mix
+            // binding is unchanged. Clear only the cached output measurement interval.
+            if let Some(levels) = &mut self.levels {
+                levels.outputs.fill(None);
+                levels.limiters.fill(None);
+            }
+            self.report.clear();
+        }
+        match result {
+            Ok(()) => {
+                self.error = None;
+                self.message = "출력 설정 적용 완료 · 현재 믹서·소스·보컬 설정을 유지합니다. 정지 후 새 Scene 저장으로 보존할 수 있습니다.".into();
+                Ok(())
+            }
+            Err(error) => self.fail("출력 변경을 완료하지 못했습니다.", error),
         }
     }
 
@@ -444,7 +479,7 @@ impl Session {
             Err(error) => return self.fail("오디오를 정지했지만 실행 상태를 저장하지 못했습니다.", error),
         };
         self.save_new(path, scene)?;
-        self.message = "정지 후 현재 AUX·앱 소스·믹서·보컬 설정과 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
+        self.message = "정지 후 현재 AUX·앱 소스·출력·믹서·보컬 설정과 모든 VST3 상태를 새 Scene에 저장했습니다.".into();
         Ok(())
     }
 
@@ -561,6 +596,13 @@ mod tests {
         assert!(session.set_aux_source(None).is_err());
         assert!(session.set_aux_source(Some(AuxSource { input: "other-device".into(), channels: vec![1] })).is_err());
         assert_eq!(session.aux_source(), Some(aux));
+        let outputs = session.output_bindings();
+        assert_eq!(outputs, session.scene().unwrap().route.output_bindings());
+        let mut changed = outputs.clone();
+        changed[0].output = "other-output".into();
+        changed[0].channels = vec![2, 1];
+        assert!(session.set_output_bindings(changed).is_err());
+        assert_eq!(session.output_bindings(), outputs);
         assert!(session.device_details.is_empty());
         assert!(session.report.is_empty());
         session.poll().unwrap();
@@ -573,6 +615,7 @@ mod tests {
         assert!(session.vocal_settings().is_none());
         assert!(session.apps().is_empty());
         assert!(session.aux_source().is_none());
+        assert!(session.output_bindings().is_empty());
         assert!(session.error.is_some());
     }
 
@@ -605,6 +648,8 @@ mod tests {
         assert!(session.remove_app(0).is_err());
         assert!(session.aux_source().is_none());
         assert!(session.set_aux_source(Some(AuxSource { input: "not-running".into(), channels: vec![1, 2] })).is_err());
+        assert!(session.output_bindings().is_empty());
+        assert!(session.set_output_bindings(Vec::new()).is_err());
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("no-live-scene.json");
         assert!(session.stop_and_save(path.clone()).is_err());

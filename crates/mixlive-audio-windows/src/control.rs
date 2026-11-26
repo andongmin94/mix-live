@@ -702,12 +702,14 @@ impl GainRamp {
 
 /// Route-order gains for one physical output stream, applied AFTER its clock queue/resampler.
 /// A shared endpoint ramps its lanes on its one clock; distinct devices have their own ramps.
+#[cfg(any(windows, test))]
 pub(crate) struct PlaybackGains {
     controls: Arc<LiveControls>,
     mixes: [usize; MAX_MIXES],
     count: usize,
     ramps: [GainRamp; MAX_MIXES],
 }
+#[cfg(any(windows, test))]
 impl PlaybackGains {
     pub fn new(rate: u32, mixes: &[usize], controls: Arc<LiveControls>) -> Result<Self, String> {
         if !(8_000..=192_000).contains(&rate) || !(1..=MAX_MIXES).contains(&mixes.len())
@@ -725,6 +727,18 @@ impl PlaybackGains {
     pub fn update(&mut self) {
         let targets = self.controls.output_targets();
         for lane in 0..self.count { self.ramps[lane].set(targets[self.mixes[lane]]); }
+    }
+    /// A newly attached stream starts from current controls, including mutes
+    /// changed while its device was being prepared. Retained streams do not snap.
+    pub(crate) fn snap_to_targets(&mut self) {
+        let targets = self.controls.output_targets();
+        for lane in 0..self.count {
+            let ramp = &mut self.ramps[lane];
+            ramp.value = targets[self.mixes[lane]];
+            ramp.target = ramp.value;
+            ramp.step = 0.0;
+            ramp.left = 0;
+        }
     }
     pub fn next_gains(&mut self) -> [f32; MAX_MIXES] { std::array::from_fn(|lane| self.ramps[lane].next_gain()) }
 }
@@ -1141,6 +1155,29 @@ mod tests {
             for _ in 1..frames { ramp.next_gain(); }
             assert_eq!(ramp.next_gain(), 0.1);
         }
+    }
+
+    #[test]
+    fn playback_gain_activation_uses_current_targets_without_restarting_retained_ramps() {
+        let controls = Arc::new(LiveControls::new(-6.0, [Some(0.0), None, Some(-12.0)], false, 0, VocalConfig::default()).unwrap());
+        let mut fresh = PlaybackGains::new(48_000, &[2, 0], controls.clone()).unwrap();
+        let mut retained = PlaybackGains::new(48_000, &[0], controls.clone()).unwrap();
+        controls.apply("gain monitor -12".parse().unwrap()).unwrap();
+        retained.update();
+        for _ in 0..37 { retained.next_gains(); }
+        let mut reference = retained.ramps[0];
+        controls.apply("mute broadcast".parse().unwrap()).unwrap();
+        fresh.snap_to_targets();
+        assert_eq!(fresh.next_gains(), [0.0, controls.output_targets()[0], 0.0]);
+        for _ in 0..240 {
+            assert_eq!(retained.next_gains()[0], reference.next_gain());
+        }
+        controls.apply("unmute broadcast".parse().unwrap()).unwrap();
+        fresh.update();
+        let first = fresh.next_gains()[0];
+        assert!(first > 0.0 && first < controls.output_targets()[2]);
+        for _ in 1..240 { fresh.next_gains(); }
+        assert_eq!(fresh.next_gains()[0], controls.output_targets()[2]);
     }
 
     #[test]

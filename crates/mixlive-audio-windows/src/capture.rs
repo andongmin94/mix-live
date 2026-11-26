@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}};
 use mixlive_core::{ChannelLayout, Engine, Input, Mix, Scene, Send, Source};
 #[cfg(any(windows, test))]
 use mixlive_core::SendDelays;
@@ -8,6 +8,89 @@ use mixlive_effects::{PreparedVocalChange, VocalConfig};
 use crate::{bridge::{Fault, Health, OutputWriter}, config::{MAX_APPS, MAX_MIXES, PitchConfig}, pitch_correction::PitchCorrector, control::{AppControls, GainRamp, LiveControls, RouteMix, RouteSource, MAX_SOURCES, MAX_ROUTES}};
 
 pub const CAPTURE_BLOCK: usize = 256;
+
+/// One physical playback group. Its reader, gain ramps and limiter stay in the
+/// device callback; the worker owns only this producer and its compact mix lanes.
+pub struct CaptureOutput {
+    writer: OutputWriter,
+    mixes: Vec<usize>,
+    health: Arc<Health>,
+    enabled: Arc<AtomicBool>,
+}
+impl CaptureOutput {
+    /// Mix indices are logical slots until Capture or a prepared change maps them.
+    pub fn new(writer: OutputWriter, mixes: Vec<usize>, health: Arc<Health>, enabled: Arc<AtomicBool>) -> Self {
+        Self { writer, mixes, health, enabled }
+    }
+
+    fn map_mixes(&mut self, slots: &[usize]) -> Result<(), String> {
+        if self.mixes.len() != self.writer.mix_count() {
+            return Err("endpoint mix bindings do not match their clock bridges".into());
+        }
+        for mix in &mut self.mixes {
+            *mix = slots.iter().position(|slot| slot == mix).ok_or("output mix is not active")?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_output_partition<'a>(groups: impl IntoIterator<Item = &'a [usize]>, slots: &[usize]) -> Result<(), String> {
+    let mut seen = [false; MAX_MIXES];
+    for group in groups {
+        if group.is_empty() { return Err("an output group must carry at least one active mix".into()); }
+        for &mix in group {
+            if !slots.contains(&mix) || seen[mix] {
+                return Err("output groups must carry each active mix exactly once".into());
+            }
+            seen[mix] = true;
+        }
+    }
+    if slots.is_empty() || slots.iter().any(|&mix| !seen[mix]) {
+        return Err("output groups must carry each active mix exactly once".into());
+    }
+    Ok(())
+}
+
+/// Prepared and retired output storage uses the existing worker handoff. Empty
+/// next slots receive whole retained groups without dropping their producers.
+#[cfg(any(windows, test))]
+pub(crate) struct PreparedOutputChange {
+    outputs: Vec<Option<CaptureOutput>>,
+    current_groups: Vec<Vec<usize>>,
+    next_groups: Vec<Vec<usize>>,
+    retained: Vec<(usize, usize)>,
+    applied: bool,
+    error: Option<&'static str>,
+}
+
+#[cfg(any(windows, test))]
+impl PreparedOutputChange {
+    pub(crate) fn new(controls: &LiveControls, current_groups: &[Vec<usize>], mut next: Vec<Option<CaptureOutput>>,
+        retained: Vec<(usize, usize)>) -> Result<Self, String> {
+        let slots: Vec<_> = controls.mixes().map(RouteMix::index).collect();
+        validate_output_partition(current_groups.iter().map(Vec::as_slice), &slots)?;
+        let mut groups: Vec<_> = next.iter().map(|output| output.as_ref().map(|output| output.mixes.as_slice())).collect();
+        let mut seen = [false; MAX_MIXES];
+        for &(from, to) in &retained {
+            let current = current_groups.get(from).ok_or("retained output is outside the current groups")?;
+            let destination = groups.get_mut(to).ok_or("retained output is outside the next groups")?;
+            if seen[from] || destination.is_some() { return Err("retained output mappings must be unique empty slots".into()); }
+            seen[from] = true;
+            *destination = Some(current.as_slice());
+        }
+        if groups.iter().any(Option::is_none) { return Err("next output group has no prepared or retained producer".into()); }
+        let next_groups = groups.iter().flatten().map(|group| group.to_vec()).collect();
+        validate_output_partition(groups.into_iter().flatten(), &slots)?;
+        for output in next.iter_mut().flatten() { output.map_mixes(&slots)?; }
+        let current_groups = current_groups.iter().map(|group| group.iter().map(|mix|
+            slots.iter().position(|slot| slot == mix).expect("validated current output mix")).collect()).collect();
+        Ok(Self { outputs: next, current_groups, next_groups, retained, applied: false, error: None })
+    }
+
+    pub(crate) fn applied(&self) -> bool { self.applied }
+    pub(crate) fn error(&self) -> Option<&'static str> { self.error }
+    pub(crate) fn output_groups(&self) -> Vec<Vec<usize>> { self.next_groups.clone() }
+}
 
 /// Immutable routing information copied before Capture moves to the worker.
 /// Preparing a replacement only allocates on the control thread.
@@ -248,12 +331,12 @@ pub struct Capture {
     route_count: usize,
     route_ramps: [GainRamp; MAX_ROUTES],
     route_envelopes: [[f32; CAPTURE_BLOCK]; MAX_ROUTES],
-    outputs: Vec<(OutputWriter, Vec<usize>)>,
+    outputs: Vec<Option<CaptureOutput>>,
     health: Arc<Health>,
     pub vocal_stats: Arc<VocalStats>,
 }
 impl Capture {
-    pub fn new(vocal: VocalChain, sample_rate: u32, mut outputs: Vec<(OutputWriter, Vec<usize>)>, health: Arc<Health>, controls: Arc<LiveControls>) -> Result<Self, String> {
+    pub fn new(vocal: VocalChain, sample_rate: u32, mut outputs: Vec<CaptureOutput>, health: Arc<Health>, controls: Arc<LiveControls>) -> Result<Self, String> {
         let mix_slots: Vec<_> = controls.mixes().map(RouteMix::index).collect();
         let mix_count = mix_slots.len();
         if !(8_000..=192_000).contains(&sample_rate) {
@@ -262,15 +345,9 @@ impl Capture {
         if vocal.config() != controls.vocal_config() {
             return Err("vocal controls do not match the prepared processing configuration".into());
         }
-        if outputs.is_empty() || outputs.iter().any(|(writer, mixes)| {
-            mixes.len() != writer.mix_count() || mixes.iter().any(|mix| !mix_slots.contains(mix))
-        }) { return Err("endpoint mix bindings do not match their clock bridges".into()); }
+        validate_output_partition(outputs.iter().map(|output| output.mixes.as_slice()), &mix_slots)?;
         // Map stable logical output slots to the compact core indices once, before callbacks.
-        for (_, bindings) in &mut outputs {
-            for mix in bindings {
-                *mix = mix_slots.iter().position(|slot| *slot == *mix).expect("validated output mix");
-            }
-        }
+        for output in &mut outputs { output.map_mixes(&mix_slots)?; }
         let app_controls = controls.app_controls();
         let engine = routing_engine(controls.has_aux(), app_controls.len(), mix_count)?;
         let source_slots = source_slots(controls.has_aux(), app_controls.len());
@@ -282,7 +359,7 @@ impl Capture {
         let source_trims = controls.trim_targets(&app_controls).map(|gain| GainRamp::new(sample_rate, gain));
         Ok(Self { engine, voice_latency: 0, compensation: 0, vocal, pitch: None, pitch_config: PitchConfig::default(), corrected_mic: [0.0; CAPTURE_BLOCK], voice_left: [0.0; CAPTURE_BLOCK], voice_right: [0.0; CAPTURE_BLOCK],
             aux_enabled: controls.has_aux(), aux_left: [0.0; CAPTURE_BLOCK], aux_right: [0.0; CAPTURE_BLOCK],
-            app_controls, app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs,
+            app_controls, app_buffers: [[[0.0; CAPTURE_BLOCK]; 2]; MAX_APPS], outputs: outputs.into_iter().map(Some).collect(),
             controls, source_slots, mix_slots, source_mutes, source_trims, route_count, route_ramps, route_envelopes: [[0.0; CAPTURE_BLOCK]; MAX_ROUTES], health,
             vocal_stats: Arc::new(VocalStats::default()) })
     }
@@ -294,6 +371,43 @@ impl Capture {
 
     #[cfg(any(windows, test))]
     pub(crate) fn app_controls(&self) -> Vec<Arc<AppControls>> { self.app_controls.clone() }
+
+    /// Control-thread snapshot used once before the worker starts.
+    #[cfg(any(windows, test))]
+    pub(crate) fn output_groups(&self) -> Vec<Vec<usize>> {
+        self.outputs.iter().flatten().map(|output| output.mixes.iter().map(|&mix| self.mix_slots[mix]).collect()).collect()
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn set_outputs_enabled(&self, enabled: bool) {
+        for output in self.outputs.iter().flatten() { output.enabled.store(enabled, Ordering::Release); }
+    }
+
+    /// The worker also calls this while input is idle. An unattached or retired
+    /// callback can fail only its private bridge, never the current route.
+    pub(crate) fn propagate_output_health(&self) {
+        for output in self.outputs.iter().flatten() {
+            if output.enabled.load(Ordering::Acquire) { output.health.propagate_to(&self.health); }
+        }
+    }
+
+    #[cfg(any(windows, test))]
+    pub(crate) fn apply_output_change(&mut self, prepared: &mut PreparedOutputChange) {
+        self.propagate_output_health();
+        if let Some(error) = self.health.error() { prepared.error = Some(error); return; }
+        if self.outputs.len() != prepared.current_groups.len() || self.outputs.iter().zip(&prepared.current_groups)
+            .any(|(output, mixes)| output.as_ref().is_none_or(|output| output.mixes != *mixes)) {
+            prepared.error = Some("output groups changed before attachment"); return;
+        }
+        if let Some(error) = prepared.outputs.iter().flatten().find_map(|output| output.health.error()) {
+            prepared.error = Some(error); return;
+        }
+        for &(from, to) in &prepared.retained { prepared.outputs[to] = self.outputs[from].take(); }
+        self.set_outputs_enabled(false);
+        std::mem::swap(&mut self.outputs, &mut prepared.outputs);
+        self.set_outputs_enabled(true);
+        prepared.applied = true;
+    }
 
     /// The worker applies source identity, routing and histories at one block boundary.
     /// Retained ramps are copied before swapping arrays so compacting indices cannot
@@ -480,16 +594,20 @@ impl Capture {
             let peak = block.iter().fold(0.0_f32, |p, x| p.max(x.abs()));
             self.health.input_peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
             self.vocal_stats.record(meters);
-            for (writer, mixes) in &mut self.outputs {
+            for output in self.outputs.iter_mut().flatten() {
+                if !output.enabled.load(Ordering::Acquire) { continue; }
                 for frame in 0..block.len() {
+                    if !output.enabled.load(Ordering::Acquire) { break; }
                     let mut packed = [0.0; MAX_MIXES * 2];
-                    for (lane, mix) in mixes.iter().enumerate() {
+                    for (lane, mix) in output.mixes.iter().enumerate() {
                         let Some(output) = self.engine.output(*mix) else { self.health.fail(Fault::Routing); return; };
                         packed[lane * 2] = output.left[frame]; packed[lane * 2 + 1] = output.right[frame];
                     }
-                    writer.push(packed);
+                    output.writer.push(packed);
                 }
             }
+            self.propagate_output_health();
+            if self.health.failed() { return; }
             // Publish completion only after every output received this block.
             self.health.captured_frames.fetch_add(block.len() as u64, Ordering::Release);
         }

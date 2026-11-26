@@ -10,6 +10,8 @@ mod draft;
 #[cfg(windows)]
 mod form;
 #[cfg(windows)]
+mod output_editor;
+#[cfg(windows)]
 mod parameter_editor;
 #[cfg(windows)]
 mod pitch_editor;

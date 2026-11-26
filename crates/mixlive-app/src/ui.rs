@@ -15,7 +15,7 @@ use gpui_deck::{
     Button, Root, ScrollArea, SelectItem, SelectState, Slider, SliderEvent, SliderState, SliderThumb, StyledExt as _, Switch,
 };
 use mixlive_audio_windows::control::{GainTarget, LiveCommand, MuteTarget, RouteMix, RouteSource};
-use mixlive_audio_windows::config::{AppSource, AuxSource, PitchConfig, MAX_APPS};
+use mixlive_audio_windows::config::{AppSource, AuxSource, OutputBinding, PitchConfig, MAX_APPS};
 use mixlive_audio_windows::devices::{AppInfo, DeviceInfo};
 use mixlive_audio_windows::plugin::{ChainEdit, EffectSpec, LiveParameter};
 use mixlive_audio_windows::windows::{device_catalog, list_apps};
@@ -24,6 +24,7 @@ use mixlive_effects::{VocalParameter, VocalSettings};
 use crate::{
     aux_editor::{AuxEditor, AuxEvent},
     form::{FormEvent, SceneForm, select_control, selected},
+    output_editor::{OutputEditor, OutputEvent},
     parameter_editor::{ParameterEditor, ParameterEvent},
     pitch_editor::{PitchEditor, PitchEvent},
     session::Session,
@@ -121,6 +122,8 @@ enum Operation {
     RemoveApp(usize),
     AuxDevices,
     SetAux(Option<AuxSource>),
+    OutputDevices,
+    SetOutputs(Vec<OutputBinding>),
     Close,
 }
 
@@ -142,6 +145,8 @@ pub struct MixLive {
     vocal_subscription: Option<Subscription>,
     aux_editor: Option<Entity<AuxEditor>>,
     aux_subscription: Option<Subscription>,
+    output_editor: Option<Entity<OutputEditor>>,
+    output_subscription: Option<Subscription>,
     installed_plugins: Option<InstalledPlugins>,
     available_apps: Option<AvailableApps>,
     scanning_plugins: bool,
@@ -234,6 +239,8 @@ impl MixLive {
             vocal_subscription: None,
             aux_editor: None,
             aux_subscription: None,
+            output_editor: None,
+            output_subscription: None,
             installed_plugins: None,
             available_apps: None,
             scanning_plugins: false,
@@ -658,6 +665,42 @@ impl MixLive {
         self.workspace_scroll.set_offset(Default::default());
     }
 
+    fn install_output_editor(&mut self, devices: Vec<DeviceInfo>, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.session.output_bindings();
+        if let Some(editor) = &self.output_editor {
+            editor.update(cx, |editor, cx| {
+                editor.set_devices(devices, window, cx);
+                editor.set_current(current, cx);
+            });
+            return;
+        }
+        let editor = cx.new(|cx| OutputEditor::new(current, devices, window, cx));
+        self.output_subscription = Some(cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
+            match event {
+                OutputEvent::Apply(bindings) => this.perform(Operation::SetOutputs(bindings.clone()), window, cx),
+                OutputEvent::Refresh => this.perform(Operation::OutputDevices, window, cx),
+                OutputEvent::Close if this.busy.is_none() => {
+                    this.output_editor = None;
+                    this.output_subscription = None;
+                    cx.notify();
+                }
+                OutputEvent::Close => {}
+            }
+        }));
+        self.output_editor = Some(editor);
+        self.workspace_scroll.set_offset(Default::default());
+    }
+
+    fn open_output_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some() || self.picking || !self.session.running() { return; }
+        if self.output_editor.is_none() {
+            self.perform(Operation::OutputDevices, window, cx);
+        } else {
+            self.workspace_scroll.set_offset(Default::default());
+            cx.notify();
+        }
+    }
+
     fn perform(&mut self, operation: Operation, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy.is_some() {
             return;
@@ -674,7 +717,7 @@ impl MixLive {
         {
             return;
         }
-        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_) | Operation::SetVocalSettings(_) | Operation::RefreshApps | Operation::AddApp(_) | Operation::RemoveApp(_) | Operation::AuxDevices | Operation::SetAux(_));
+        let live_operation = matches!(operation, Operation::Editor { .. } | Operation::Parameters { .. } | Operation::SetParameter { .. } | Operation::EditChain(_) | Operation::SetPitch(_) | Operation::SetVocalSettings(_) | Operation::RefreshApps | Operation::AddApp(_) | Operation::RemoveApp(_) | Operation::AuxDevices | Operation::SetAux(_) | Operation::OutputDevices | Operation::SetOutputs(_));
         if live_operation && (!self.session.running() || self.picking) {
             return;
         }
@@ -694,6 +737,8 @@ impl MixLive {
             Operation::RemoveApp(_) => "앱 삭제 중",
             Operation::AuxDevices => "AUX 장치 조회 중",
             Operation::SetAux(_) => "AUX 변경 중",
+            Operation::OutputDevices => "출력 장치 조회 중",
+            Operation::SetOutputs(_) => "출력 변경 중",
         });
         if matches!(operation, Operation::EditChain(_)) {
             // Parameter events capture a slot index. A topology change invalidates that selection.
@@ -711,6 +756,8 @@ impl MixLive {
             self.vocal_subscription = None;
             self.aux_editor = None;
             self.aux_subscription = None;
+            self.output_editor = None;
+            self.output_subscription = None;
             self.available_apps = None;
         } else if let Some(editor) = &self.parameter_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
@@ -722,6 +769,9 @@ impl MixLive {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
         if let Some(editor) = &self.aux_editor {
+            editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
+        }
+        if let Some(editor) = &self.output_editor {
             editor.update(cx, |editor, cx| editor.set_busy(true, window, cx));
         }
         if let Some(available) = &self.available_apps {
@@ -739,6 +789,7 @@ impl MixLive {
             let mut parameters = None;
             let mut apps = None;
             let mut aux_devices = None;
+            let mut output_devices = None;
             let catalog = match &operation {
                 Operation::Devices | Operation::EditDevices => {
                     Some(device_catalog().map_err(|error| error.to_string()))
@@ -791,6 +842,14 @@ impl MixLive {
                 }
                 Operation::SetAux(source) => {
                     let _ = session.set_aux_source(source.clone());
+                    None
+                }
+                Operation::OutputDevices => {
+                    output_devices = Some(device_catalog().map(|catalog| catalog.outputs).map_err(|error| error.to_string()));
+                    None
+                }
+                Operation::SetOutputs(bindings) => {
+                    let _ = session.set_output_bindings(bindings.clone());
                     None
                 }
                 Operation::StopAndSave(path) => {
@@ -849,6 +908,18 @@ impl MixLive {
                             }
                         }
                     }
+                    if let Some(devices) = output_devices {
+                        match devices {
+                            Ok(devices) => {
+                                this.session.error = None;
+                                this.install_output_editor(devices, window, cx);
+                            }
+                            Err(error) => {
+                                this.session.message = "출력 장치 목록을 읽지 못했습니다. 연결을 확인한 뒤 다시 조회하세요.".into();
+                                this.session.error = Some(error);
+                            }
+                        }
+                    }
                     if let Some(available) = &this.available_apps {
                         for select in [&available.picker, &available.channels] {
                             select.update(cx, |state, cx| state.set_disabled(false, window, cx));
@@ -869,6 +940,12 @@ impl MixLive {
                     if let Some(editor) = &this.aux_editor {
                         editor.update(cx, |editor, cx| {
                             editor.set_current(this.session.aux_source(), cx);
+                            editor.set_busy(false, window, cx);
+                        });
+                    }
+                    if let Some(editor) = &this.output_editor {
+                        editor.update(cx, |editor, cx| {
+                            editor.set_current(this.session.output_bindings(), cx);
                             editor.set_busy(false, window, cx);
                         });
                     }
@@ -1433,31 +1510,21 @@ impl MixLive {
             .flex_1()
             .min_w_0()
             .gap_4()
-            .child(section_title("03", "목적지"))
-            .child(device(
-                "주 출력",
-                &route.output,
-                format!("출력 채널 {}", channels(&route.output_channels)),
-            ));
-        if let Some(send) = &route.send {
-            destinations = destinations.child(device(
-                "추가 송출",
-                send,
-                format!("출력 채널 {}", channels(&route.send_channels)),
-            ));
-        } else {
-            destinations = destinations.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(MUTED))
-                    .child("추가 송출 미선택"),
-            );
+            .child(section_title("03", "목적지"));
+        let bindings = self.session.output_bindings();
+        for mix in RouteMix::ALL {
+            let label = match mix { RouteMix::Output => "주 출력", RouteMix::Send => "추가 송출", RouteMix::Broadcast => "방송 송출" };
+            if let Some(binding) = bindings.iter().find(|binding| binding.mix == mix) {
+                destinations = destinations.child(device(label, &binding.output,
+                    format!("출력 채널 {}", channels(&binding.channels))));
+            } else {
+                destinations = destinations.child(div().text_sm().text_color(rgb(MUTED)).child(format!("{label} 미선택")));
+            }
         }
-        if let Some(broadcast) = &route.broadcast {
-            destinations = destinations.child(device("방송 송출", broadcast,
-                format!("출력 채널 {}", channels(&route.broadcast_channels))));
-        } else {
-            destinations = destinations.child(div().text_sm().text_color(rgb(MUTED)).child("방송 송출 미선택"));
+        if self.session.running() {
+            destinations = destinations.child(button("edit-live-outputs", "실행 중 출력 설정", false)
+                .disabled(self.busy.is_some() || self.picking)
+                .on_click(cx.listener(|this, _, window, cx| this.open_output_editor(window, cx))));
         }
         destinations = destinations.child(
             button("edit-devices", "장치·출력 설정", false)
@@ -1892,6 +1959,11 @@ impl Render for MixLive {
             body = body.child(form.clone());
         } else {
             if self.session.running()
+                && let Some(editor) = &self.output_editor
+            {
+                body = body.child(editor.clone());
+            }
+            if self.session.running()
                 && let Some(editor) = &self.aux_editor
             {
                 body = body.child(editor.clone());
@@ -1926,7 +1998,7 @@ impl Render for MixLive {
             .child(self.header(cx))
             .child(body)
             .child(div().flex_shrink_0().px_7().py_3().border_t_1().border_color(rgb(BORDER)).text_xs().text_color(rgb(MUTED))
-                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 AUX·앱 소스·믹서·보컬 설정과 VST3 상태를 보존합니다."))
+                .child("일반 정지는 변경값을 버립니다. 정지 후 새 Scene 저장을 선택하면 현재 AUX·앱 소스·출력·믹서·보컬 설정과 VST3 상태를 보존합니다."))
     }
 }
 
@@ -1981,7 +2053,7 @@ fn source_name(source: RouteSource, apps: &[AppSource]) -> String {
     }
 }
 
-fn mix_name(mix: RouteMix) -> &'static str {
+pub(crate) fn mix_name(mix: RouteMix) -> &'static str {
     match mix {
         RouteMix::Output => "모니터",
         RouteMix::Send => "통화 송출",

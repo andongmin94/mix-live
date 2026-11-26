@@ -5,9 +5,16 @@ use std::time::Instant;
 
 const TEST_AUX_TAG: u64 = 0x1_0100;
 
-fn test_feeds(has_aux: bool, apps: Vec<OutputReader>) -> SourceFeeds {
+fn test_feeds(has_aux: bool, apps: Vec<OutputReader>, mixes: &[usize]) -> SourceFeeds {
     SourceFeeds { aux: if has_aux { AuxFeed::Shared(TEST_AUX_TAG) } else { AuxFeed::Disabled },
-        aux_source: has_aux.then(|| AuxSource { input: "fixture-aux".into(), channels: vec![1, 2] }), apps }
+        aux_source: has_aux.then(|| AuxSource { input: "fixture-aux".into(), channels: vec![1, 2] }), apps,
+        output_bindings: mixes.iter().enumerate().map(|(lane, &mix)| OutputBinding {
+            mix: RouteMix::ALL[mix], output: "fixture-output".into(), channels: vec![(lane * 2 + 1) as u16, (lane * 2 + 2) as u16],
+        }).collect() }
+}
+
+fn test_output(writer: crate::bridge::OutputWriter, mixes: Vec<usize>, health: &Arc<Health>) -> CaptureOutput {
+    CaptureOutput::new(writer, mixes, health.clone(), Arc::new(AtomicBool::new(true)))
 }
 
 fn fixture(name: &str) -> EffectSpec {
@@ -38,15 +45,150 @@ fn capture_queue_rejects_overflow_and_invalid_input_without_waiting() {
 }
 
 #[test]
+fn output_changes_reject_failed_preparation_and_forward_only_current_idle_faults() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], false, 0, VocalConfig::default()).unwrap());
+    let old_health = Arc::new(Health::default());
+    let old_gate = Arc::new(AtomicBool::new(false));
+    let (old_writer, _old_reader) = channel(48000, 48000, 10, 1, old_health.clone()).unwrap();
+    let retained_health = Arc::new(Health::default());
+    let retained_gate = Arc::new(AtomicBool::new(false));
+    let (retained_writer, _retained_reader) = channel(48000, 48000, 10, 1, retained_health.clone()).unwrap();
+    let ports = vec![CaptureOutput::new(old_writer, vec![0], old_health.clone(), old_gate.clone()),
+        CaptureOutput::new(retained_writer, vec![2], retained_health, retained_gate.clone())];
+    let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        ports, health.clone(), controls.clone()).unwrap();
+    let mut feeds = test_feeds(false, vec![], &[0, 2]);
+    feeds.output_bindings[1].output = "fixture-broadcast".into();
+    feeds.output_bindings[1].channels = vec![1, 2];
+    let original = feeds.output_bindings.clone();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), feeds).unwrap();
+    assert!(old_gate.load(Ordering::Acquire) && retained_gate.load(Ordering::Acquire));
+    let mut next = original.clone();
+    next[0].output = "replacement-monitor".into();
+    let failed = Arc::new(Health::default());
+    let failed_gate = Arc::new(AtomicBool::new(false));
+    let (writer, _reader) = channel(48000, 44100, 10, 1, failed.clone()).unwrap();
+    failed.fail(Fault::Device);
+    let port = CaptureOutput::new(writer, vec![0], failed, failed_gate.clone());
+    let error = worker.set_output_bindings(next.clone(), vec![Some(port), None], vec![(1, 1)], &controls).unwrap_err();
+    assert!(error.contains("before attachment"));
+    assert_eq!(worker.output_bindings(), original);
+    assert!(!health.failed() && !failed_gate.load(Ordering::Acquire));
+    assert!(old_gate.load(Ordering::Acquire) && retained_gate.load(Ordering::Acquire));
+
+    let current = Arc::new(Health::default());
+    let current_gate = Arc::new(AtomicBool::new(false));
+    let (writer, _reader) = channel(48000, 44100, 10, 1, current.clone()).unwrap();
+    let port = CaptureOutput::new(writer, vec![0], current.clone(), current_gate.clone());
+    worker.set_output_bindings(next.clone(), vec![Some(port), None], vec![(1, 1)], &controls).unwrap();
+    assert_eq!(worker.output_bindings(), next);
+    assert_eq!(worker.output_groups, vec![vec![0], vec![2]]);
+    assert!(!old_gate.load(Ordering::Acquire));
+    assert!(current_gate.load(Ordering::Acquire) && retained_gate.load(Ordering::Acquire));
+    old_health.fail(Fault::Overflow);
+    // A subsequent acknowledged boundary establishes that the detached failure
+    // is ignored, without relying on a scheduling sleep or a hardware callback.
+    worker.set_output_bindings(next.clone(), vec![None, None], vec![(0, 0), (1, 1)], &controls).unwrap();
+    assert!(!health.failed());
+    current.fail(Fault::Resampler);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !health.failed() && Instant::now() < deadline { thread::sleep(Duration::from_millis(1)); }
+    assert_eq!(health.error(), Some("resampler failed"));
+    assert_eq!(health.captured_frames.load(Ordering::Acquire), 0);
+    assert_eq!(worker.output_bindings(), next);
+    assert!(worker.finish(None).unwrap_err().contains("resampler failed"));
+    assert!(!current_gate.load(Ordering::Acquire) && !retained_gate.load(Ordering::Acquire));
+}
+
+#[test]
+#[ignore = "requires existing MIXLIVE_GAIN_VST3 fixture; no devices/windows"]
+fn native_output_replacement_keeps_voice_aux_apps_and_delivers_to_the_new_writer() {
+    let health = Arc::new(Health::default());
+    let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, Some(0.0)], true, 1, VocalConfig::default()).unwrap());
+    for command in ["route aux output on", "route aux broadcast on", "route app1 output on", "route app1 broadcast on"] {
+        controls.apply(command.parse().unwrap()).unwrap();
+    }
+    let retained_app = controls.app_controls()[0].clone();
+    let monitor_health = Arc::new(Health::default());
+    let monitor_gate = Arc::new(AtomicBool::new(false));
+    let (monitor_writer, mut monitor) = channel(48000, 48000, 10, 1, monitor_health.clone()).unwrap();
+    let old_health = Arc::new(Health::default());
+    let old_gate = Arc::new(AtomicBool::new(false));
+    let (old_writer, mut old_reader) = channel(48000, 48000, 10, 1, old_health.clone()).unwrap();
+    let ports = vec![CaptureOutput::new(monitor_writer, vec![0], monitor_health, monitor_gate.clone()),
+        CaptureOutput::new(old_writer, vec![2], old_health.clone(), old_gate.clone())];
+    let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
+        ports, health.clone(), controls.clone()).unwrap();
+    let pitch = PitchConfig { key: 7, scale: PitchScale::Minor, ..PitchConfig::default() };
+    capture.prepare_pitch(48000, pitch).unwrap();
+    let (mut app_writer, app_reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
+    let mut plugin = load_effect(&fixture("MIXLIVE_GAIN_VST3"), 48000).unwrap();
+    plugin.set_parameter(0, 0.5).unwrap();
+    let plugins = vec![(plugin, Arc::new(AtomicBool::new(false)))];
+    let mut feeds = test_feeds(true, vec![app_reader], &[0, 2]);
+    feeds.output_bindings[1].output = "fixture-broadcast".into();
+    feeds.output_bindings[1].channels = vec![1, 2];
+    let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, health.clone(), feeds).unwrap();
+    let retained_plugin = worker.slots[0].plugin.clone();
+    let vocal = worker.vocal_settings();
+    for _ in 0..1536 { app_writer.push([0.04, -0.08, 0.0, 0.0, 0.0, 0.0]); }
+    input.push(&[0.2; 1536], Some((TEST_AUX_TAG, &[[0.02, 0.03]; 1536])));
+    wait_for(&mut worker, &health, 1536);
+    let mut before_peak = 0.0_f32;
+    for _ in 0..1536 {
+        before_peak = before_peak.max(monitor.next_frame([1.0; 3])[0].abs());
+        old_reader.next_frame([1.0; 3]);
+    }
+    assert!(before_peak > 0.1 && retained_app.take_peak() > 0.05);
+
+    let next_health = Arc::new(Health::default());
+    let next_gate = Arc::new(AtomicBool::new(false));
+    let (writer, mut replacement) = channel(48000, 48000, 10, 1, next_health.clone()).unwrap();
+    let mut bindings = worker.output_bindings().to_vec();
+    bindings[1].output = "new-broadcast".into();
+    bindings[1].channels = vec![2, 1];
+    let port = CaptureOutput::new(writer, vec![2], next_health, next_gate.clone());
+    worker.set_output_bindings(bindings.clone(), vec![None, Some(port)], vec![(0, 0)], &controls).unwrap();
+    assert_eq!(worker.output_bindings(), bindings);
+    assert!(Arc::ptr_eq(&worker.slots[0].plugin, &retained_plugin));
+    assert!(Arc::ptr_eq(&worker.app_controls()[0], &retained_app));
+    assert_eq!(worker.effect_parameters(0).unwrap()[0].normalized, 0.5);
+    assert_eq!(worker.pitch_config(), pitch);
+    assert_eq!(worker.vocal_settings(), vocal);
+    assert_eq!(worker.chain.as_ref().unwrap().compensation, 0);
+    assert!(monitor_gate.load(Ordering::Acquire) && next_gate.load(Ordering::Acquire));
+    assert!(!old_gate.load(Ordering::Acquire));
+    old_health.fail(Fault::Device);
+
+    for _ in 0..1536 { app_writer.push([0.04, -0.08, 0.0, 0.0, 0.0, 0.0]); }
+    input.push(&[0.2; 1536], Some((TEST_AUX_TAG, &[[0.02, 0.03]; 1536])));
+    wait_for(&mut worker, &health, 3072);
+    for _ in 0..1024 {
+        monitor.next_frame([1.0; 3]);
+        replacement.next_frame([1.0; 3]);
+    }
+    for frame in [monitor.next_frame([1.0; 3]), replacement.next_frame([1.0; 3])] {
+        // Unchanged .5 native gain affects only mic. AUX/app retain their own
+        // stereo contributions; the broadcast logical slot 2 is compact lane 1.
+        assert!((frame[0] - 0.16).abs() < 0.001, "{frame:?}");
+        assert!((frame[1] - 0.05).abs() < 0.001, "{frame:?}");
+    }
+    assert!(!health.failed());
+    worker.finish(None).unwrap();
+    assert!(!monitor_gate.load(Ordering::Acquire) && !next_gate.load(Ordering::Acquire));
+}
+
+#[test]
 fn live_aux_changes_reject_failed_feeds_and_commit_current_topology() {
     let health = Arc::new(Health::default());
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], false, 1, VocalConfig::default()).unwrap());
     let retained_app = controls.app_controls()[0].clone();
     let (writer, _output) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+        vec![test_output(writer, vec![0, 1], &health)], health.clone(), controls.clone()).unwrap();
     let (_app_writer, app_reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
-    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(false, vec![app_reader])).unwrap();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(false, vec![app_reader], &[0, 1])).unwrap();
     let shared = AuxSource { input: "shared-input".into(), channels: vec![3, 4] };
     worker.set_aux_source(Some(shared.clone()), AuxFeed::Shared(TEST_AUX_TAG), &controls).unwrap();
     assert_eq!(worker.aux_source(), Some(&shared));
@@ -107,8 +249,8 @@ fn current_independent_aux_failure_reaches_idle_worker_without_rebinding() {
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap());
     let (writer, _output) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0])], health.clone(), controls.clone()).unwrap();
-    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(false, vec![])).unwrap();
+        vec![test_output(writer, vec![0], &health)], health.clone(), controls.clone()).unwrap();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(false, vec![], &[0])).unwrap();
     let local = Arc::new(Health::default());
     let (_writer, reader) = channel(44100, 48000, 10, 1, local.clone()).unwrap();
     let source = AuxSource { input: "independent-input".into(), channels: vec![1, 2] };
@@ -135,12 +277,12 @@ fn native_aux_boundary_discards_queued_old_pairs_and_preserves_voice_and_apps() 
     let retained_app = controls.app_controls()[0].clone();
     let (writer, mut output) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+        vec![test_output(writer, vec![0, 1], &health)], health.clone(), controls.clone()).unwrap();
     let (mut app_writer, app_reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
     let mut plugin = load_effect(&fixture("MIXLIVE_GAIN_VST3"), 48000).unwrap();
     plugin.set_parameter(0, 0.5).unwrap();
     let plugins = vec![(plugin, Arc::new(AtomicBool::new(false)))];
-    let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, health.clone(), test_feeds(true, vec![app_reader])).unwrap();
+    let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, health.clone(), test_feeds(true, vec![app_reader], &[0, 1])).unwrap();
     let retained_plugin = worker.slots[0].plugin.clone();
 
     let failed = Arc::new(Health::default());
@@ -218,10 +360,10 @@ fn live_vocal_settings_acknowledge_before_publication_and_keep_independent_targe
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, config).unwrap());
     let (writer, _reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
-        vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+        vec![test_output(writer, vec![0, 1], &health)], health.clone(), controls.clone()).unwrap();
     let pitch = PitchConfig { strength: 0.8, ..PitchConfig::default() };
     capture.prepare_pitch(48000, pitch).unwrap();
-    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(true, vec![])).unwrap();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(true, vec![], &[0, 1])).unwrap();
     for parameter in VocalParameter::ALL {
         let range = parameter.range();
         let value = (range.start() + range.end()) * 0.5;
@@ -264,10 +406,10 @@ fn live_pitch_updates_commit_on_idle_boundaries_and_reject_invalid_preparation()
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), Some(0.0), None], true, 0, VocalConfig::default()).unwrap());
     let (writer, _reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
     let mut capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0, 1])], health.clone(), controls).unwrap();
+        vec![test_output(writer, vec![0, 1], &health)], health.clone(), controls).unwrap();
     let enabled = PitchConfig { key: 7, scale: PitchScale::Minor, strength: 0.8, retune_ms: 67.0 };
     capture.prepare_pitch(48000, enabled).unwrap();
-    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(true, vec![])).unwrap();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(true, vec![], &[0, 1])).unwrap();
     assert_eq!(worker.pitch_config(), enabled);
     assert_eq!(worker.chain.as_ref().unwrap().pitch_latency, 2048);
     assert_eq!(worker.chain.as_ref().unwrap().compensation, 2048);
@@ -323,10 +465,10 @@ fn live_app_edits_keep_retained_bridge_audio_and_publish_only_after_acknowledgme
     let retained = controls.app_controls()[1].clone();
     let (writer, mut output) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+        vec![test_output(writer, vec![0, 1], &health)], health.clone(), controls.clone()).unwrap();
     let (_first_writer, first_reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
     let (mut retained_writer, retained_reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
-    let (mut input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(true, vec![first_reader, retained_reader])).unwrap();
+    let (mut input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(true, vec![first_reader, retained_reader], &[0, 1])).unwrap();
 
     // An unedited route with the same bridge provides a sample-for-sample
     // reference for retained resampler/queue history through index compaction.
@@ -337,7 +479,7 @@ fn live_app_edits_keep_retained_bridge_audio_and_publish_only_after_acknowledgme
     }
     let (reference_writer, mut reference_output) = channel(48000, 48000, 10, 2, reference_health.clone()).unwrap();
     let mut reference = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(reference_writer, vec![0, 1])], reference_health.clone(), reference_controls).unwrap();
+        vec![test_output(reference_writer, vec![0, 1], &reference_health)], reference_health.clone(), reference_controls).unwrap();
     let (mut reference_source, mut reference_reader) = channel(48000, 48000, 10, 1, reference_health.clone()).unwrap();
     for frame in 0..1536 {
         let value = (frame as f32 * 0.037).sin() * 0.1;
@@ -442,9 +584,9 @@ fn native_live_chain_edits_preserve_instances_outputs_and_the_empty_worker() {
     }
     let (writer, mut reader) = channel(48000, 48000, 10, 2, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0, 1])], health.clone(), controls.clone()).unwrap();
+        vec![test_output(writer, vec![0, 1], &health)], health.clone(), controls.clone()).unwrap();
     let (mut app_writer, app_reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
-    let (mut input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(true, vec![app_reader])).unwrap();
+    let (mut input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(true, vec![app_reader], &[0, 1])).unwrap();
     assert!(worker.effects().is_empty());
     let spec = fixture("MIXLIVE_GAIN_VST3");
     // No capture frames are needed for an empty-to-nonempty handoff.
@@ -545,8 +687,8 @@ fn native_live_chain_snapshot_keeps_the_edited_slot_order_and_bypass() {
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap());
     let (writer, _reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0])], health.clone(), controls).unwrap();
-    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(false, vec![])).unwrap();
+        vec![test_output(writer, vec![0], &health)], health.clone(), controls).unwrap();
+    let (_input, mut worker) = spawn(capture, vec![], 48000, 100, health.clone(), test_feeds(false, vec![], &[0])).unwrap();
     for (index, value) in [0.23, 0.61].into_iter().enumerate() {
         let spec = EffectSpec { bypassed: index == 0, ..fixture("MIXLIVE_GAIN_VST3") };
         worker.edit_chain(ChainEdit::Add(spec)).unwrap();
@@ -588,10 +730,10 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
     let (writer, mut reader) = channel(48000, 48000, 10, 3, health.clone()).unwrap();
     controls.apply("route aux send on".parse().unwrap()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0, 1, 2])], health.clone(), controls.clone()).unwrap();
+        vec![test_output(writer, vec![0, 1, 2], &health)], health.clone(), controls.clone()).unwrap();
     let (mut first_app, first_reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
     let (mut second_app, second_reader) = channel(48000, 48000, 10, 1, health.clone()).unwrap();
-    let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, health.clone(), test_feeds(true, vec![first_reader, second_reader])).unwrap();
+    let (mut input, mut worker) = spawn(capture, plugins, 48000, 100, health.clone(), test_feeds(true, vec![first_reader, second_reader], &[0, 1, 2])).unwrap();
     assert!(worker.description.contains("Serial chain: 2 effects"));
     // The existing native gain fixture reports zero latency; it must not acquire an artificial delay.
     assert!(worker.description.contains("Outgoing AUX/app send compensation: 0 samples"));
@@ -656,10 +798,10 @@ fn native_chain_processes_voice_once_and_keeps_aux_and_instances_independent() {
     let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0, VocalConfig::default()).unwrap());
     let (writer, _reader) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
     let capture = Capture::new(VocalChain::new(48000, VocalConfig::default()).unwrap(), 48000,
-        vec![(writer, vec![0])], health.clone(), controls).unwrap();
+        vec![test_output(writer, vec![0], &health)], health.clone(), controls).unwrap();
     let plugins = vec![(load_effect(&spec, 48000).unwrap(), Arc::new(AtomicBool::new(false))),
         (load_effect(&fixture("MIXLIVE_STATE_VST3"), 48000).unwrap(), Arc::new(AtomicBool::new(false)))];
-    let error = spawn(capture, plugins, 48000, 30, health, test_feeds(false, vec![])).err().unwrap();
+    let error = spawn(capture, plugins, 48000, 30, health, test_feeds(false, vec![], &[0])).err().unwrap();
     assert!(error.contains("slot 2") && error.contains("stereo"));
 }
 
@@ -673,13 +815,13 @@ fn built_in_room_reaches_the_live_native_effect_as_stereo() {
         let controls = Arc::new(LiveControls::new(0.0, [Some(0.0), None, None], false, 0, config).unwrap());
         let (writer, reader) = channel(48000, 48000, 30, 1, health.clone()).unwrap();
         let capture = Capture::new(VocalChain::new(48000, config).unwrap(), 48000,
-            vec![(writer, vec![0])], health.clone(), controls).unwrap();
+            vec![test_output(writer, vec![0], &health)], health.clone(), controls).unwrap();
         (capture, reader, health)
     };
     let (capture, mut reader, health) = prepare();
     let mut plugin = load_effect(&fixture("MIXLIVE_GAIN_VST3"), 48000).unwrap();
     plugin.set_parameter(0, 0.5).unwrap();
-    let (mut input, mut worker) = spawn(capture, vec![(plugin, Arc::new(AtomicBool::new(false)))], 48000, 100, health.clone(), test_feeds(false, vec![])).unwrap();
+    let (mut input, mut worker) = spawn(capture, vec![(plugin, Arc::new(AtomicBool::new(false)))], 48000, 100, health.clone(), test_feeds(false, vec![], &[0])).unwrap();
     let mut mic = vec![0.0; 4096];
     mic[0] = 0.5;
     for part in mic.chunks(137) { input.push(part, None); }
@@ -750,7 +892,7 @@ fn native_editors_reopen_on_the_same_slots_and_detach_independently() {
         Slot::new(plugin, Arc::new(AtomicBool::new(gain > 0.5)), 0)
     }).collect();
     let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
-        stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), vocal_settings: VocalConfig::default().settings(), apps: vec![], aux_source: None, description: String::new() };
+        stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), vocal_settings: VocalConfig::default().settings(), apps: vec![], aux_source: None, output_bindings: vec![], output_groups: vec![], description: String::new() };
     // Upstream's documented Editor Attached instrumentation (read-only parameter 1000).
     let attached = |worker: &PluginWorker, index: usize| {
         worker.slots[index].plugin.lock().unwrap().get_parameter(1000).unwrap()
@@ -816,7 +958,7 @@ fn native_finish_saves_all_slot_states_or_nothing_and_preserves_existing_files()
             slots.push(Slot::new(plugin, Arc::new(AtomicBool::new(gain > 0.5)), 0));
         }
         let mut worker = PluginWorker { thread: None, stop: Arc::new(AtomicBool::new(false)), slots,
-            stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), vocal_settings: VocalConfig::default().settings(), apps: vec![], aux_source: None, description: String::new() };
+            stopped: false, health: health.clone(), chain: None, pitch_config: PitchConfig::default(), vocal_settings: VocalConfig::default().settings(), apps: vec![], aux_source: None, output_bindings: vec![], output_groups: vec![], description: String::new() };
         // A last generic-panel edit with no subsequent audio block must survive its snapshot.
         for (index, gain) in [0.23, 0.61].into_iter().enumerate() {
             let parameters = worker.set_effect_parameter(index, 0, gain).unwrap();

@@ -1,5 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use crate::control::MixSettings;
+use crate::control::{MixSettings, RouteMix};
 use mixlive_effects::{DynamicsConfig, EchoConfig, EqConfig, Preset, ReverbConfig, VocalConfig};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -149,6 +149,38 @@ pub const MAX_APPS: usize = 8;
 pub struct AuxSource {
     pub input: String,
     pub channels: Vec<u16>,
+}
+
+/// One logical mix's physical playback binding. Mixer controls remain unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputBinding {
+    pub mix: RouteMix,
+    pub output: String,
+    pub channels: Vec<u16>,
+}
+
+/// Validate a complete replacement of the enabled mixes before changing any binding.
+/// Device resolution additionally checks actual channel counts and endpoint identity.
+pub fn validate_output_bindings(bindings: &[OutputBinding], enabled: [bool; MAX_MIXES]) -> Result<(), String> {
+    let mut seen = [false; MAX_MIXES];
+    let mut maps: Vec<(&str, OutputMap)> = Vec::with_capacity(MAX_MIXES);
+    for binding in bindings {
+        let mix = binding.mix.index();
+        if !enabled[mix] || seen[mix] {
+            return Err("output bindings must contain each currently enabled mix exactly once".into());
+        }
+        if binding.output.trim().is_empty() { return Err("playback endpoint ID must not be blank".into()); }
+        let map = OutputMap::new(&binding.channels, u16::MAX)?;
+        if maps.iter().any(|&(id, other)| id == binding.output.as_str() && map.overlaps(other)) {
+            return Err("output mix channels must not overlap on the same endpoint".into());
+        }
+        maps.push((&binding.output, map));
+        seen[mix] = true;
+    }
+    if seen != enabled {
+        return Err("output bindings must contain each currently enabled mix exactly once".into());
+    }
+    Ok(())
 }
 
 /// A persistent source identity and its independent initial mix settings. No PID is stored.
@@ -351,6 +383,34 @@ impl RouteOptions {
             .into_iter().enumerate().filter_map(|(index, (id, channels))| id.map(|id| (index, id, channels)))
     }
 
+    pub fn output_bindings(&self) -> Vec<OutputBinding> {
+        self.playback_bindings().map(|(mix, output, channels)| OutputBinding {
+            mix: RouteMix::ALL[mix], output: output.to_owned(), channels: channels.to_vec(),
+        }).collect()
+    }
+
+    /// Keep the logical mix set and all active/inactive mixer values intact.
+    pub fn set_output_bindings(&mut self, bindings: &[OutputBinding]) -> Result<(), String> {
+        validate_output_bindings(bindings, [true, self.send.is_some(), self.broadcast.is_some()])?;
+        for binding in bindings {
+            match binding.mix {
+                RouteMix::Output => {
+                    self.output.clone_from(&binding.output);
+                    self.output_channels.clone_from(&binding.channels);
+                }
+                RouteMix::Send => {
+                    self.send.as_mut().expect("validated active send").clone_from(&binding.output);
+                    self.send_channels.clone_from(&binding.channels);
+                }
+                RouteMix::Broadcast => {
+                    self.broadcast.as_mut().expect("validated active broadcast").clone_from(&binding.output);
+                    self.broadcast_channels.clone_from(&binding.channels);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn pitch_config(&self) -> PitchConfig {
         PitchConfig { key: self.pitch_key, scale: self.pitch_scale, strength: self.pitch_correction, retune_ms: self.pitch_retune_ms }
     }
@@ -401,15 +461,7 @@ impl RouteOptions {
         for channels in [&self.output_channels, &self.send_channels, &self.broadcast_channels] {
             OutputMap::new(channels, u16::MAX)?;
         }
-        let mut bindings: Vec<(&str, OutputMap)> = Vec::with_capacity(MAX_MIXES);
-        for (_, id, channels) in self.playback_bindings() {
-            if id.trim().is_empty() { return Err("playback endpoint ID must not be blank".into()); }
-            let map = OutputMap::new(channels, u16::MAX)?;
-            if bindings.iter().any(|&(other_id, other_map)| id == other_id && map.overlaps(other_map)) {
-                return Err("output mix channels must not overlap on the same endpoint".into());
-            }
-            bindings.push((id, map));
-        }
+        validate_output_bindings(&self.output_bindings(), [true, self.send.is_some(), self.broadcast.is_some()])?;
         let aux = InputMap::new(&self.aux_channels, u16::MAX)?;
         if self.apps.len() > MAX_APPS { return Err(format!("at most {MAX_APPS} application sources are supported")); }
         for (index, app) in self.apps.iter().enumerate() {
@@ -567,6 +619,68 @@ mod tests {
             let enabled = std::array::from_fn(|mix| bits & (1 << mix) != 0);
             let destination = AuxDestination::from_enabled(enabled);
             assert_eq!(std::array::from_fn::<_, MAX_MIXES, _>(|mix| destination.includes(mix)), enabled);
+        }
+    }
+
+    #[test]
+    fn live_output_bindings_keep_mix_identity_and_all_other_scene_values() {
+        let Command::Check(mut route) = Cli::parse_from(["audio", "check", "--input", "mic", "--output", "phones",
+            "--broadcast", "phones", "--broadcast-channels", "5,6", "--app", "browser.exe"]).command else { panic!("expected check") };
+        route.send_channels = vec![8, 7];
+        route.send_gain_db = -37.0;
+        route.apps[0].to = AuxDestination::OutputBroadcast;
+        route.reverb_mix = 0.2;
+        let mut expected = route.clone();
+        expected.output = "new-phones".into();
+        expected.output_channels = vec![2, 1];
+        expected.broadcast = Some("new-phones".into());
+        expected.broadcast_channels = vec![3];
+        let bindings = vec![
+            OutputBinding { mix: RouteMix::Broadcast, output: "new-phones".into(), channels: vec![3] },
+            OutputBinding { mix: RouteMix::Output, output: "new-phones".into(), channels: vec![2, 1] },
+        ];
+        route.set_output_bindings(&bindings).unwrap();
+        assert_eq!(route, expected);
+        assert_eq!(route.output_bindings(), [bindings[1].clone(), bindings[0].clone()]);
+        route.validate().unwrap();
+
+        // Splitting a shared endpoint preserves the same logical output slots.
+        let mut split = route.output_bindings();
+        split[1].output = "broadcast-only".into();
+        split[1].channels = vec![1, 2];
+        route.set_output_bindings(&split).unwrap();
+        assert_eq!(route.output_bindings(), split);
+        assert_eq!(route.send_channels, [8, 7]);
+        assert_eq!(route.send_gain_db, -37.0);
+        assert!(route.send.is_none());
+    }
+
+    #[test]
+    fn invalid_output_replacements_leave_every_binding_unchanged() {
+        let Command::Check(mut route) = Cli::parse_from(["audio", "check", "--input", "mic", "--output", "phones",
+            "--broadcast", "broadcast"]).command else { panic!("expected check") };
+        let original = route.clone();
+        let mut valid = route.output_bindings();
+        valid[0].output = "changed-monitor".into();
+        valid[0].channels = vec![2, 1];
+        let mut cases = vec![Vec::new(), vec![valid[0].clone()], vec![valid[0].clone(), valid[0].clone()]];
+        let mut disabled_mix = valid.clone();
+        disabled_mix[1].mix = RouteMix::Send;
+        cases.push(disabled_mix);
+        let mut overlap = valid.clone();
+        overlap[1].output = overlap[0].output.clone();
+        cases.push(overlap);
+        let mut blank = valid.clone();
+        blank[1].output = "  ".into();
+        cases.push(blank);
+        for channels in [vec![], vec![0], vec![1, 1], vec![1, 2, 3]] {
+            let mut malformed = valid.clone();
+            malformed[1].channels = channels;
+            cases.push(malformed);
+        }
+        for bindings in cases {
+            assert!(route.set_output_bindings(&bindings).is_err());
+            assert_eq!(route, original);
         }
     }
 
