@@ -466,7 +466,7 @@ impl OutputPlayback {
     fn render<T: Sample + cpal::FromSample<f32>>(&mut self, data: &mut [T], channels: usize) {
         data.fill(T::EQUILIBRIUM);
         if !self.enabled.load(Ordering::Acquire) || self.route_health.failed() || self.health.failed() { return; }
-        if data.len() % channels != 0 { self.health.fail(Fault::Routing); return; }
+        if !data.len().is_multiple_of(channels) { self.health.fail(Fault::Routing); return; }
         if !self.activated {
             // Controls may have changed while the prepared stream emitted silence.
             self.gains.snap_to_targets();
